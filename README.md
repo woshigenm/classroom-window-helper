@@ -69,7 +69,8 @@ bypass_tool\
 │   ├─ sign.bat               cmd 包装：调用 sign.ps1 并提示密码
 │   ├─ sign.ps1               用 PFX 签名 bin\ 三个交付文件
 │   ├─ make-selfsigned-cert.ps1  生成内网测试用自签证书
-│   └─ README.md              编译 / 签名完整说明
+│   ├─ package.ps1            打包 dist\ 下的 Release zip
+│   └─ README.md              编译 / 签名 / 打包完整说明
 ├─ docs\
 │   ├─ how-to-use.md          使用手册（部署 / 上课 / 快捷键）
 │   └─ design.md              设计与实现（钩子 / 窗口 / 日志 / 限制）

@@ -65,3 +65,23 @@ Import-Certificate -FilePath bypass_tool-test.cer -CertStoreLocation Cert:\Curre
 - 重新编译后需要重新签名；签名后文件大小和 MD5 会变。
 - 自签名只能改善本机/内网显示，**不能保证**不被 `Trojan:Win32/Wacatac.B!ml` 这类 ML 误报命中。
 - PFX / 私钥只放本机或 CI Secret，绝不提交仓库。
+
+## 4. 打包 Release
+
+先确保 `bin\` 已签名，然后：
+
+```bat
+powershell -ExecutionPolicy Bypass -File build\package.ps1 -Version v1.2.0 -IncludeCert
+```
+
+- 产物：`dist\classroom-window-helper-v1.2.0.zip`
+- 包含：三个交付文件、`bypass_config.ini`、`README.md`、`docs\how-to-use.md`、`docs\design.md`；加 `-IncludeCert` 还会带 `bypass_tool-test.cer` 和信任说明。
+- 不包含：`local\`、PFX、日志、netlab。
+- `dist\` 已在 `.gitignore` 中，zip 不提交，直接上传到 GitHub **Releases** 附件。
+
+如果编译后还没签名，可以让 `package.ps1` 先签：
+
+```powershell
+.\build\package.ps1 -Version v1.2.0 -IncludeCert `
+  -Pfx local\certs\bypass_tool-test.pfx -Password "your-password"
+```
