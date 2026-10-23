@@ -1,0 +1,30 @@
+# ---- local-only (never upload) -------------------------------------
+/local/
+
+# ---- signing keys / certificates (never upload) --------------------
+*.pfx
+*.p12
+*.pvk
+*.snk
+*.key
+*.cer
+*.crt
+
+# ---- build outputs -------------------------------------------------
+/bin/
+
+# ---- runtime logs --------------------------------------------------
+*.log
+
+# ---- object / temp files -------------------------------------------
+*.o
+*.obj
+*.d
+*.tmp
+*.old.dll
+
+# ---- editor / OS ---------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
