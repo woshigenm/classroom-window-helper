@@ -86,8 +86,19 @@ try {
         }
     }
 
+    @(
+        "Classroom Window Mode"
+        ""
+        "1. Extract this zip."
+        "2. Run bin\bypass.exe as Administrator."
+        "3. Config: bin\bypass_config.ini"
+        "4. Kill switch: create bin\bypass_hook.off"
+        ""
+        "Authorized lab use only."
+    ) | Set-Content -LiteralPath (Join-Path $stage "RUN.txt") -Encoding ASCII
+
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-    $zip = Join-Path $OutDir ("classroom-window-helper-" + $Version + ".zip")
+    $zip = Join-Path $OutDir ("classroom-window-helper-" + $Version + "-bin.zip")
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
     Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
     Write-Output ("zip: " + $zip)

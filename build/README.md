@@ -74,8 +74,8 @@ Import-Certificate -FilePath bypass_tool-test.cer -CertStoreLocation Cert:\Curre
 powershell -ExecutionPolicy Bypass -File build\package.ps1 -Version v1.2.0 -IncludeCert
 ```
 
-- 产物：`dist\classroom-window-helper-v1.2.0.zip`
-- 包含：三个交付文件、`bypass_config.ini`、`README.md`、`docs\how-to-use.md`、`docs\design.md`；加 `-IncludeCert` 还会带 `bypass_tool-test.cer` 和信任说明。
+- 产物：`dist\classroom-window-helper-v1.2.0-bin.zip`
+- 包含：`bin\` 下的三个交付文件 + `bypass_config.ini`、`RUN.txt`、`README.md`、`docs\how-to-use.md`、`docs\design.md`；加 `-IncludeCert` 还会带 `bypass_tool-test.cer` 和信任说明。
 - 不包含：`local\`、PFX、日志、netlab。
 - `dist\` 已在 `.gitignore` 中，zip 不提交，直接上传到 GitHub **Releases** 附件。
 
