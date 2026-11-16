@@ -172,8 +172,12 @@ enabled=1
 
 | 层 | 文件 | 负责 |
 |---|---|---|
-| Loader | `bin\bypass_hook32.dll` | 装所有 inline/IAT 钩子、持有 trampoline、日志、路径、教师端判断 |
-| Core | `bin\bypass_hook_core.dll` | `Hook_*` 实现、窗口/抓屏/关机守卫；由 Loader `LoadLibrary` 后调 `Core_Init` |
+| Loader | `bin\bypass_hook32.dll` | 装所有 inline/IAT 钩子、持有 trampoline、日志、路径、教师端判断；把 Core 从 `bin\core_cache\core.<pid>.<n>.dll` 的缓存副本加载，源文件永远不被映射 |
+| Core | `bin\bypass_hook_core.dll` | `Hook_*` 实现、窗口/抓屏/关机守卫；由 Loader `LoadLibraryEx` 后调 `Core_Init` |
+
+> P2a：缓存副本、控制管道（`\\.\pipe\bypass_core_ctl_<pid>`）、回滚和 `still mapped`
+> 已就绪；真实 Core 的 `before_unload` 还没实现（P2b），所以现在对真实 Core 发 `reload`
+> 会返回 `err no-drain (P2b)`，不会卸载它。
 
 **什么时候要重编什么**（很重要）：
 

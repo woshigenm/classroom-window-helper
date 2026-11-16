@@ -53,6 +53,18 @@ static HrHost         g_hostCfg;    /* Loader's ABI block: Core keeps this point
 static long           g_patchCount;
 static int            g_scanLogged;
 
+/* P2a: cache copy + reload/rollback */
+static struct {
+    HMODULE mod;
+    char    path[MAX_PATH];
+    DWORD   seq;
+    int     valid;
+} g_cur;
+static volatile LONG  g_coreDead;   /* still-mapped detected: never reload again */
+static int            g_seq;
+static CRITICAL_SECTION g_blobCs;
+static int            g_blobCsReady;
+
 /* ---------------- reals (trampolines for the inline hooks) ---------------- */
 
 static PFN_SetWindowPos        real_SetWindowPos;
@@ -857,6 +869,82 @@ static int InstallInlineHooks(void)
     return (n == ok) ? n : -ok;
 }
 
+/* ---------------- blob store (P2: Core state across reloads) ---------------- */
+
+#define HR_BLOB_MAX     32
+#define HR_BLOB_KEYSZ   32
+#define HR_BLOB_DATASZ  256
+
+typedef struct {
+    char         key[HR_BLOB_KEYSZ];
+    unsigned int size;
+    unsigned char data[HR_BLOB_DATASZ];
+    int          used;
+} BlobEnt;
+
+static BlobEnt g_blobs[HR_BLOB_MAX];
+static BlobEnt g_blobSnap[HR_BLOB_MAX];
+
+static int BlobPut(const char* key, const void* data, unsigned int size)
+{
+    int i, slot = -1;
+
+    if (!key || !key[0] || !data || size > HR_BLOB_DATASZ) return 0;
+    if (!g_blobCsReady) return 0;
+
+    EnterCriticalSection(&g_blobCs);
+    for (i = 0; i < HR_BLOB_MAX; i++) {
+        if (g_blobs[i].used && !_stricmp(g_blobs[i].key, key)) { slot = i; break; }
+        if (!g_blobs[i].used && slot < 0) slot = i;
+    }
+    if (slot >= 0) {
+        memset(&g_blobs[slot], 0, sizeof(g_blobs[slot]));
+        g_blobs[slot].used = 1;
+        strncpy(g_blobs[slot].key, key, HR_BLOB_KEYSZ - 1);
+        g_blobs[slot].size = size;
+        memcpy(g_blobs[slot].data, data, size);
+    }
+    LeaveCriticalSection(&g_blobCs);
+    return slot >= 0;
+}
+
+static int BlobGet(const char* key, void* out, unsigned int* size)
+{
+    int i, found = 0;
+
+    if (!key || !size || !g_blobCsReady) return 0;
+    EnterCriticalSection(&g_blobCs);
+    for (i = 0; i < HR_BLOB_MAX; i++) {
+        if (g_blobs[i].used && !_stricmp(g_blobs[i].key, key)) {
+            unsigned int n = g_blobs[i].size;
+            if (out && *size >= n) memcpy(out, g_blobs[i].data, n);
+            *size = n;
+            found = 1;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_blobCs);
+    return found;
+}
+
+static void BlobSnapshot(void)
+{
+    if (!g_blobCsReady) return;
+    EnterCriticalSection(&g_blobCs);
+    memcpy(g_blobSnap, g_blobs, sizeof(g_blobs));
+    LeaveCriticalSection(&g_blobCs);
+}
+
+/* ★ 回滚时必须在“加载旧 Core”之前调用: 旧 Core 的 Core_Init 会读 blob,
+   不能让它读到新 Core 写了一半的状态。 */
+static void BlobRestore(void)
+{
+    if (!g_blobCsReady) return;
+    EnterCriticalSection(&g_blobCs);
+    memcpy(g_blobs, g_blobSnap, sizeof(g_blobs));
+    LeaveCriticalSection(&g_blobCs);
+}
+
 static void FillHost(HrHost* host)
 {
     memset(host, 0, sizeof(*host));
@@ -866,6 +954,8 @@ static void FillHost(HrHost* host)
     host->loader_path = g_loaderPath;
     host->log         = HookLog;
     host->patch_modules = PatchAllModules;
+    host->blob_put    = BlobPut;
+    host->blob_get    = BlobGet;
 
     host->real.SetWindowPos        = (void*)real_SetWindowPos;
     host->real.SetWindowLongW      = (void*)real_SetWindowLongW;
@@ -924,64 +1014,215 @@ static BOOL HooksComplete(const HrHooks* h)
            h->InitiateSystemShutdownExA && h->InitiateSystemShutdownExW;
 }
 
-static BOOL LoadCore(void)
+/* P2a: load a Core from `src` through a cache copy (core.<pid>.<seq>.dll).
+   Never maps the source file itself, so the build output can be overwritten.
+   Returns 1 on success (published); on failure `err` explains why. */
+static BOOL LoadCoreFrom(const char* src, char* outPath, size_t outCap,
+                         char* err, size_t errCap)
 {
-    char    path[MAX_PATH];
+    char          cacheDir[MAX_PATH], cachePath[MAX_PATH];
+    HMODULE       mod;
     PFN_Core_Init init;
+    HrCoreApi     api;
+    int           seq = ++g_seq;
 
-    _snprintf(path, sizeof(path) - 1, "%s" HR_CORE_NAME, g_baseDir);
-    path[sizeof(path) - 1] = '\0';
+    if (err && errCap) err[0] = '\0';
+    if (!src || !src[0]) { if (err) _snprintf(err, errCap - 1, "no source"); return FALSE; }
 
-    /* Core 可能有同目录依赖 (P2 起还能从缓存目录加载) */
-    g_coreModule = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!g_coreModule) {
-        HookLog("[Loader] CORE LOAD FAILED: %s err=%lu (hooks passthrough)",
-                path, (unsigned long)GetLastError());
+    _snprintf(cacheDir, sizeof(cacheDir) - 1, "%s%s", g_baseDir, HR_CACHE_DIR);
+    cacheDir[sizeof(cacheDir) - 1] = '\0';
+    CreateDirectoryA(cacheDir, NULL);
+
+    _snprintf(cachePath, sizeof(cachePath) - 1, "%s\\core.%lu.%d.dll",
+              cacheDir, (unsigned long)g_pid, seq);
+    cachePath[sizeof(cachePath) - 1] = '\0';
+
+    if (!CopyFileA(src, cachePath, FALSE)) {
+        if (err) _snprintf(err, errCap - 1, "copy failed err=%lu",
+                           (unsigned long)GetLastError());
         return FALSE;
     }
-    init = (PFN_Core_Init)(void*)GetProcAddress(g_coreModule, HR_CORE_INIT);
+    mod = LoadLibraryExA(cachePath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!mod) {
+        if (err) _snprintf(err, errCap - 1, "LoadLibrary failed err=%lu",
+                           (unsigned long)GetLastError());
+        DeleteFileA(cachePath);
+        return FALSE;
+    }
+    init = (PFN_Core_Init)(void*)GetProcAddress(mod, HR_CORE_INIT);
     if (!init) {
-        HookLog("[Loader] %s has no %s (hooks passthrough)", path, HR_CORE_INIT);
-        FreeLibrary(g_coreModule);
-        g_coreModule = NULL;
+        if (err) _snprintf(err, errCap - 1, "no %s export", HR_CORE_INIT);
+        FreeLibrary(mod);
+        DeleteFileA(cachePath);
         return FALSE;
     }
 
-    /* ★ 必须是静态存储: Core 会把 g_host 一直留着用, 不能指向 Manager 的栈 */
     FillHost(&g_hostCfg);
-    memset(&g_core, 0, sizeof(g_core));
+    memset(&api, 0, sizeof(api));
 
-    if (!init(&g_hostCfg, &g_core)) {
-        /* Core 自己检查了 ABI, 失败时什么都没做 -> FreeLibrary 安全 */
-        HookLog("[Loader] Core_Init failed (returned 0) - FreeLibrary safe");
-        FreeLibrary(g_coreModule);
-        g_coreModule = NULL;
+    if (!init(&g_hostCfg, &api)) {
+        /* Core did nothing yet -> FreeLibrary is safe */
+        if (err) _snprintf(err, errCap - 1, "Core_Init returned 0");
+        FreeLibrary(mod);
+        DeleteFileA(cachePath);
         return FALSE;
     }
 
-    /* 走到这里 Core 已经初始化 (线程已起), **绝不能 FreeLibrary**:
-       返回的 ABI/表不对时只能不发布 (钩子保持直通), 让 Core 留在内存里。 */
-    if (g_core.abi_version != HR_ABI_VERSION || g_core.size < sizeof(HrCoreApi)) {
-        HookLog("[Loader] Core_Init returned bad ABI (abi=%u size=%u) - "
-                "leaving it mapped, hooks passthrough",
-                g_core.abi_version, g_core.size);
+    /* Core is initialized now: never FreeLibrary on these two paths */
+    if (api.abi_version != HR_ABI_VERSION || api.size < sizeof(HrCoreApi)) {
+        HookLog("[Loader] %s: bad ABI (abi=%u size=%u) - leaving it mapped",
+                cachePath, api.abi_version, api.size);
+        if (err) _snprintf(err, errCap - 1, "bad ABI (left mapped)");
         return FALSE;
     }
-    if (!HooksComplete(&g_core.hooks)) {
-        HookLog("[Loader] Core hook table incomplete - leaving it mapped, "
-                "hooks passthrough");
+    if (!HooksComplete(&api.hooks)) {
+        HookLog("[Loader] %s: hook table incomplete - leaving it mapped", cachePath);
+        if (err) _snprintf(err, errCap - 1, "hook table incomplete (left mapped)");
         return FALSE;
     }
+
+    g_core = api;
+    g_cur.mod = mod;
+    g_cur.seq = (DWORD)seq;
+    g_cur.valid = 1;
+    _snprintf(g_cur.path, sizeof(g_cur.path) - 1, "%s", cachePath);
+    g_cur.path[sizeof(g_cur.path) - 1] = '\0';
+    g_coreModule = mod;
 
     InterlockedExchangePointer((PVOID volatile*)&g_table, (PVOID)&g_core);
-    HookLog("[Loader] core loaded: %s build=%s", path,
+
+    if (outPath && outCap) {
+        _snprintf(outPath, outCap - 1, "%s", cachePath);
+        outPath[outCap - 1] = '\0';
+    }
+    HookLog("[Loader] core loaded: %s build=%s", cachePath,
             g_core.build_id ? g_core.build_id : "?");
     return TRUE;
 }
 
+/* P2a reload.  P2b fills in before_unload; until then a Core without it is
+   refused (the real Core still has its Worker thread, unloading it would UAF). */
+static int DoReload(int noRollback, char* resp, size_t cap)
+{
+    char    prev[MAX_PATH], src[MAX_PATH], cache[MAX_PATH], err[160];
+
+    if (InterlockedCompareExchange(&g_coreDead, 0, 0)) {
+        _snprintf(resp, cap - 1, "err coreDead\n");
+        return 0;
+    }
+    if (!g_cur.valid) {
+        _snprintf(resp, cap - 1, "err no-active-core\n");
+        return 0;
+    }
+    if (!g_core.before_unload) {
+        _snprintf(resp, cap - 1, "err no-drain (P2b)\n");
+        return 0;
+    }
+
+    _snprintf(prev, sizeof(prev) - 1, "%s", g_cur.path);
+    prev[sizeof(prev) - 1] = '\0';
+    BlobSnapshot();
+
+    /* table still points at the old Core: let it drain while its hooks are
+       still reachable (Core sets its own disabled flag internally). */
+    if (!g_core.before_unload()) {
+        _snprintf(resp, cap - 1, "err refused-by-core\n");
+        return 0;
+    }
+
+    InterlockedExchangePointer((PVOID volatile*)&g_table, NULL);
+    g_cur.valid = 0;
+    FreeLibrary(g_cur.mod);
+    g_cur.mod = NULL;
+    g_coreModule = NULL;
+
+    /* ★ 检测的是缓存副本路径, 不是源文件: 源文件从来没有被映射过 */
+    if (GetModuleHandleA(prev) != NULL) {
+        InterlockedExchange(&g_coreDead, 1);
+        HookLog("[Loader] still mapped after FreeLibrary: %s (coreDead)", prev);
+        _snprintf(resp, cap - 1, "err coreDead\n");
+        return 0;
+    }
+
+    _snprintf(src, sizeof(src) - 1, "%s" HR_CORE_NAME, g_baseDir);
+    src[sizeof(src) - 1] = '\0';
+
+    if (LoadCoreFrom(src, cache, sizeof(cache), err, sizeof(err))) {
+        DeleteFileA(prev);          /* old cache is no longer mapped */
+        _snprintf(resp, cap - 1, "ok seq=%lu cache=%s\n", (unsigned long)g_cur.seq, cache);
+        return 1;
+    }
+
+    HookLog("[Loader] reload failed: %s", err);
+    if (noRollback) {
+        _snprintf(resp, cap - 1, "err reload-failed (no rollback): %s\n", err);
+        return 0;
+    }
+
+    /* rollback: blob snapshot must be restored BEFORE the old Core's Init */
+    BlobRestore();
+    if (LoadCoreFrom(prev, cache, sizeof(cache), err, sizeof(err))) {
+        DeleteFileA(prev);
+        HookLog("[Loader] rollback ok: %s", cache);
+        _snprintf(resp, cap - 1, "rolledback seq=%lu cache=%s\n", (unsigned long)g_cur.seq, cache);
+        return 1;
+    }
+
+    InterlockedExchange(&g_coreDead, 1);
+    HookLog("[Loader] rollback FAILED: %s (coreDead)", err);
+    _snprintf(resp, cap - 1, "err coreDead\n");
+    return 0;
+}
+
+static DWORD WINAPI CtlThread(LPVOID p)
+{
+    char name[128];
+
+    (void)p;
+    _snprintf(name, sizeof(name) - 1, HR_CTL_PIPE "%lu", (unsigned long)g_pid);
+    name[sizeof(name) - 1] = '\0';
+
+    for (;;) {
+        HANDLE h = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX,
+                                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                                    1, 4096, 4096, 0, NULL);
+        if (h == INVALID_HANDLE_VALUE) { Sleep(1000); continue; }
+
+        if (ConnectNamedPipe(h, NULL) || GetLastError() == ERROR_PIPE_CONNECTED) {
+            char  req[128];
+            DWORD rd = 0;
+
+            memset(req, 0, sizeof(req));
+            if (ReadFile(h, req, sizeof(req) - 1, &rd, NULL) && rd > 0) {
+                char  resp[512];
+                DWORD wr = 0;
+
+                resp[0] = '\0';
+                if (!_strnicmp(req, "reload", 6))
+                    DoReload(strstr(req, "norollback") != NULL, resp, sizeof(resp));
+                else if (!_strnicmp(req, "status", 6))
+                    _snprintf(resp, sizeof(resp) - 1,
+                              "ok core=%s seq=%lu dead=%ld cache=%s\n",
+                              g_core.build_id ? g_core.build_id : "?",
+                              (unsigned long)g_cur.seq, (long)g_coreDead,
+                              g_cur.valid ? g_cur.path : "-");
+                else
+                    _snprintf(resp, sizeof(resp) - 1, "err unknown\n");
+                resp[sizeof(resp) - 1] = '\0';
+                WriteFile(h, resp, (DWORD)strlen(resp), &wr, NULL);
+                /* 消息模式: 不 Flush 就 Disconnect 会把没读走的数据丢掉 */
+                FlushFileBuffers(h);
+            }
+            DisconnectNamedPipe(h);
+        }
+        CloseHandle(h);
+    }
+    return 0;
+}
+
 static DWORD WINAPI Manager(LPVOID p)
 {
-    char full[MAX_PATH];
+    char full[MAX_PATH], src[MAX_PATH], cache[MAX_PATH], err[160];
     int  inlineOk;
 
     (void)p;
@@ -1006,7 +1247,18 @@ static DWORD WINAPI Manager(LPVOID p)
 
     PatchAllModules();
 
-    LoadCore();
+    _snprintf(src, sizeof(src) - 1, "%s" HR_CORE_NAME, g_baseDir);
+    src[sizeof(src) - 1] = '\0';
+    if (!LoadCoreFrom(src, cache, sizeof(cache), err, sizeof(err)))
+        HookLog("[Loader] CORE LOAD FAILED: %s (hooks passthrough)", err);
+
+    /* control pipe stays up even if the initial load failed, so a retry is
+       possible without reinjecting the Loader */
+    {
+        HANDLE th = CreateThread(NULL, 0, CtlThread, NULL, 0, NULL);
+        if (th) CloseHandle(th);
+        else HookLog("[Loader] control pipe thread failed (err=%lu)", GetLastError());
+    }
     return 0;
 }
 
@@ -1023,6 +1275,9 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
 
         InitializeCriticalSection(&g_logCs);
         g_logCsReady = 1;
+
+        InitializeCriticalSection(&g_blobCs);
+        g_blobCsReady = 1;
 
         th = CreateThread(NULL, 0, Manager, NULL, 0, NULL);
         if (th) CloseHandle(th);

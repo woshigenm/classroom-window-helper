@@ -1,18 +1,16 @@
 /* ============================================================
- *  fake_core.c -- deliberately broken Core DLLs for the Loader's
- *  failure-path tests (build three times with -DFAKE_MODE=0/1/2).
+ *  fake_core.c -- deliberately broken / instrumented Core DLLs for the
+ *  Loader tests (build with -DFAKE_MODE=<n>).
  *
- *  FAKE_MODE 0: Core_Init returns 0 (did nothing)  -> Loader may FreeLibrary
- *  FAKE_MODE 1: Core_Init returns 1 but abi_version=999
- *                -> Loader must NOT FreeLibrary, table stays NULL
- *  FAKE_MODE 2: Core_Init returns 1 with the right ABI but an incomplete
- *                hook table -> Loader must NOT FreeLibrary, table stays NULL
+ *  0: Core_Init returns 0 (did nothing)   -> Loader may FreeLibrary
+ *  1: returns 1, abi_version=999          -> must NOT FreeLibrary
+ *  2: returns 1, right ABI, hooks NULL    -> must NOT FreeLibrary
+ *  3: returns 1, complete dummy table, before_unload=1, and LoadLibrary(self)
+ *     once -> after reload FreeLibrary leaves it mapped (still-mapped test)
+ *  4: returns 1, complete dummy table, before_unload=1 (reload success test)
  *
- *  Modes 1/2 also start a heartbeat thread that keeps appending to
- *  %TEMP%\bypass_fake_core_beat.txt.  If the Loader wrongly FreeLibrary'd a
- *  successfully initialized Core, that thread would execute freed code and
- *  the host process would crash (no VERDICT line).  The script checks both:
- *  no crash AND the heartbeat file exists.
+ *  1/2 start a heartbeat thread (%TEMP%\bypass_fake_core_beat.txt); if the
+ *  Loader wrongly unloaded them the thread would crash the host.
  *
  *  32-bit, C, ASCII only.
  * ============================================================ */
@@ -28,7 +26,29 @@
 #define FAKE_MODE 0
 #endif
 
-#if FAKE_MODE != 0
+extern IMAGE_DOS_HEADER __ImageBase;
+
+#if FAKE_MODE >= 3
+static LONG_PTR WINAPI DummyHook(void)
+{
+    return 0;
+}
+
+static void FillDummyHooks(HrHooks* h)
+{
+    void** p = (void**)h;
+    size_t i, n = sizeof(*h) / sizeof(void*);
+
+    for (i = 0; i < n; i++) p[i] = (void*)DummyHook;
+}
+
+static int __cdecl FakeBeforeUnload(void)
+{
+    return 1;
+}
+#endif  /* FAKE_MODE >= 3 */
+
+#if FAKE_MODE == 1 || FAKE_MODE == 2
 static DWORD WINAPI BeatThread(LPVOID p)
 {
     char path[MAX_PATH];
@@ -56,7 +76,7 @@ static DWORD WINAPI BeatThread(LPVOID p)
     }
     return 0;
 }
-#endif  /* FAKE_MODE != 0 */
+#endif  /* FAKE_MODE == 1 || FAKE_MODE == 2 */
 
 __declspec(dllexport) int __cdecl Core_Init(const HrHost* host, HrCoreApi* api)
 {
@@ -70,12 +90,23 @@ __declspec(dllexport) int __cdecl Core_Init(const HrHost* host, HrCoreApi* api)
     api->size = sizeof(*api);
 # if FAKE_MODE == 1
     api->abi_version = 999;
+    CreateThread(NULL, 0, BeatThread, NULL, 0, NULL);
+# elif FAKE_MODE == 2
+    api->abi_version = HR_ABI_VERSION;
+    api->hooks.CreateProcessW = (PFN_CreateProcessW)(void*)0x1;  /* incomplete */
+    CreateThread(NULL, 0, BeatThread, NULL, 0, NULL);
 # else
     api->abi_version = HR_ABI_VERSION;
-    /* only one entry: HooksComplete() must reject the table */
-    api->hooks.CreateProcessW = (PFN_CreateProcessW)(void*)0x1;
+    FillDummyHooks(&api->hooks);
+    api->before_unload = FakeBeforeUnload;
+#  if FAKE_MODE == 3
+    {   /* extra reference: FreeLibrary will not unmap this module */
+        char own[MAX_PATH];
+        if (GetModuleFileNameA((HMODULE)&__ImageBase, own, sizeof(own)))
+            LoadLibraryA(own);
+    }
+#  endif
 # endif
-    CreateThread(NULL, 0, BeatThread, NULL, 0, NULL);
     return 1;
 #endif
 }

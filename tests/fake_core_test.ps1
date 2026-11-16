@@ -10,11 +10,11 @@ $beat = Join-Path $env:TEMP 'bypass_fake_core_beat.txt'
 
 $fakes = @(
     @{ dll = 'fake_core_return0.dll'; tag = 'return 0';
-       expect = 'Core_Init failed (returned 0)'; beat = $false },
+       expect = 'Core_Init returned 0'; beat = $false },
     @{ dll = 'fake_core_abi.dll'; tag = 'bad ABI';
-       expect = 'Core_Init returned bad ABI'; beat = $true },
+       expect = 'bad ABI'; beat = $true },
     @{ dll = 'fake_core_hooks.dll'; tag = 'incomplete hooks';
-       expect = 'Core hook table incomplete'; beat = $true }
+       expect = 'hook table incomplete'; beat = $true }
 )
 
 if (!(Test-Path $core)) { throw "missing $core" }

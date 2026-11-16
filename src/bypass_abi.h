@@ -31,10 +31,12 @@
 
 #include <windows.h>
 
-#define HR_ABI_VERSION   1
+#define HR_ABI_VERSION   2       /* v2: blob_put/blob_get added */
 #define HR_CORE_NAME     "bypass_hook_core.dll"
 #define HR_LOADER_NAME   "bypass_hook32.dll"
 #define HR_CORE_INIT     "Core_Init"
+#define HR_CACHE_DIR     "core_cache"
+#define HR_CTL_PIPE      "\\\\.\\pipe\\bypass_core_ctl_"
 
 /* ---------------- function signatures (shared by both sides) ---------------- */
 
@@ -132,6 +134,13 @@ typedef struct HrReals {
     void* InitiateSystemShutdownExW;
 } HrReals;
 
+/* P2: the Core stores reloadable state here.  The Loader keeps the store and
+   snapshots it before before_unload(); on a failed reload it restores the
+   snapshot BEFORE loading the previous Core, so that Core_Init reads the
+   pre-unload state (not a half-written blob from the new Core). */
+typedef int (*HR_BLOB_PUT)(const char* key, const void* data, unsigned int size);
+typedef int (*HR_BLOB_GET)(const char* key, void* out, unsigned int* size);
+
 typedef struct HrHost {
     unsigned int abi_version;
     unsigned int size;
@@ -139,6 +148,8 @@ typedef struct HrHost {
     const char*  loader_path;   /* full path of bypass_hook32.dll            */
     HR_LOG_FN    log;
     HR_PATCH_FN  patch_modules;
+    HR_BLOB_PUT  blob_put;
+    HR_BLOB_GET  blob_get;
     HrReals      real;
 } HrHost;
 

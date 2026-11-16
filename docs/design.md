@@ -700,6 +700,20 @@ bypass_hook_core.dll (Core)
 P2a = 缓存副本 + `still mapped` + 回滚框架（`before_unload` 先只 `return 1`）；
 P2b = 上面第 2 步的十项真正实现。
 
+**P2a 已实现的部分**：
+
+- 缓存目录 `bin\core_cache\core.<pid>.<seq>.dll`：源文件 `bypass_hook_core.dll`
+  从不被映射，构建输出可以随时覆盖；成功重载后删除旧缓存。
+- 控制管道 `\\.\pipe\bypass_core_ctl_<pid>`，一行命令 / 一行响应：
+  `status`、`reload`、`reload norollback`（`norollback` 用于调试，失败时不回滚）。
+- blob 仓库（32 项 × 256 字节）：`before_unload` **前**快照，回滚时**先恢复快照、
+  再加载旧 Core**（旧 Core 的 `Core_Init` 读到的必须是卸载前的状态）。
+- `still mapped` 检测的是**缓存副本路径**（`prev.cachePath`），不是源文件名；
+  命中后 `coreDead = 1`、`g_table = NULL`，之后所有 `reload` 直接拒绝。
+- **P2a 阶段真实 Core 的 `before_unload` 仍为 NULL**：它的 Worker/抓屏线程还没实现
+  排空，`reload` 会返回 `err no-drain (P2b)`，绝不会在 P2a 里卸载真实 Core。
+  P2b 实现十步之后再打开这条路径。
+
 ---
 
 ## 3. 日志与排错
@@ -862,6 +876,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\fake_core_test.ps1
 后两种假 Core 会起一个心跳线程写 `%TEMP%\bypass_fake_core_beat.txt`；脚本检查它存在，
 证明 `Core_Init` 返回 1 后 Loader 没有 `FreeLibrary`（否则线程会执行已释放代码、进程崩）。
 最后恢复真 Core，`wmode` 必须回到 `FIXED`。
+
+验证 P2a 的缓存副本 / 重载 / 回滚 / `still mapped`（`make.bat fakecores corehost` + 脚本）：
+
+```bat
+make.bat all fakecores corehost
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\reload_test.ps1
+```
+
+脚本启动一个自注入 Loader 的长驻 `core_host.exe`，通过
+`\\.\pipe\bypass_core_ctl_<pid>` 驱动：
+
+| 场景 | 期望 |
+|---|---|
+| 首次加载 | `bin\core_cache\core.<pid>.1.dll` 存在，`status` 返回 `seq=1` |
+| 重载成功 | `ok seq=2`，新缓存存在，旧缓存被删 |
+| 新 Core `Core_Init` 返回 0 | `rolledback`，日志有 `reload failed: Core_Init returned 0` 和 `rollback ok` |
+| 新 Core 返回 1 但 ABI 不对 | `rolledback`，日志有 `bad ABI ... leaving it mapped`（不卸载它） |
+| 装一个“泄漏” Core（自己多 `LoadLibrary` 一次）再重载 | `err coreDead`，日志有 `still mapped after FreeLibrary`，`status` 里 `dead=1`，进程不崩 |
+| 真实 Core（P2a 无 drain）重载 | `err no-drain (P2b)`，**不卸载** |
 
 验证"跨进程兜底不会卡死 enforcer"（`make.bat hangwintest` + 脚本）：
 

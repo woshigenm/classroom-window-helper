@@ -1869,7 +1869,7 @@ static DWORD PeStampFile(const char* path)
 }
 
 /* PE TimeDateStamp of the module mapped inside `pid` (0 = not loaded/no access). */
-static DWORD PeStampLoaded(DWORD pid, const char* dllName)
+static DWORD PeStampLoaded(DWORD pid, const char* dllName, BOOL matchCache)
 {
     HANDLE            snap, hp;
     MODULEENTRY32     me;
@@ -1884,7 +1884,13 @@ static DWORD PeStampLoaded(DWORD pid, const char* dllName)
     me.dwSize = sizeof(me);
     if (Module32First(snap, &me)) {
         do {
-            if (_stricmp(me.szModule, dllName) != 0) continue;
+            /* P2 起 Core 从 core.<pid>.<seq>.dll 的缓存副本映射, 名字不再等于
+               bypass_hook_core.dll —— 按前缀认。 */
+            if (matchCache) {
+                if (_strnicmp(me.szModule, "core.", 5) != 0) continue;
+            } else if (_stricmp(me.szModule, dllName) != 0) {
+                continue;
+            }
 
             hp = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
                              FALSE, pid);
@@ -1983,7 +1989,7 @@ static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
         }
 
         for (d = 0; d < 2; d++) {
-            DWORD stamp = PeStampLoaded(pid, dllNames[d]);
+            DWORD stamp = PeStampLoaded(pid, dllNames[d], d == 1);
             char  t[40];
             char  part[96];
 

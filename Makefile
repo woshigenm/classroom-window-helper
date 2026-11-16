@@ -53,7 +53,7 @@ CFLAGS32 := -std=gnu11 -O2 -Wall
 DLLFLAGS := -shared -Wl,--kill-at -static -static-libgcc
 DLLLIBS  := -lpsapi -lole32 -ladvapi32 -lgdi32
 
-.PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest hangwintest screentest shuttest fakecores clean rebuild check
+.PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest hangwintest screentest shuttest fakecores corehost clean rebuild check
 
 # 主程序 + DLL + 注入器 + 自动提权载荷（自测程序按需单独编）
 all: bypass hook32 lpe
@@ -93,7 +93,10 @@ screentest: $(BIN)/screenguard_test.exe
 shuttest: $(BIN)/shutguard_test.exe
 
 # 故意损坏的 Core（Loader 失败路径：返回 0 / ABI 不符 / hook 表不全）
-fakecores: $(BIN)/fake_core_return0.dll $(BIN)/fake_core_abi.dll $(BIN)/fake_core_hooks.dll
+fakecores: $(BIN)/fake_core_return0.dll $(BIN)/fake_core_abi.dll $(BIN)/fake_core_hooks.dll $(BIN)/fake_core_leak.dll $(BIN)/fake_core_good.dll
+
+# 长驻宿主: 自注入 Loader 后睡眠, 供 P2a 重载脚本通过命名管道驱动
+corehost: $(BIN)/core_host.exe
 
 # ---- outputs -------------------------------------------------
 
@@ -136,6 +139,15 @@ $(BIN)/fake_core_abi.dll: tests/fake_core.c src/bypass_abi.h | $(BIN)
 $(BIN)/fake_core_hooks.dll: tests/fake_core.c src/bypass_abi.h | $(BIN)
 	"$(CC32)" $(CFLAGS32) -DFAKE_MODE=2 $(DLLFLAGS) "tests/fake_core.c" -o "$@"
 
+$(BIN)/fake_core_leak.dll: tests/fake_core.c src/bypass_abi.h | $(BIN)
+	"$(CC32)" $(CFLAGS32) -DFAKE_MODE=3 $(DLLFLAGS) "tests/fake_core.c" -o "$@"
+
+$(BIN)/fake_core_good.dll: tests/fake_core.c src/bypass_abi.h | $(BIN)
+	"$(CC32)" $(CFLAGS32) -DFAKE_MODE=4 $(DLLFLAGS) "tests/fake_core.c" -o "$@"
+
+$(BIN)/core_host.exe: tests/core_host.c | $(BIN)
+	"$(CC32)" $(CFLAGS32) "tests/core_host.c" -o "$@"
+
 $(BIN)/vd_pin_test.exe: tests/vd_pin_test.c | $(BIN)
 	"$(CC32)" $(CFLAGS32) "tests/vd_pin_test.c" -o "$@" -lole32 -luuid -ladvapi32
 
@@ -156,7 +168,7 @@ clean:
 	-@del /q "$(BIN)\vd_pin_test.exe" 2>nul
 	-@del /q "$(BIN)\screenguard_test.exe" 2>nul
 	-@del /q "$(BIN)\shutguard_test.exe" 2>nul
-	-@del /q "$(BIN)\fake_core_return0.dll" "$(BIN)\fake_core_abi.dll" "$(BIN)\fake_core_hooks.dll" 2>nul
+	-@del /q "$(BIN)\fake_core_return0.dll" "$(BIN)\fake_core_abi.dll" "$(BIN)\fake_core_hooks.dll" "$(BIN)\fake_core_leak.dll" "$(BIN)\fake_core_good.dll" "$(BIN)\core_host.exe" 2>nul
 	-@rmdir /s /q "$(BIN)\lpe" 2>nul
 	@echo [clean] done
 
