@@ -596,6 +596,8 @@ static DWORD WINAPI VD_Thread(LPVOID p)
         return 0;
     }
 
+    HookLog("vd: thread started (p2b-1 marker)");
+
     if (g_vdCfgEnabled) {
         char ts[64] = "-";
 

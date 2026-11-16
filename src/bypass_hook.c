@@ -2089,7 +2089,7 @@ static LONG_PTR SanitizeStyle(HWND h, LONG_PTR val, BOOL* skip)
     return val;
 }
 
-static LONG WINAPI Hook_SetWindowLongW(HWND h, int idx, LONG val)
+static LONG WINAPI Impl_SetWindowLongW(HWND h, int idx, LONG val)
 {
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (idx == GWL_STYLE && (LooksManaged(h) || ShouldRestyle(h, val))) {
@@ -2103,7 +2103,7 @@ static LONG WINAPI Hook_SetWindowLongW(HWND h, int idx, LONG val)
     return real_SetWindowLongW(h, idx, val);
 }
 
-static LONG WINAPI Hook_SetWindowLongA(HWND h, int idx, LONG val)
+static LONG WINAPI Impl_SetWindowLongA(HWND h, int idx, LONG val)
 {
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (idx == GWL_STYLE && (LooksManaged(h) || ShouldRestyle(h, val))) {
@@ -2117,7 +2117,7 @@ static LONG WINAPI Hook_SetWindowLongA(HWND h, int idx, LONG val)
     return real_SetWindowLongA(h, idx, val);
 }
 
-static LONG_PTR WINAPI Hook_SetWindowLongPtrW(HWND h, int idx, LONG_PTR val)
+static LONG_PTR WINAPI Impl_SetWindowLongPtrW(HWND h, int idx, LONG_PTR val)
 {
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (idx == GWL_STYLE && (LooksManaged(h) || ShouldRestyle(h, val))) {
@@ -2131,7 +2131,7 @@ static LONG_PTR WINAPI Hook_SetWindowLongPtrW(HWND h, int idx, LONG_PTR val)
     return real_SetWindowLongPtrW(h, idx, val);
 }
 
-static LONG_PTR WINAPI Hook_SetWindowLongPtrA(HWND h, int idx, LONG_PTR val)
+static LONG_PTR WINAPI Impl_SetWindowLongPtrA(HWND h, int idx, LONG_PTR val)
 {
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (idx == GWL_STYLE && (LooksManaged(h) || ShouldRestyle(h, val))) {
@@ -2145,7 +2145,7 @@ static LONG_PTR WINAPI Hook_SetWindowLongPtrA(HWND h, int idx, LONG_PTR val)
     return real_SetWindowLongPtrA(h, idx, val);
 }
 
-static BOOL WINAPI Hook_MoveWindow(HWND h, int x, int y, int w, int hgt, BOOL repaint)
+static BOOL WINAPI Impl_MoveWindow(HWND h, int x, int y, int w, int hgt, BOOL repaint)
 {
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (InterlockedIncrement(&g_mwLogs) <= 40) {
@@ -2452,7 +2452,7 @@ static BOOL WINAPI Hook_ShowWindowAsync(HWND h, int cmd)
    ★ 不要用 real_ShowCursor(TRUE) 去"抵消" —— 那会让显示计数只增不减
      (应用成对调用后仍在 +2N), 跑久了计数很大, 之后连放行 (bypass_hook.off)
      或系统自己的隐藏都再也藏不住光标。这里直接回报"可见、计数未变"。 */
-static int WINAPI Hook_ShowCursor(BOOL show)
+static int WINAPI Impl_ShowCursor(BOOL show)
 {
     if (!g_disabled && !show) return 0;
     return real_ShowCursor(show);
@@ -2460,7 +2460,7 @@ static int WINAPI Hook_ShowCursor(BOOL show)
 
 /* SDL 在窗口里会 SetCursor(NULL) (相当于把光标藏起来, 但 ShowCursor 计数不变),
    鼠标一进小窗光标就"消失"就是它干的。这里换成一个箭头。 */
-static HCURSOR WINAPI Hook_SetCursor(HCURSOR c)
+static HCURSOR WINAPI Impl_SetCursor(HCURSOR c)
 {
     if (!g_disabled && !c) {
         HCURSOR arrow = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
@@ -2495,7 +2495,7 @@ static BOOL WindowModeOn(void)
 /* 切桌面: 一旦拦下来, 进程就一直留在原来的桌面 (学生自己的桌面)。
    证据: MultiClient.exe 的 tcpclient 构造里 CreateDesktopA("NetTeachingDesktop"),
    再由 FUN_00402c90 在启动 ScreenRender 之后调 SwitchDesktop(hdesk)。 */
-static BOOL WINAPI Hook_SwitchDesktop(HDESK desk)
+static BOOL WINAPI Impl_SwitchDesktop(HDESK desk)
 {
     if (!g_disabled &&
         WindowModeOn()) {
@@ -4291,6 +4291,94 @@ static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd,
     return r;
 }
 
+static LONG WINAPI Hook_SetWindowLongW(HWND h, int idx, LONG val)
+{
+    LONG r;
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_SetWindowLongW ? real_SetWindowLongW(h, idx, val) : 0;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_SetWindowLongW(h, idx, val);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
+static LONG WINAPI Hook_SetWindowLongA(HWND h, int idx, LONG val)
+{
+    LONG r;
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_SetWindowLongA ? real_SetWindowLongA(h, idx, val) : 0;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_SetWindowLongA(h, idx, val);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
+static LONG_PTR WINAPI Hook_SetWindowLongPtrW(HWND h, int idx, LONG_PTR val)
+{
+    LONG_PTR r;
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_SetWindowLongPtrW ? real_SetWindowLongPtrW(h, idx, val) : 0;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_SetWindowLongPtrW(h, idx, val);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
+static LONG_PTR WINAPI Hook_SetWindowLongPtrA(HWND h, int idx, LONG_PTR val)
+{
+    LONG_PTR r;
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_SetWindowLongPtrA ? real_SetWindowLongPtrA(h, idx, val) : 0;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_SetWindowLongPtrA(h, idx, val);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
+static BOOL WINAPI Hook_MoveWindow(HWND h, int x, int y, int w, int hgt, BOOL repaint)
+{
+    BOOL r;
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_MoveWindow ? real_MoveWindow(h, x, y, w, hgt, repaint) : FALSE;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_MoveWindow(h, x, y, w, hgt, repaint);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
+static BOOL WINAPI Hook_SwitchDesktop(HDESK desk)
+{
+    BOOL r;
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_SwitchDesktop ? real_SwitchDesktop(desk) : TRUE;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_SwitchDesktop(desk);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
+static int WINAPI Hook_ShowCursor(BOOL show)
+{
+    int r;
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_ShowCursor ? real_ShowCursor(show) : 0;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_ShowCursor(show);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
+static HCURSOR WINAPI Hook_SetCursor(HCURSOR c)
+{
+    HCURSOR r;
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_SetCursor ? real_SetCursor(c) : NULL;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_SetCursor(c);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
 static void FillHookTable(HrHooks* h)
 {
     memset(h, 0, sizeof(*h));
@@ -4386,6 +4474,19 @@ static int __cdecl Core_BeforeUnload(void)
     if (!VD_StopWait(3000)) {
         HookLog("[Core] unload failed: VD thread did not stop in 3s");
         return 0;
+    }
+
+    /* ★ 阶段 1 通过到 g_coreDisabled=1 之间可能刚进来一个 hook:
+       线程停完后必须再等一次引用计数归零 (P2b-1 补的竞态窗口)。 */
+    {
+        int i;
+        for (i = 0; i < 50 && InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0; i++)
+            Sleep(1);
+        if (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0) {
+            HookLog("[Core] unload failed: %ld hooks still executing after thread stop",
+                    (long)InterlockedCompareExchange(&g_inHookCount, 0, 0));
+            return 0;
+        }
     }
 
     HookLog("[Core] before_unload: worker + caption + vd stopped (P2b-1)");

@@ -150,19 +150,28 @@ $host2 = $null
 $pid2 = 0
 try {
     Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
+    $from2 = if (Test-Path $log) { (Get-Item $log).Length } else { 0 }
     $host2 = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
         -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll', '--seconds', '20')
     for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "core_host (real) did not write its pidfile" }
     $pid2 = [int](Get-Content $pidfile -Raw).Trim()
     Start-Sleep -Milliseconds 1500
-    $from2 = if (Test-Path $log) { (Get-Item $log).Length } else { 0 }
+
+    $boot = Log-New $from2
+    "--- real Core boot (all three threads?) ---"
+    foreach ($pat in @('attached: core_host.exe', 'caption pump started', 'vd: thread started')) {
+        if ($boot -match [regex]::Escape($pat)) { "  $pat : ok" }
+        else { "  $pat : FAIL"; $pass = $false }
+    }
+
+    $fromReload = if (Test-Path $log) { (Get-Item $log).Length } else { 0 }
     $r = Send-Ctl $pid2 'reload'
     "--- real Core reload (P2b-1: must succeed) ---"
     "  resp     : $r"
     if ($r -notmatch '^ok seq=') { $pass = $false }
     Start-Sleep -Milliseconds 500
-    $new2 = Log-New $from2
+    $new2 = Log-New $fromReload
     if ($new2 -match '\[Core\] before_unload: worker \+ caption \+ vd stopped') { "  log      : ok (threads stopped)" }
     else { "  log      : FAIL (missing before_unload line)"; $pass = $false }
     if ($new2 -match '\[Loader\] core loaded:') { "  new core : ok" }

@@ -741,18 +741,28 @@ P2b 测试矩阵：正常重载 / Worker 卡住（`SuspendThread`）/ `g_inHookC
 **P2b-1 已实现（骨架）**：
 
 - `Core_BeforeUnload` 两阶段：阶段 1 检查 `g_inHookCount`（10ms 归零）和
-  “Worker 不是已在停止中”；阶段 2 置 `g_coreDisabled`、停线程、返回 1。
-- 守卫先加在 3 个最忙的 hook 上：`ShowWindow`、`SetWindowPos`、`CreateProcessW`
-  （`g_coreDisabled` 直通 + `g_inHookCount` 进出计数）。其余 30 个在 P2b-2 补齐。
+  “Worker 不是已在停止中”；阶段 2 置 `g_coreDisabled`、停线程、**线程停完后
+  再等一次 `g_inHookCount == 0`（50ms）**，再返回 1 —— 补掉“阶段 1 通过到
+  `g_coreDisabled=1` 之间刚进来一个 hook”的竞态窗口。
+- 守卫已加到 **11 个 hook**：`ShowWindow`、`SetWindowPos`、`CreateProcessW`，
+  以及三个线程实际会走到的 `SetWindowLongW/A`、`SetWindowLongPtrW/A`、
+  `MoveWindow`、`SwitchDesktop`、`ShowCursor`、`SetCursor`
+  （`EnsureSubclassed` 走 `SetWindowLongW`，所以这组必须先有）。
 - **比“只停 Worker”多停了 caption pump 和 VD 线程**：这两个线程每 250/500ms
   都会执行 Core 代码，只停 Worker 的话 `FreeLibrary` 之后它们立刻会踩到已释放
   代码。`core_host` 的实测也证明必须一起停。
-- 真实 Core 重载已通过：`before_unload: worker + caption + vd stopped` →
-  `still mapped` 不报错 → 新 Core 加载 → `core_host` 存活。
+- `CoInitializeEx` / `CoUninitialize` 都在 VD 线程内配对；`VD_StopWait` 只
+  `WaitForSingleObject` + `CloseHandle`，不碰调用方线程的 COM。
+- caption 线程不调用 VD 接口，停止顺序（Worker → caption → VD）没有反向依赖。
+- 真实 Core 重载已通过：三个线程的启动标记（`attached: core_host.exe`、
+  `caption pump started`、`vd: thread started`）都在 `before_unload` 之前出现，
+  重载后 `still mapped` 不报错、新 Core 加载、宿主存活。
 
-P2b-2 剩余：其余 30 个 hook 的守卫、`RemoveWindowSubclass`、`KillTimer`、
-`UnregisterClass`、`StateClose`（共享内存句柄）、`g_prevUef` 链不能在重载后
-指向已卸载的旧 Core。
+P2b-2 剩余：其余 22 个 hook 的守卫（或把 `g_inHookCount` 上移到 Loader 的
+33 个 dispatcher，按构造覆盖全部）、`RemoveWindowSubclass`、`KillTimer`、
+`UnregisterClass`、`StateClose`（共享内存句柄）。`g_prevUef` 建议改由 Loader
+持有（`HrHost` 加 `uef_push`/`uef_pop`，ABI 升 3），新 Core 重新注册，旧 Core
+的过滤器在卸载前摘掉。
 
 ---
 
