@@ -714,6 +714,30 @@ P2b = 上面第 2 步的十项真正实现。
   排空，`reload` 会返回 `err no-drain (P2b)`，绝不会在 P2a 里卸载真实 Core。
   P2b 实现十步之后再打开这条路径。
 
+**P2b：`before_unload` 分两阶段**（按评审定稿）
+
+阶段 1（只读/可逆检查，任一失败 `return 0`，**什么都没动**）：
+
+1. `g_inHookCount == 0`，或 10ms 内能归零；仍 > 0 说明有 hook 卡住 → 拒绝；
+2. Worker / caption / VD 的停止标志没有被置过（不是已在停止中）；
+3. DLL 自己创建的窗口/窗口类没有未销毁的实例（`FindWindowEx` 遍历）。
+
+阶段 2（不可逆清理）：
+
+1. `g_coreDisabled = 1`（新调用直通）；
+2. 停 Worker / caption / VD，各自 3 秒超时；
+3. `RemoveWindowSubclass` / `KillTimer` / `UnregisterClass`；
+4. 等 `g_inHookCount == 0`（3 秒超时）；
+5. 把最终状态写进 blob（Loader 在 `before_unload` **返回 1 之后**才拍快照）；
+6. `return 1`。
+
+> 阶段 2 某一步超时返回 0 时，Core 已经置了 `g_coreDisabled`、可能停了一半线程——
+> 这是不可逆操作开始后的固有风险。阶段 1 的检查目的就是把这种情况压到接近零；
+> Loader 收到 0 时不卸载，旧 Core 进入“活着但不再拦截”的状态并写日志。
+
+P2b 测试矩阵：正常重载 / Worker 卡住（`SuspendThread`）/ `g_inHookCount` 卡住
+（hook 里 `Sleep(5000)`）/ 窗口未销毁 / 连续重载 3 次 / 阶段 1 失败后关闭窗口再次重载。
+
 ---
 
 ## 3. 日志与排错

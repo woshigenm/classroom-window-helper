@@ -1121,7 +1121,6 @@ static int DoReload(int noRollback, char* resp, size_t cap)
 
     _snprintf(prev, sizeof(prev) - 1, "%s", g_cur.path);
     prev[sizeof(prev) - 1] = '\0';
-    BlobSnapshot();
 
     /* table still points at the old Core: let it drain while its hooks are
        still reachable (Core sets its own disabled flag internally). */
@@ -1129,6 +1128,10 @@ static int DoReload(int noRollback, char* resp, size_t cap)
         _snprintf(resp, cap - 1, "err refused-by-core\n");
         return 0;
     }
+
+    /* ★ 快照必须在 before_unload 成功**之后**拍: P2b 的 before_unload 会把
+       最终状态写进 blob (窗口位置/计数等), 先拍会把这份最终状态丢掉。 */
+    BlobSnapshot();
 
     InterlockedExchangePointer((PVOID volatile*)&g_table, NULL);
     g_cur.valid = 0;
@@ -1156,6 +1159,15 @@ static int DoReload(int noRollback, char* resp, size_t cap)
     HookLog("[Loader] reload failed: %s", err);
     if (noRollback) {
         _snprintf(resp, cap - 1, "err reload-failed (no rollback): %s\n", err);
+        return 0;
+    }
+
+    /* ★ 旧缓存副本必须还在: 它只在“重载成功”后才删。这里再显式确认一次,
+       避免外部误删/清理工具把它带走后回滚时读到不存在的文件。 */
+    if (GetFileAttributesA(prev) == INVALID_FILE_ATTRIBUTES) {
+        InterlockedExchange(&g_coreDead, 1);
+        HookLog("[Loader] rollback impossible: previous cache missing (%s)", prev);
+        _snprintf(resp, cap - 1, "err coreDead (previous cache missing)\n");
         return 0;
     }
 
