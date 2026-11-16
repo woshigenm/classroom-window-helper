@@ -132,8 +132,19 @@ mode=freeze     ; freeze=第一帧当定格帧（默认） / blank=固定纯色
 ### 5.5 屏蔽控制端重启/关机（`bin\bypass_shut.ini`）
 
 主界面勾选框「屏蔽控制端重启/关机」。勾上之后，老师端菜单里的**远程重启 (0x27)** 和
-**远程关机 (0x28)** 都会被吞掉：本机不关机、不重启，只在 `bin\bypass_hook.log` 里留一行
-`[Guard] remote power command blocked: ...`。
+**远程关机 (0x28)** 都会被吞掉：本机不关机、不重启，只在 `bin\bypass_hook.log` 里留一行：
+
+```
+[Guard] blocked ExitWindowsEx flags=0x6 (restart)      ← 0x27 重启
+[Guard] blocked ExitWindowsEx flags=0x1 (shutdown)     ← 0x28 关机（如果走这个 API）
+[Guard] blocked CreateProcessW (shutdown -s -t 1)      ← 0x28 关机（走 shutdown.exe）
+```
+
+`flags` 一眼就能分清老师点的是重启还是关机。前 3 次逐条记，之后每 25 次只记一行
+`blocked N remote power commands (last: ...)`，不会刷爆日志。
+
+面板收进托盘时点不到勾选框：**右键托盘图标**，菜单里的「屏蔽控制端重启/关机」是同一个开关
+（带勾选状态）。
 
 ```ini
 ; bin\bypass_shut.ini（点勾选框自动生成，DLL 每 0.5 秒重读，改完不用重启）

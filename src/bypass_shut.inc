@@ -31,7 +31,8 @@
  */
 
 #define SH_INI_NAME     "bypass_shut.ini"
-#define SH_LOG_MAX      10      /* log the first N blocked calls, then every 50th */
+#define SH_LOG_MAX      3       /* first 3 blocked calls in full ... */
+#define SH_LOG_EVERY    25      /* ... then one heartbeat every 25th */
 #define SH_WBUF         1024
 
 typedef BOOL      (WINAPI *PFN_ExitWindowsEx)(UINT, DWORD);
@@ -236,23 +237,17 @@ static int SH_IsShutdownCmdA(const char* app, const char* cmd)
 
 /* ---------------- logging + decision --------------------------------------- */
 
-static void SH_LogBlock(const char* api, const char* cmdA, const WCHAR* cmdW)
+/* The console retries every ~20 s, so an identical line per hit is noise.
+   Log the first few in full, then only a heartbeat every SH_LOG_EVERY. */
+static void SH_LogBlock(const char* what)
 {
     LONG n = InterlockedIncrement(&g_shutHits);
 
-    if (n > SH_LOG_MAX && (n % 50) != 0) return;
-
-    if (cmdA && cmdA[0]) {
-        HookLog("[Guard] remote power command blocked: %s (%s)", api, cmdA);
-    } else if (cmdW && cmdW[0]) {
-        char a[512];
-
-        a[0] = 0;
-        WideCharToMultiByte(CP_ACP, 0, cmdW, -1, a, sizeof(a) - 1, NULL, NULL);
-        a[sizeof(a) - 1] = '\0';
-        HookLog("[Guard] remote power command blocked: %s (%s)", api, a);
-    } else {
-        HookLog("[Guard] remote power command blocked: %s", api);
+    if (n <= SH_LOG_MAX) {
+        HookLog("[Guard] blocked %s (total=%ld)", what, (long)n);
+    } else if ((n % SH_LOG_EVERY) == 0) {
+        HookLog("[Guard] blocked %ld remote power commands (last: %s)",
+                (long)n, what);
     }
 }
 
@@ -263,15 +258,32 @@ static int SH_On(void)
 
 static int SH_BlockA(const char* app, const char* cmd, const char* api)
 {
+    char what[420];
+
     if (!SH_On() || !SH_IsShutdownCmdA(app, cmd)) return 0;
-    SH_LogBlock(api, cmd ? cmd : app, NULL);
+    _snprintf(what, sizeof(what) - 1, "%s (%s)", api,
+              (cmd && cmd[0]) ? cmd : (app && app[0] ? app : "?"));
+    what[sizeof(what) - 1] = '\0';
+    SH_LogBlock(what);
     return 1;
 }
 
 static int SH_BlockW(const WCHAR* app, const WCHAR* cmd, const char* api)
 {
+    char a[384], what[420];
+    const WCHAR* src;
+
     if (!SH_On() || !SH_IsShutdownCmdW(app, cmd)) return 0;
-    SH_LogBlock(api, NULL, cmd ? cmd : app);
+
+    src = (cmd && cmd[0]) ? cmd : app;
+    a[0] = '\0';
+    if (src) {
+        WideCharToMultiByte(CP_ACP, 0, src, -1, a, sizeof(a) - 1, NULL, NULL);
+        a[sizeof(a) - 1] = '\0';
+    }
+    _snprintf(what, sizeof(what) - 1, "%s (%s)", api, a[0] ? a : "?");
+    what[sizeof(what) - 1] = '\0';
+    SH_LogBlock(what);
     return 1;
 }
 
@@ -280,7 +292,19 @@ static int SH_BlockW(const WCHAR* app, const WCHAR* cmd, const char* api)
 static BOOL WINAPI SH_Hook_ExitWindowsEx(UINT flags, DWORD reason)
 {
     if (SH_On()) {
-        SH_LogBlock("ExitWindowsEx (restart/shutdown)", NULL, NULL);
+        char what[96];
+        const char* kind = "logoff";
+
+        /* EWX_REBOOT=0x2 (0x27), EWX_SHUTDOWN=0x1 (0x28), EWX_POWEROFF=0x8 */
+        if (flags & EWX_REBOOT)        kind = "restart";
+        else if (flags & EWX_SHUTDOWN) kind = "shutdown";
+        else if (flags & EWX_POWEROFF) kind = "poweroff";
+
+        _snprintf(what, sizeof(what) - 1,
+                  "ExitWindowsEx flags=0x%lx (%s)",
+                  (unsigned long)flags, kind);
+        what[sizeof(what) - 1] = '\0';
+        SH_LogBlock(what);
         SetLastError(0);
         return TRUE;                     /* pretend it worked: no retry */
     }
@@ -315,7 +339,7 @@ static BOOL WINAPI SH_Hook_InitiateSystemShutdownA(LPSTR machine, LPSTR msg, DWO
                                                    BOOL force, BOOL reboot)
 {
     if (SH_On()) {
-        SH_LogBlock("InitiateSystemShutdownA", machine, NULL);
+        SH_LogBlock("InitiateSystemShutdownA");
         return TRUE;
     }
     return real_InitiateSystemShutdownA
@@ -326,7 +350,7 @@ static BOOL WINAPI SH_Hook_InitiateSystemShutdownW(LPWSTR machine, LPWSTR msg, D
                                                    BOOL force, BOOL reboot)
 {
     if (SH_On()) {
-        SH_LogBlock("InitiateSystemShutdownW", NULL, machine);
+        SH_LogBlock("InitiateSystemShutdownW");
         return TRUE;
     }
     return real_InitiateSystemShutdownW
@@ -337,7 +361,7 @@ static BOOL WINAPI SH_Hook_InitiateSystemShutdownExA(LPSTR machine, LPSTR msg, D
                                                      BOOL force, BOOL reboot, DWORD reason)
 {
     if (SH_On()) {
-        SH_LogBlock("InitiateSystemShutdownExA", machine, NULL);
+        SH_LogBlock("InitiateSystemShutdownExA");
         return TRUE;
     }
     return real_InitiateSystemShutdownExA
@@ -349,7 +373,7 @@ static BOOL WINAPI SH_Hook_InitiateSystemShutdownExW(LPWSTR machine, LPWSTR msg,
                                                      BOOL force, BOOL reboot, DWORD reason)
 {
     if (SH_On()) {
-        SH_LogBlock("InitiateSystemShutdownExW", NULL, machine);
+        SH_LogBlock("InitiateSystemShutdownExW");
         return TRUE;
     }
     return real_InitiateSystemShutdownExW
@@ -359,29 +383,50 @@ static BOOL WINAPI SH_Hook_InitiateSystemShutdownExW(LPWSTR machine, LPWSTR msg,
 
 /* ---------------- setup + heartbeat ---------------------------------------- */
 
-static void SH_LogInstall(const char* api, BOOL ok)
+/* One summary line per process instead of one per hooked API (the classroom
+   spawns several of them; six lines each drowned the interesting entries). */
+static void SH_LogHookSummary(const char* const* names, const BOOL* ok, int n)
 {
-    HookLog("[Guard] hook %s: %s", api,
-            ok ? "installed" : "FAILED (IAT only)");
+    char list[256], failed[128];
+    int  i, good = 0;
+
+    list[0] = 0;
+    failed[0] = 0;
+    for (i = 0; i < n; i++) {
+        char*  dst = ok[i] ? list : failed;
+        size_t cap = ok[i] ? sizeof(list) : sizeof(failed);
+
+        if (dst[0]) strncat(dst, " ", cap - strlen(dst) - 1);
+        strncat(dst, names[i], cap - strlen(dst) - 1);
+        if (ok[i]) good++;
+    }
+
+    if (good == n) {
+        HookLog("[Guard] hooks installed: %s", list);
+    } else {
+        HookLog("[Guard] hooks %d/%d installed: %s", good, n, list);
+        HookLog("[Guard] hook FAILED: %s", failed);
+    }
 }
 
 static void SH_Init(void)
 {
-    HMODULE mod;
+    HMODULE        mod;
+    const char*    names[6];
+    BOOL           ok[6];
+    int            n = 0;
+    FARPROC        p;
 
     SH_ReadConfig();
 
     mod = GetModuleHandleA("kernel32.dll");
     if (mod) {
-        FARPROC p;
-
         p = GetProcAddress(mod, "WinExec");
         if (p) {
-            BOOL ok;
-
             real_WinExec = (PFN_WinExec)p;
-            ok = InstallInlineHook((void*)p, (void*)SH_Hook_WinExec, (void**)&real_WinExec);
-            SH_LogInstall("WinExec", ok);
+            names[n] = "WinExec";
+            ok[n++] = InstallInlineHook((void*)p, (void*)SH_Hook_WinExec,
+                                        (void**)&real_WinExec);
         }
 
         /* The 0x28 path runs `shutdown -s -t 1` through systemoper.dll, which
@@ -389,65 +434,56 @@ static void SH_Init(void)
            time, but the kernel32 entry is shared by every module in this
            process, so an entry hook covers it from the first call. */
         if (real_CreateProcessW) {
-            FARPROC p2 = GetProcAddress(mod, "CreateProcessW");
-            if (p2) {
-                BOOL ok = InstallInlineHook((void*)p2, (void*)Hook_CreateProcessW,
+            p = GetProcAddress(mod, "CreateProcessW");
+            if (p) {
+                names[n] = "CreateProcessW";
+                ok[n++] = InstallInlineHook((void*)p, (void*)Hook_CreateProcessW,
                                             (void**)&real_CreateProcessW);
-                SH_LogInstall("CreateProcessW", ok);
             }
         }
         if (real_CreateProcessA) {
-            FARPROC p3 = GetProcAddress(mod, "CreateProcessA");
-            if (p3) {
-                BOOL ok = InstallInlineHook((void*)p3, (void*)Hook_CreateProcessA,
+            p = GetProcAddress(mod, "CreateProcessA");
+            if (p) {
+                names[n] = "CreateProcessA";
+                ok[n++] = InstallInlineHook((void*)p, (void*)Hook_CreateProcessA,
                                             (void**)&real_CreateProcessA);
-                SH_LogInstall("CreateProcessA", ok);
             }
         }
     }
 
     mod = GetModuleHandleA("user32.dll");
     if (mod) {
-        FARPROC p = GetProcAddress(mod, "ExitWindowsEx");
-
+        p = GetProcAddress(mod, "ExitWindowsEx");
         if (p) {
-            BOOL ok;
-
             real_ExitWindowsEx = (PFN_ExitWindowsEx)p;
-            ok = InstallInlineHook((void*)p, (void*)SH_Hook_ExitWindowsEx,
-                                   (void**)&real_ExitWindowsEx);
-            SH_LogInstall("ExitWindowsEx", ok);
+            names[n] = "ExitWindowsEx";
+            ok[n++] = InstallInlineHook((void*)p, (void*)SH_Hook_ExitWindowsEx,
+                                        (void**)&real_ExitWindowsEx);
         }
     }
 
     mod = GetModuleHandleA("shell32.dll");
     if (mod) {
-        FARPROC p;
-
         p = GetProcAddress(mod, "ShellExecuteA");
         if (p) {
-            BOOL ok;
-
             real_ShellExecuteA = (PFN_ShellExecuteA)p;
-            ok = InstallInlineHook((void*)p, (void*)SH_Hook_ShellExecuteA,
-                                   (void**)&real_ShellExecuteA);
-            SH_LogInstall("ShellExecuteA", ok);
+            names[n] = "ShellExecuteA";
+            ok[n++] = InstallInlineHook((void*)p, (void*)SH_Hook_ShellExecuteA,
+                                        (void**)&real_ShellExecuteA);
         }
         p = GetProcAddress(mod, "ShellExecuteW");
         if (p) {
-            BOOL ok;
-
             real_ShellExecuteW = (PFN_ShellExecuteW)p;
-            ok = InstallInlineHook((void*)p, (void*)SH_Hook_ShellExecuteW,
-                                   (void**)&real_ShellExecuteW);
-            SH_LogInstall("ShellExecuteW", ok);
+            names[n] = "ShellExecuteW";
+            ok[n++] = InstallInlineHook((void*)p, (void*)SH_Hook_ShellExecuteW,
+                                        (void**)&real_ShellExecuteW);
         }
     }
 
+    SH_LogHookSummary(names, ok, n);
+
     mod = GetModuleHandleA("advapi32.dll");
     if (mod) {
-        FARPROC p;
-
         p = GetProcAddress(mod, "InitiateSystemShutdownA");
         if (p) real_InitiateSystemShutdownA = (PFN_InitiateSystemShutdownA)p;
         p = GetProcAddress(mod, "InitiateSystemShutdownW");
@@ -459,16 +495,21 @@ static void SH_Init(void)
     }
 }
 
-/* Called from the worker loop: re-read the ini, report state changes once. */
+/* Called from the worker loop: re-read the ini.  Only state *changes* are
+   logged (plus one ON line at startup, which is useful to confirm injection);
+   the default "off" is not interesting and was printed by every process. */
 static void SH_Tick(void)
 {
     LONG was = g_shutEnabled;
 
     SH_ReadConfig();
 
-    if (g_shutEnabled != was || !g_shutInitLogged) {
+    if (g_shutEnabled != was) {
+        HookLog("[Guard] remote shutdown guard -> %s",
+                g_shutEnabled ? "ON" : "off");
+    } else if (!g_shutInitLogged) {
         g_shutInitLogged = 1;
-        HookLog("[Guard] remote shutdown/restart guard -> %s (%s)",
-                g_shutEnabled ? "ON" : "off", SH_INI_NAME);
+        if (g_shutEnabled)
+            HookLog("[Guard] remote shutdown guard -> ON (%s)", SH_INI_NAME);
     }
 }

@@ -591,17 +591,23 @@ FUN_00413560(cmd)
 - 被拦的调用返回**成功**（`ExitWindowsEx` → `TRUE`，`WinExec` → `33`，`ShellExecute` → `(HINSTANCE)33`，
   `CreateProcess` → `TRUE` + 全零 `PROCESS_INFORMATION`），控制端不会把它当成失败重试。
 - 开关：`bin\bypass_shut.ini` 的 `enabled=0/1`，DLL 每 0.5 秒重读；主界面勾选框
-  「屏蔽控制端重启/关机」写这个文件并调 `RunInjector` 保证 DLL 已进入 `Student.exe`。
+  「屏蔽控制端重启/关机」和托盘右键菜单里的同名项是**同一个**开关（都走 `SetShutGuard`，
+  保证 ini / DLL / 勾选框状态一致），打开时调 `RunInjector` 保证 DLL 已进入 `Student.exe`。
 - 只影响被注入的课堂进程；用户自己从开始菜单/`shutdown` 关机不经过这些进程，不受影响。
-- 日志：`[Guard] hook <api>: installed/FAILED (IAT only)`（启动时每个入口一行）、
-  `[Guard] remote power command blocked: <api> (<cmdline>)`（拦截时）。
+- 日志（刻意压量，控制端会每 ~20 秒重发）：
+  - 启动时每个进程一行汇总：`[Guard] hooks installed: WinExec CreateProcessW ...`；
+    任何一个入口没打上会有 `[Guard] hook FAILED: <api>`（正常情况下不应出现）。
+  - 拦截前 3 次逐条：`[Guard] blocked ExitWindowsEx flags=0x6 (restart)` /
+    `[Guard] blocked CreateProcessW (shutdown -s -t 1)`；之后每 25 次一行
+    `[Guard] blocked 25 remote power commands (last: ...)`。
+  - 开关状态只在**变化**时记一行；默认关闭不再为每个进程打印 "off"。
 
 > **自测注意（血泪教训）**：`tests\shutguard_test.c` **不允许**调用
 > `ExitWindowsEx`（实测 `ExitWindowsEx(0x80000000, 0)` 会被 Windows 当成关机，直接把机器关掉），
 > 也不允许出现裸的 `shutdown -s -t 1`（会解析到 `System32\shutdown.exe`）。
 > 测试只跑 `%TEMP%\shutguard_probe\shutdown.exe`（`cmd.exe` 的重名副本）+ 从日志读
-> `hook ExitWindowsEx: installed`；`tests\shutguard_test.ps1` 在运行前会扫描二进制，
-> 发现这两类东西就拒绝执行。
+> `[Guard] hooks installed:` / 没有 `[Guard] hook FAILED: ExitWindowsEx`；
+> `tests\shutguard_test.ps1` 在运行前会扫描二进制，发现这两类东西就拒绝执行。
 
 ---
 
@@ -738,7 +744,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\shutguard_test.ps1
 ```
 case 1/2: guard off -> fake shutdown.exe 正常启动；命令行透传
 case 2/2: guard on  -> 所有 shutdown 写法都被吞掉，不创建进程
-                      日志里有 hook ExitWindowsEx: installed
+                      日志里有 [Guard] hooks installed（且没有 hook FAILED）
 VERDICT PASS
 ```
 

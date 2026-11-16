@@ -297,13 +297,23 @@ int main(int argc, char** argv)
         if (w <= 31) pass = 0;
 
         _snprintf(needle, sizeof(needle) - 1,
-                  "[pid %lu] [Guard] remote shutdown/restart guard -> off",
+                  "[pid %lu] [Guard] hooks", (unsigned long)GetCurrentProcessId());
+        if (LogHas(needle)) {
+            printf("  %-46s ok\n", "log: hook summary present");
+        } else {
+            printf("  %-46s FAIL (log line missing)\n", "log: hook summary present");
+            pass = 0;
+        }
+
+        _snprintf(needle, sizeof(needle) - 1,
+                  "[pid %lu] [Guard] remote shutdown guard -> ON",
                   (unsigned long)GetCurrentProcessId());
         if (LogHas(needle)) {
-            printf("  %-46s ok\n", "log says guard is off");
-        } else {
-            printf("  %-46s FAIL (log line missing)\n", "log says guard is off");
+            printf("  %-46s FAIL (guard reported ON while disabled)\n",
+                   "log: guard stays off");
             pass = 0;
+        } else {
+            printf("  %-46s ok\n", "log: guard stays off");
         }
 
         printf("SUMMARY expect=off\n");
@@ -375,16 +385,36 @@ int main(int argc, char** argv)
                w > 31 ? "ok" : "FAIL", (unsigned)w);
         if (w <= 31) pass = 0;
 
-        /* Zero-risk proof for the 0x27 path: the DLL logs the result of its
-           ExitWindowsEx entry hook.  Nothing calls the API here. */
+        /* Zero-risk proof for the 0x27 path: the DLL reports its hook summary
+           at startup (and logs a FAILED line if one entry hook did not take).
+           Nothing calls the API here. */
         _snprintf(needle, sizeof(needle) - 1,
-                  "[pid %lu] [Guard] hook ExitWindowsEx: installed",
+                  "[pid %lu] [Guard] hooks", (unsigned long)GetCurrentProcessId());
+        if (LogHas(needle)) {
+            printf("  %-46s ok\n", "log: hook summary present");
+        } else {
+            printf("  %-46s FAIL (log line missing)\n", "log: hook summary present");
+            pass = 0;
+        }
+
+        _snprintf(needle, sizeof(needle) - 1,
+                  "[pid %lu] [Guard] hook FAILED: ExitWindowsEx",
                   (unsigned long)GetCurrentProcessId());
         if (LogHas(needle)) {
-            printf("  %-46s ok\n", "ExitWindowsEx entry hook armed (log)");
-        } else {
-            printf("  %-46s FAIL (log line missing)\n",
+            printf("  %-46s FAIL (entry hook did not take)\n",
                    "ExitWindowsEx entry hook armed (log)");
+            pass = 0;
+        } else {
+            printf("  %-46s ok\n", "ExitWindowsEx entry hook armed (log)");
+        }
+
+        _snprintf(needle, sizeof(needle) - 1,
+                  "[pid %lu] [Guard] remote shutdown guard -> ON",
+                  (unsigned long)GetCurrentProcessId());
+        if (LogHas(needle)) {
+            printf("  %-46s ok\n", "log: guard reported ON");
+        } else {
+            printf("  %-46s FAIL (log line missing)\n", "log: guard reported ON");
             pass = 0;
         }
     }

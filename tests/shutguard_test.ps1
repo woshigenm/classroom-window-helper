@@ -13,12 +13,19 @@ if (!(Test-Path $dll)) { throw "missing $dll (run: make.bat hook32)" }
 # Hard safety gate: the test must not be able to ask the OS to power off.
 # (A previous revision called ExitWindowsEx(0x80000000) "as a harmless probe";
 #  Windows treated it as a shutdown.  Never again.)
-$ascii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
-$wide  = [System.Text.Encoding]::Unicode.GetString([System.IO.File]::ReadAllBytes($exe))
-foreach ($bad in @("ExitWindowsEx`0", 'InitiateSystemShutdown')) {
-    if ($ascii.Contains($bad)) {
-        throw "UNSAFE test binary: imports '$($bad -replace "`0", '')' - refusing to run"
-    }
+$bytes = [System.IO.File]::ReadAllBytes($exe)
+$ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+$wide  = [System.Text.Encoding]::Unicode.GetString($bytes)
+$latin = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+
+# Import name table entries look like <hint:00 00> "ExitWindowsEx" <00>; our
+# own log text is followed by NUL but preceded by printable characters, so the
+# two leading NULs tell the import apart from the string.
+if ($latin.Contains("`0`0ExitWindowsEx`0")) {
+    throw "UNSAFE test binary: imports ExitWindowsEx - refusing to run"
+}
+if ($ascii.Contains('InitiateSystemShutdown')) {
+    throw "UNSAFE test binary: imports InitiateSystemShutdown - refusing to run"
 }
 # A bare shutdown command would resolve to System32\shutdown.exe.  The test may
 # only ever use the fake probe path (built at run time), never this literal.

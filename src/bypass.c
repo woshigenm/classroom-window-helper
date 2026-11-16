@@ -167,6 +167,7 @@
 #define IDM_TRAY_DESKTOP    2008    /* 切回 Default 桌面 */
 #define IDM_TRAY_CLICK      2009    /* 应急点击 */
 #define IDM_TRAY_NETDIAG    2010    /* 网络/桌面诊断 (写日志) */
+#define IDM_TRAY_SHUT       2011    /* 屏蔽控制端重启/关机 (开关) */
 
 /* ========== UI theme constants (dark theme) ========== */
 #define TITLEBAR_H      40      /* custom title bar height */
@@ -4487,24 +4488,37 @@ static void ShutGuardSave(void)
         DeleteFileA(tmp);
 }
 
-static void OnShutGuardToggle(HWND hwnd)
+/* 统一的开关入口: 主界面勾选框和托盘菜单都走这里, 保证 ini / DLL / 控件
+   三者状态永远一致。 */
+static void SetShutGuard(HWND hwnd, BOOL on)
 {
-    g_shutGuard = (IsDlgButtonChecked(hwnd, ID_CHK_SHUT) == BST_CHECKED)
-                      ? TRUE : FALSE;
+    g_shutGuard = on ? TRUE : FALSE;
     ShutGuardSave();
 
     /* 守卫逻辑在注入的 DLL 里: 打开时确保它已经进了 Student.exe 等进程 */
     if (g_shutGuard) RunInjector(hwnd, TRUE);
 
+    /* 同步主界面勾选框 (托盘菜单打开时窗口可能正收在托盘里) */
+    if (hwnd && IsWindow(hwnd)) {
+        CheckDlgButton(hwnd, ID_CHK_SHUT, g_shutGuard ? BST_CHECKED : BST_UNCHECKED);
+        InvalidateRect(hwnd, NULL, FALSE);
+    }
+
     if (g_shutGuard) {
         AppendLog(hwnd, "\r\n[Guard] 屏蔽控制端重启/关机 -> 开 (bin\\bypass_shut.ini)\r\n"
-                        "[Guard] 老师端发来的 0x27/0x28 会被吞掉: 不重启、不关机, 只记一行日志\r\n");
+                        "[Guard] 老师端的 0x27(重启)/0x28(关机) 会被吞掉, 只记一行日志\r\n");
     } else {
         AppendLog(hwnd, "\r\n[Guard] 屏蔽控制端重启/关机 -> 关 (bin\\bypass_shut.ini)\r\n"
                         "[Guard] 恢复正常: 老师端可以远程关机/重启本机\r\n");
     }
     UpdateStatus(hwnd, g_shutGuard ? "Status: remote shutdown blocked"
                                    : "Status: remote shutdown allowed");
+}
+
+static void OnShutGuardToggle(HWND hwnd)
+{
+    SetShutGuard(hwnd,
+                 (IsDlgButtonChecked(hwnd, ID_CHK_SHUT) == BST_CHECKED) ? TRUE : FALSE);
 }
 
 /* ========== 托盘 (notification area) ==========
@@ -4776,6 +4790,8 @@ static void TrayShowMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING, IDM_TRAY_DESKTOP,    L"立即切回桌面(&D)\tCtrl+Alt+D");
     AppendMenuW(menu, MF_STRING, IDM_TRAY_CLICK,      L"应急点击(&E)\tCtrl+Alt+E");
     AppendMenuW(menu, MF_STRING, IDM_TRAY_NETDIAG,    L"网络/桌面诊断(&N)");
+    AppendMenuW(menu, MF_STRING | (g_shutGuard ? MF_CHECKED : 0),
+                IDM_TRAY_SHUT,                        L"屏蔽控制端重启/关机(&P)");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_RELEASE,    L"恢复全屏广播（放行）(&R)");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -4818,6 +4834,9 @@ static void TrayShowMenu(HWND hwnd) {
         break;
     case IDM_TRAY_NETDIAG:
         LogNetStatus(hwnd);
+        break;
+    case IDM_TRAY_SHUT:
+        SetShutGuard(hwnd, g_shutGuard ? FALSE : TRUE);
         break;
     case IDM_TRAY_RELEASE:
         /* 放行: 停止监视 + 写 bypass_hook.off, 已注入的 DLL 2 秒内停止干预。
