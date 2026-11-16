@@ -880,6 +880,39 @@ UI、日志、README 都按这个描述，不写“已直通”。`g_coreDead` �
   弹“部分直通”警告并把状态栏改成 `Core disabled, restart the process`）。
   状态串控制在 ~45 字符内，状态栏用 `DT_END_ELLIPSIS`，再长就会被截断。
 
+**版本自检（P3）：内容哈希，PE stamp 只作兜底**
+
+「检查当前状态」判断「这个进程里的 DLL 是不是磁盘上那份」时，**优先用内容哈希**：
+
+- Loader 在 `CopyFileA(src, cache)` 之后对 **cache 副本**算 FNV-1a 32，也就是它
+  实际 `LoadLibraryEx` 的那份字节；日志 `[Loader] core loaded: ... hash=xxxxxxxx`，
+  控制管道 `status` 回 `hash=xxxxxxxx`。
+- UI 算 `bin\bypass_hook_core.dll` 的 FNV，和 `status` 里的比：相等 = current。
+- **为什么不用 PE `TimeDateStamp`**：它是**链接时间**，不是身份。同一秒内重编两次、
+  `SOURCE_DATE_EPOCH` 可重复构建、手工改过的 DLL，stamp 都不变——会误报 current。
+  而热重载之后进程里跑的是 `core.<pid>.<seq>.dll`，问题本来就是「哪份字节」。
+
+三层判据：
+
+| 情况 | 判据 | 建议 |
+|---|---|---|
+| `hash` 相同 | 内容一致 | 无事 |
+| `hash` 不同，磁盘稳定 | Core 旧了 | **点「重载 Core」**（Loader 是新的，不用重启） |
+| `hash` 不同，磁盘两次读还不一样 | 构建正在写这个文件 | `disk is being rewritten - check again`，不给建议 |
+| `status` 超时且 `g_reloadBusy` | Loader 正在 reload（单连接管道） | `reloading Core (Loader busy)`，不落回 stamp |
+| 没有控制管道 | 旧单 DLL / P2 之前 | 退回 PE stamp 两个层都比，结论一律「重启课堂客户端」 |
+
+> 构建脚本**不是原子写**（`gcc -o "$@"` 直接 truncate 目标文件），所以第二次哈希
+> 确认是必须的，否则构建中途点检查会看到半成品、建议重载半成品。
+
+> 顺带修掉一个真 bug：`PeStampLoaded` 原来只用 `TH32CS_SNAPMODULE`。主程序是 64 位、
+> 课堂进程是 32 位，从 64 位进程枚举 32 位模块必须带 `TH32CS_SNAPMODULE32`，否则
+> `Module32First` 直接失败 → 每个进程都显示 `not loaded`，旧单 DLL 的兜底形同虚设。
+
+> Loader 在拷贝后还会比一次 `hash(cache) vs hash(src)`，不同就记
+> `core hash mismatch ... (DLL rewritten during the copy?)`——这是「替换 DLL 与重载
+> 并发」的唯一进程内证据。
+
 ---
 
 ## 3. 日志与排错

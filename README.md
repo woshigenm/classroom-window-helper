@@ -214,6 +214,20 @@ enabled=1
   | 其他 `err` | 失败，什么都没动（`--no-rollback` 时可能只剩半套） | `nothing reloaded` |
   | `err hooks-busy (core disabled)` / `err coreDead` | **进程半禁用，终态** | `Core disabled, restart the process` |
 
+#### 版本自检：内容哈希，不再看链接时间
+
+「检查当前状态」原来比 PE `TimeDateStamp`（链接时间），同秒重建 / 可重复构建 /
+手工改过的 DLL 都会误报「current」。现在优先用**内容哈希**：
+
+- Loader 加载时对自己映射的那份 cache 副本算 FNV-1a 32，`status` 里回 `hash=xxxxxxxx`；
+- 主程序算 `bin\bypass_hook_core.dll` 的哈希比较，**相等才算 current**；
+- 结论分三档：**Core 旧 → 点「重载 Core」**（不用重启）；**Loader 旧 / 半禁用 →
+  重启课堂客户端**；**磁盘文件正在被构建重写 → 提示稍后再查**；
+- 没有控制管道（旧单 DLL）或 Loader 正在 reload（管道被占）时，退回 PE stamp 比较。
+
+> 顺带修掉一个真 bug：从 64 位主程序枚举 32 位课堂进程的模块必须带
+> `TH32CS_SNAPMODULE32`，否则模块表永远为空、每个进程都显示 `not loaded`。
+
 #### 半禁用不是「已直通」
 
 `before_unload` 返回 1 之后才置 `g_unloading=1`，然后 Loader 做权威 drain（3 秒）。

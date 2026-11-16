@@ -100,6 +100,7 @@
 #include <stddef.h>
 
 #include "bypass_state.h"
+#include "bypass_hash.h"
 #include "elevate.h"
 
 #ifndef WM_DPICHANGED
@@ -1885,7 +1886,9 @@ static DWORD PeStampLoaded(DWORD pid, const char* dllName, BOOL matchCache)
     IMAGE_NT_HEADERS32 nt;
 
     if (!pid || !dllName) return 0;
-    snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    /* 主程序是 64 位, 课堂进程是 32 位: 不带 SNAPMODULE32 时 Module32First
+       直接失败（返回 0 = "not loaded"），旧单 DLL 的兜底路径就永远报不 loaded。 */
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snap == INVALID_HANDLE_VALUE) return 0;
     me.dwSize = sizeof(me);
     if (Module32First(snap, &me)) {
@@ -1940,10 +1943,75 @@ static void StampText(DWORD stamp, char* out, DWORD n)
     out[n - 1] = '\0';
 }
 
+static void TrimEol(char* s)
+{
+    size_t n = s ? strlen(s) : 0;
+
+    while (n && (s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == ' '))
+        s[--n] = '\0';
+}
+
+/* set while ReloadCoreThread is running: a status request that times out
+   during this window means "Loader busy", not "Loader stale" */
+static volatile LONG g_reloadBusy;
+
+/* One request/response over the Loader control pipe
+   (\\.\pipe\bypass_core_ctl_<pid>).  Returns
+     1  = reply received (out filled, newline trimmed)
+     0  = no pipe: not injected, or the pre-P1 single DLL
+    -1  = timeout / write error (out = "timeout";  a *busy* Loader is
+          indistinguishable from a hung one here, the caller decides) */
+static int CtlRequest(DWORD pid, const char* msg, char* out, size_t cap,
+                      DWORD timeoutMs)
+{
+    char   name[128];
+    HANDLE h;
+    DWORD  wr = 0, avail = 0, rd = 0, start;
+
+    if (!out || cap < 8 || !msg) return -1;
+    out[0] = '\0';
+    _snprintf(name, sizeof(name) - 1, "\\\\.\\pipe\\bypass_core_ctl_%lu",
+              (unsigned long)pid);
+    name[sizeof(name) - 1] = '\0';
+
+    h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                    OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!WriteFile(h, msg, (DWORD)strlen(msg), &wr, NULL)) {
+        CloseHandle(h);
+        _snprintf(out, cap - 1, "timeout");
+        out[cap - 1] = '\0';
+        return -1;
+    }
+
+    start = GetTickCount();
+    while ((DWORD)(GetTickCount() - start) < timeoutMs) {
+        if (PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) && avail > 0) break;
+        Sleep(20);
+    }
+    if (avail > 0 && ReadFile(h, out, (DWORD)cap - 1, &rd, NULL) && rd > 0) {
+        out[rd] = '\0';
+        CloseHandle(h);
+        TrimEol(out);
+        return 1;
+    }
+    CloseHandle(h);
+    _snprintf(out, cap - 1, "timeout");
+    out[cap - 1] = '\0';
+    return -1;
+}
+
 /* verbose=1: 把逐进程结果写进日志（给「检查当前状态」用）
    verbose=0: 只在发现旧 DLL 时警告（给启动后的一次性定时器用）
    P1 起有两层: bypass_hook32.dll (Loader, 很少变) 和 bypass_hook_core.dll
    (Core, 改逻辑只换它)。两个都要比, 否则 Core 旧了也报"current"。 */
+/* P3: 版本自检优先用 Loader 报告的**内容哈希**，PE stamp 只作兜底。
+   Loader 在加载时对 cache 副本（= 实际 map 的字节）算 FNV-1a 32，`status` 里回
+   `hash=xxxxxxxx`；这里和 `bin\bypass_hook_core.dll` 的哈希比。PE TimeDateStamp
+   只是链接时间——同秒重建、可重复构建、手工改过的 DLL 都保持同一个 stamp，
+   会误判「current」。
+   拿不到哈希（旧单 DLL 没有控制管道；或 Loader 正在 reload 占着管道）时退回
+   PE stamp 比较，即 P3 之前的行为。 */
 static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
 {
     static const char* images[] = { "Student.exe", "MultiClient.exe",
@@ -1952,9 +2020,12 @@ static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
                                        "bypass_hook_core.dll" };
     static const char* dllTags[2]  = { "loader", "core" };
     char  dir[MAX_PATH] = "";
-    char  stale[200] = "";
+    char  corePath[MAX_PATH] = "";
+    char  stale[200] = "";        /* 需要重启课堂客户端 */
+    char  staleCore[200] = "";    /* 只有 Core 旧: 点「重载 Core」即可 */
     DWORD disk[2] = { 0, 0 };
-    int   i, d, staleCount = 0;
+    unsigned long diskHash = 0;
+    int   i, d, restartCount = 0, reloadCount = 0;
 
     if (GetModuleFileNameA(NULL, dir, sizeof(dir))) {
         char* p = strrchr(dir, '\\');
@@ -1967,10 +2038,15 @@ static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
 
         if (dir[0]) PathCombineA(path, dir, dllNames[d]);
         disk[d] = path[0] ? PeStampFile(path) : 0;
+        if (d == 1 && path[0]) {
+            _snprintf(corePath, sizeof(corePath) - 1, "%s", path);
+            corePath[sizeof(corePath) - 1] = '\0';
+        }
     }
+    if (corePath[0]) HrFnv1aFile(corePath, &diskHash, NULL);
 
     if (verbose) {
-        char t1[40], t2[40];
+        char t1[40], t2[40], hb[40];
 
         AppendLog(hwnd, "\r\n--- Guard Status ---\r\n");
         AppendLog(hwnd, "  screen guard   : %s (bin\\bypass_screen.ini)\r\n",
@@ -1981,12 +2057,18 @@ static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
         StampText(disk[1], t2, sizeof(t2));
         AppendLog(hwnd, "  DLL on disk    : loader %s / core %s\r\n",
                   disk[0] ? t1 : "NOT FOUND", disk[1] ? t2 : "NOT FOUND");
+        if (diskHash) _snprintf(hb, sizeof(hb) - 1, "hash %08lx", diskHash);
+        else          _snprintf(hb, sizeof(hb) - 1, "no hash (file missing)");
+        hb[sizeof(hb) - 1] = '\0';
+        AppendLog(hwnd, "  core on disk   : %s\r\n", hb);
     }
 
     for (i = 0; i < (int)(sizeof(images) / sizeof(images[0])); i++) {
         DWORD pid = FindPidByName(images[i]);
-        char  line[256] = "";
-        int   bad = 0;
+        char  line[320] = "";
+        char  ctl[384];
+        unsigned long procHash = 0;
+        int   needRestart = 0, needReload = 0, busy = 0, r;
 
         if (!pid) {
             if (verbose)
@@ -1994,45 +2076,117 @@ static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
             continue;
         }
 
-        for (d = 0; d < 2; d++) {
-            DWORD stamp = PeStampLoaded(pid, dllNames[d], d == 1);
-            char  t[40];
-            char  part[96];
-
-            if (!stamp) {
-                _snprintf(part, sizeof(part) - 1, "%s not loaded", dllTags[d]);
-            } else {
-                StampText(stamp, t, sizeof(t));
-                if (disk[d] && stamp != disk[d]) {
-                    _snprintf(part, sizeof(part) - 1, "%s %s <== OLD", dllTags[d], t);
-                    bad = 1;
-                    if (stale[0]) strncat(stale, ", ", sizeof(stale) - strlen(stale) - 1);
-                    {
-                        char one[64];
-                        _snprintf(one, sizeof(one) - 1, "%s(%s)", images[i], dllTags[d]);
-                        one[sizeof(one) - 1] = '\0';
-                        strncat(stale, one, sizeof(stale) - strlen(stale) - 1);
-                    }
-                    staleCount++;
-                } else {
-                    _snprintf(part, sizeof(part) - 1, "%s %s", dllTags[d], t);
-                }
-            }
-            part[sizeof(part) - 1] = '\0';
-            if (line[0]) strncat(line, " / ", sizeof(line) - strlen(line) - 1);
-            strncat(line, part, sizeof(line) - strlen(line) - 1);
+        /* 300 ms keeps the UI responsive; the Loader answers in ~1 ms unless it
+           is inside a reload (its control thread is single-connection).  The
+           user-initiated check gets a bit more slack. */
+        r = CtlRequest(pid, "status", ctl, sizeof(ctl), verbose ? 1000 : 300);
+        if (r == 1) {
+            char* p = strstr(ctl, "hash=");
+            if (p) procHash = (unsigned long)strtoul(p + 5, NULL, 16);
+            if (strstr(ctl, "dead=1")) needRestart = 1;
+        } else if (r < 0 && InterlockedCompareExchange(&g_reloadBusy, 0, 0)) {
+            busy = 1;
         }
 
-        if (verbose)
-            AppendLog(hwnd, "  %-14s : %s%s\r\n", images[i], line,
-                      bad ? "   (restart the classroom client)" : "");
+        if (busy) {
+            /* 不落回 PE stamp: 这时 stamp 可能是旧的，也可能是正在换，别给建议 */
+            _snprintf(line, sizeof(line) - 1, "reloading Core (Loader busy)");
+        } else if (procHash && diskHash) {
+            DWORD ls = PeStampLoaded(pid, dllNames[0], FALSE);
+            char  t[40];
+
+            StampText(ls, t, sizeof(t));
+            if (ls && disk[0] && ls != disk[0]) {
+                needRestart = 1;
+                _snprintf(line, sizeof(line) - 1,
+                          "loader %s <== OLD / core %08lx", t, procHash);
+            } else if (procHash == diskHash) {
+                _snprintf(line, sizeof(line) - 1,
+                          "loader %s / core %08lx (current)", t, procHash);
+            } else {
+                /* 不一致: 先确认磁盘文件不是正在被重写（ld 直接写目标文件，
+                   构建中途读到的是半成品，不能据此建议重载） */
+                unsigned long again = 0;
+
+                Sleep(150);
+                HrFnv1aFile(corePath, &again, NULL);
+                if (again && again == procHash) {
+                    _snprintf(line, sizeof(line) - 1,
+                              "loader %s / core %08lx (current)", t, procHash);
+                } else if (again && again != diskHash) {
+                    _snprintf(line, sizeof(line) - 1,
+                              "core %08lx vs disk %08lx (disk is being "
+                              "rewritten - check again)", procHash, again);
+                } else {
+                    needReload = 1;
+                    _snprintf(line, sizeof(line) - 1,
+                              "loader %s / core %08lx <== OLD (disk %08lx)",
+                              t, procHash, diskHash);
+                }
+            }
+        } else {
+            /* 旧单 DLL（无控制管道）或 P2 期没有 hash 的 Loader: PE stamp 兜底 */
+            for (d = 0; d < 2; d++) {
+                DWORD stamp = PeStampLoaded(pid, dllNames[d], d == 1);
+                char  t[40];
+                char  part[96];
+
+                if (!stamp) {
+                    _snprintf(part, sizeof(part) - 1, "%s not loaded", dllTags[d]);
+                } else {
+                    StampText(stamp, t, sizeof(t));
+                    if (disk[d] && stamp != disk[d]) {
+                        _snprintf(part, sizeof(part) - 1, "%s %s <== OLD",
+                                  dllTags[d], t);
+                        if (r == 1 && d == 1) needReload = 1;
+                        else                  needRestart = 1;
+                    } else {
+                        _snprintf(part, sizeof(part) - 1, "%s %s", dllTags[d], t);
+                    }
+                }
+                part[sizeof(part) - 1] = '\0';
+                if (line[0]) strncat(line, " / ", sizeof(line) - strlen(line) - 1);
+                strncat(line, part, sizeof(line) - strlen(line) - 1);
+            }
+        }
+
+        line[sizeof(line) - 1] = '\0';
+        {
+            const char* advice = needRestart ? "   (restart the classroom client)"
+                               : needReload  ? "   (click 重载 Core, no restart)"
+                                             : "";
+            char* lst = needRestart ? stale : staleCore;
+            size_t cap = needRestart ? sizeof(stale) : sizeof(staleCore);
+
+            if (verbose)
+                AppendLog(hwnd, "  %-14s : %s%s\r\n", images[i], line, advice);
+
+            if (needRestart || needReload) {
+                char one[64];
+
+                _snprintf(one, sizeof(one) - 1, "%s(%s)", images[i],
+                          needRestart ? "loader" : "core");
+                one[sizeof(one) - 1] = '\0';
+                if (lst[0]) strncat(lst, ", ", cap - strlen(lst) - 1);
+                strncat(lst, one, cap - strlen(lst) - 1);
+                if (needRestart) restartCount++;
+                else             reloadCount++;
+            }
+        }
     }
 
-    if (staleCount) {
+    if (restartCount) {
         AppendLog(hwnd, "\r\n[Build] WARNING: %s 里跑的是旧 DLL。\r\n"
                         "[Build] 旧守卫仍然有效，但新逻辑/日志要重启课堂客户端才会加载。\r\n",
                   stale);
         UpdateStatus(hwnd, "Status: WARNING - old DLL in classroom client (restart it)");
+        return TRUE;
+    }
+    if (reloadCount) {
+        AppendLog(hwnd, "\r\n[Build] WARNING: %s 的 Core 是旧的（Loader 是新的）。\r\n"
+                        "[Build] 点「重载 Core」即可，不用重启课堂客户端。\r\n",
+                  staleCore);
+        UpdateStatus(hwnd, "Status: Core is stale - click reload Core");
         return TRUE;
     }
 
@@ -4253,50 +4407,11 @@ static const char* RELOAD_TARGETS[] = {
     "ScreenRecord.exe", "SharedDesktop.exe", "StudentScreenHelper.exe",
     "ScreenPen.exe", "AudioRender.exe", "AudioSender.exe", NULL
 };
-static volatile LONG g_reloadBusy;
 
 /* 1 = ok, 0 = no control pipe, -1 = timeout/write error */
 static int ReloadOneCore(DWORD pid, char* out, size_t cap)
 {
-    char   name[128];
-    HANDLE h;
-    DWORD  wr = 0, avail = 0, rd = 0, start;
-    int    ok = 0;
-
-    if (cap < 8) return -1;
-    out[0] = '\0';
-    _snprintf(name, sizeof(name) - 1, "\\\\.\\pipe\\bypass_core_ctl_%lu",
-              (unsigned long)pid);
-    name[sizeof(name) - 1] = '\0';
-    h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                    OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    if (!WriteFile(h, "reload", 6, &wr, NULL)) { CloseHandle(h); return -1; }
-
-    start = GetTickCount();
-    while ((DWORD)(GetTickCount() - start) < 15000) {
-        if (PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) && avail > 0) break;
-        Sleep(100);
-    }
-    if (avail > 0 && ReadFile(h, out, (DWORD)cap - 1, &rd, NULL) && rd > 0) {
-        out[rd] = '\0';
-        ok = 1;
-    }
-    CloseHandle(h);
-    if (!ok) {
-        _snprintf(out, cap - 1, "timeout");
-        out[cap - 1] = '\0';
-        return -1;
-    }
-    return 1;
-}
-
-static void TrimEol(char* s)
-{
-    size_t n = strlen(s);
-
-    while (n && (s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == ' '))
-        s[--n] = '\0';
+    return CtlRequest(pid, "reload", out, cap, 15000);
 }
 
 /* 响应分类: Loader 只回这几种 (见 loader.c 的 _snprintf(resp, ...))

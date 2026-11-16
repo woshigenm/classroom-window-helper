@@ -106,10 +106,10 @@ corehost: $(BIN)/core_host.exe
 $(BIN):
 	@if not exist "$(BIN)" mkdir "$(BIN)"
 
-$(BIN)/bypass.exe: src/bypass.c src/elevate.c src/elevate.h src/bypass_state.h | $(BIN)
+$(BIN)/bypass.exe: src/bypass.c src/elevate.c src/elevate.h src/bypass_state.h src/bypass_hash.h | $(BIN)
 	"$(CC64)" $(CFLAGS64) "src/bypass.c" "src/elevate.c" -o "$@" $(LIBS64)
 
-$(BIN)/bypass_hook32.dll: src/loader.c src/bypass_abi.h | $(BIN)
+$(BIN)/bypass_hook32.dll: src/loader.c src/bypass_abi.h src/bypass_hash.h | $(BIN)
 	"$(CC32)" $(CFLAGS32) $(DLLFLAGS) "src/loader.c" -o "$@" -lpsapi -luser32
 
 $(BIN)/bypass_hook_core.dll: src/bypass_hook.c src/bypass_vd.inc src/bypass_screen.inc src/bypass_shut.inc src/bypass_abi.h src/bypass_state.h | $(BIN)

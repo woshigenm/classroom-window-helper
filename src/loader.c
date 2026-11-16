@@ -33,6 +33,7 @@
 #include <string.h>
 
 #include "bypass_abi.h"
+#include "bypass_hash.h"
 
 static HMODULE g_self;
 static DWORD   g_pid;
@@ -58,6 +59,7 @@ static struct {
     HMODULE mod;
     char    path[MAX_PATH];
     DWORD   seq;
+    unsigned long hash;   /* FNV-1a of the cache copy (the mapped bytes) */
     int     valid;
 } g_cur;
 static volatile LONG  g_coreDead;   /* still-mapped detected: never reload again */
@@ -1362,6 +1364,7 @@ static BOOL LoadCoreFrom(const char* src, char* outPath, size_t outCap,
     HMODULE       mod;
     PFN_Core_Init init;
     HrCoreApi     api;
+    unsigned long cacheHash = 0, srcHash = 0;
     int           seq = ++g_seq;
 
     if (err && errCap) err[0] = '\0';
@@ -1380,6 +1383,15 @@ static BOOL LoadCoreFrom(const char* src, char* outPath, size_t outCap,
                            (unsigned long)GetLastError());
         return FALSE;
     }
+
+    /* Content identity of the bytes we are about to map.  A PE TimeDateStamp
+       is a link time, not an identity (same-second rebuilds, reproducible
+       builds, hand-edited DLLs all keep it), while the hash follows the bytes.
+       If the source was rewritten while we copied it, the two differ. */
+    HrFnv1aFile(cachePath, &cacheHash, NULL);
+    if (HrFnv1aFile(src, &srcHash, NULL) && cacheHash && srcHash != cacheHash)
+        HookLog("[Loader] core hash mismatch: cache=%08lx src=%08lx "
+                "(DLL rewritten during the copy?)", cacheHash, srcHash);
     mod = LoadLibraryExA(cachePath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!mod) {
         if (err) _snprintf(err, errCap - 1, "LoadLibrary failed err=%lu",
@@ -1426,6 +1438,7 @@ static BOOL LoadCoreFrom(const char* src, char* outPath, size_t outCap,
     g_core = api;
     g_cur.mod = mod;
     g_cur.seq = (DWORD)seq;
+    g_cur.hash = cacheHash;
     g_cur.valid = 1;
     _snprintf(g_cur.path, sizeof(g_cur.path) - 1, "%s", cachePath);
     g_cur.path[sizeof(g_cur.path) - 1] = '\0';
@@ -1437,8 +1450,8 @@ static BOOL LoadCoreFrom(const char* src, char* outPath, size_t outCap,
         _snprintf(outPath, outCap - 1, "%s", cachePath);
         outPath[outCap - 1] = '\0';
     }
-    HookLog("[Loader] core loaded: %s build=%s", cachePath,
-            g_core.build_id ? g_core.build_id : "?");
+    HookLog("[Loader] core loaded: %s build=%s hash=%08lx", cachePath,
+            g_core.build_id ? g_core.build_id : "?", cacheHash);
     return TRUE;
 }
 
@@ -1599,9 +1612,10 @@ static DWORD WINAPI CtlThread(LPVOID p)
                     DoReload(strstr(req, "norollback") != NULL, resp, sizeof(resp));
                 else if (!_strnicmp(req, "status", 6))
                     _snprintf(resp, sizeof(resp) - 1,
-                              "ok core=%s seq=%lu dead=%ld cache=%s\n",
+                              "ok core=%s seq=%lu dead=%ld hash=%08lx cache=%s\n",
                               g_core.build_id ? g_core.build_id : "?",
                               (unsigned long)g_cur.seq, (long)g_coreDead,
+                              g_cur.hash,
                               g_cur.valid ? g_cur.path : "-");
                 else
                     _snprintf(resp, sizeof(resp) - 1, "err unknown\n");
