@@ -1367,6 +1367,11 @@ static BOOL LoadCoreFrom(const char* src, char* outPath, size_t outCap,
     unsigned long cacheHash = 0, srcHash = 0;
     int           seq = ++g_seq;
 
+    /* Each attempt gets a fresh cache name on purpose, even when the copy or the
+       load fails: the "bad ABI" / "hooks incomplete" paths leave the module
+       MAPPED, and the next attempt must not try to overwrite a mapped file.
+       A skipped number in core.<pid>.<seq>.dll is the intended cost. */
+
     if (err && errCap) err[0] = '\0';
     if (!src || !src[0]) { if (err) _snprintf(err, errCap - 1, "no source"); return FALSE; }
 
@@ -1389,6 +1394,9 @@ static BOOL LoadCoreFrom(const char* src, char* outPath, size_t outCap,
        builds, hand-edited DLLs all keep it), while the hash follows the bytes.
        If the source was rewritten while we copied it, the two differ. */
     HrFnv1aFile(cachePath, &cacheHash, NULL);
+    if (!cacheHash)
+        HookLog("[Loader] %s: hash unavailable (status reports hash=0 = unknown)",
+                cachePath);
     if (HrFnv1aFile(src, &srcHash, NULL) && cacheHash && srcHash != cacheHash)
         HookLog("[Loader] core hash mismatch: cache=%08lx src=%08lx "
                 "(DLL rewritten during the copy?)", cacheHash, srcHash);
@@ -1544,6 +1552,13 @@ static int DoReload(int noRollback, char* resp, size_t cap)
     g_cur.mod = NULL;
     g_coreModule = NULL;
 
+    /* ★ g_core 里 build_id 和 33 个 hooks.* 都指向刚被 FreeLibrary 的模块。
+       dispatcher 走 Tbl() (已经是 NULL) 不碰它, 但 `status` 命令直接读
+       g_core.build_id —— 不清就是 UAF (卸载成功 + 新 Core 加载失败 /
+       still-mapped / rollback 失败这几条路径)。清空后 status 输出 core=?。 */
+    memset(&g_core, 0, sizeof(g_core));
+    g_cur.hash = 0;                 /* 0 = unknown (见 status / UI 的回落规则) */
+
     /* ★ 检测的是缓存副本路径, 不是源文件: 源文件从来没有被映射过 */
     if (GetModuleHandleA(prev) != NULL) {
         InterlockedExchange(&g_coreDead, 1);
@@ -1610,7 +1625,24 @@ static DWORD WINAPI CtlThread(LPVOID p)
             DWORD rd = 0;
 
             memset(req, 0, sizeof(req));
-            if (ReadFile(h, req, sizeof(req) - 1, &rd, NULL) && rd > 0) {
+            {
+                /* message mode: a request longer than the buffer makes ReadFile
+                   fail with ERROR_MORE_DATA (rd still gets the prefix).  Drain
+                   the rest - otherwise the client never sees a reply and the
+                   leftover message is lost on Disconnect.  Commands are short,
+                   so the prefix is all we parse. */
+                DWORD got = 0;
+                BOOL  ok = ReadFile(h, req, sizeof(req) - 1, &got, NULL);
+
+                rd = got;
+                while (!ok && GetLastError() == ERROR_MORE_DATA) {
+                    char scrap[256];
+
+                    got = 0;
+                    ok = ReadFile(h, scrap, sizeof(scrap), &got, NULL);
+                }
+            }
+            if (rd > 0) {
                 char  resp[512];
                 DWORD wr = 0;
 

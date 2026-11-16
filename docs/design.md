@@ -707,6 +707,20 @@ P2b = 上面第 2 步的十项真正实现。
   从不被映射，构建输出可以随时覆盖；成功重载后删除旧缓存。
 - 控制管道 `\\.\pipe\bypass_core_ctl_<pid>`，一行命令 / 一行响应：
   `status`、`reload`、`reload norollback`（`norollback` 用于调试，失败时不回滚）。
+  消息模式下请求超过 127 字节时 `ReadFile` 返回 `ERROR_MORE_DATA`，必须把剩余消息
+  读干净再 `Disconnect`，否则客户端收不到响应（命令本身只用前缀，够解析）。
+- **`FreeLibrary` 之后必须 `memset(&g_core, 0, sizeof(g_core))`**：`g_core.build_id` 和
+  33 个 `hooks.*` 都指向已卸载模块；dispatcher 走 `Tbl()`（此时 NULL）不碰它，但
+  `status` 命令**直接**读 `g_core.build_id`，不清就是 UAF（崩溃）。触发路径：
+  `still mapped` / `reload norollback` 加载失败 / `prev` 缓存丢失 / rollback 也失败。
+  清空后 `status` 输出 `core=?`。回归：`tests\status_after_failed_reload_test.ps1`
+  （用 `fake_core_hooks.dll`：`Core_Init` 成功、`HooksComplete` 失败）。
+  注意 `g_unloading` 仍保持 1（那几条路径都不恢复直通），所以 dispatcher 本来就不会
+  再进 Core；这条只修 `status` 的直读。
+- `status` 里的 `hash=0` 表示**未知**（哈希读取失败 / 刚卸载），不是真实哈希：
+  UI 把它当「没有哈希」回落到 PE stamp 比较，不会误报 OLD。`g_cur.hash` 在卸载时清零。
+- `core.<pid>.<seq>.dll` 的序号在有失败尝试时会跳号，这是**故意的**：`bad ABI` /
+  `hooks incomplete` 会把模块留在映射状态，下一次尝试必须换新文件名，不能覆盖已映射文件。
 - blob 仓库（32 项 × 256 字节）：`before_unload` **前**快照，回滚时**先恢复快照、
   再加载旧 Core**（旧 Core 的 `Core_Init` 读到的必须是卸载前的状态）。
 - `still mapped` 检测的是**缓存副本路径**（`prev.cachePath`），不是源文件名；

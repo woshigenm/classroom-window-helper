@@ -122,6 +122,13 @@ Run-Suite 'hooks live after reload' {
         Out-Host
 }
 
+# P0: after the old Core was unloaded and the new one failed to load, `status`
+# must not read g_core.build_id from the freed module (core=?).
+Run-Suite 'status after failed reload (UAF)' {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'status_after_failed_reload_test.ps1') |
+        Out-Host
+}
+
 Run-Suite 'version self-check (content hash)' {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'version_test.ps1') |
         Out-Host
