@@ -40,6 +40,20 @@ static int RunInjector(const char* injector, const char* dll)
     return rc == 0;
 }
 
+static HWND g_hostWin;
+static volatile LONG g_hammerRun;
+
+static DWORD WINAPI HammerThread(LPVOID p)
+{
+    (void)p;
+    while (InterlockedCompareExchange(&g_hammerRun, 0, 0)) {
+        if (g_hostWin && IsWindow(g_hostWin))
+            ShowWindow(g_hostWin, SW_SHOW);
+        Sleep(50);
+    }
+    return 0;
+}
+
 static LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     return DefWindowProcA(h, m, w, l);
@@ -53,6 +67,7 @@ int main(int argc, char** argv)
     int seconds = 30;
     int crashAfter = 0;
     int makeWindow = 0;
+    int hammerShow = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -61,6 +76,7 @@ int main(int argc, char** argv)
         else if (!_stricmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!_stricmp(argv[i], "--crash-after") && i + 1 < argc) crashAfter = atoi(argv[++i]);
         else if (!_stricmp(argv[i], "--window")) makeWindow = 1;
+        else if (!_stricmp(argv[i], "--hammer-show")) hammerShow = 1;
         else if (!injector) injector = argv[i];
     }
 
@@ -109,8 +125,16 @@ int main(int argc, char** argv)
                             sw / 10, sh / 10, sw * 8 / 10, sh * 8 / 10,
                             NULL, NULL, wc.hInstance, NULL);
         if (w) ShowWindow(w, SW_SHOW);
+        g_hostWin = w;
         printf("window=%p\n", (void*)w);
         fflush(stdout);
+
+        if (hammerShow && w) {
+            InterlockedExchange(&g_hammerRun, 1);
+            CreateThread(NULL, 0, HammerThread, NULL, 0, NULL);
+            printf("hammer=on\n");
+            fflush(stdout);
+        }
     }
 
     if (crashAfter > 0) {

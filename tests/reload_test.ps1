@@ -153,7 +153,7 @@ try {
     $from2 = if (Test-Path $log) { (Get-Item $log).Length } else { 0 }
     $host2 = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
         -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll',
-                        '--window', '--seconds', '20')
+                        '--window', '--hammer-show', '--seconds', '20')
     for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "core_host (real) did not write its pidfile" }
     $pid2 = [int](Get-Content $pidfile -Raw).Trim()
@@ -182,6 +182,8 @@ try {
     else { "  new core : FAIL"; $pass = $false }
     if ($new2 -match 'subclassed hwnd=') { "  re-subclass: ok (new Core)" }
     else { "  re-subclass: FAIL"; $pass = $false }
+    if (Get-Process -Id $pid2 -ErrorAction SilentlyContinue) { "  host     : alive (ok, hammering hook)" }
+    else { "  host     : FAIL (crashed)"; $pass = $false }
     $st = Send-Ctl $pid2 'status'
     "  status   : $st"
 } finally {

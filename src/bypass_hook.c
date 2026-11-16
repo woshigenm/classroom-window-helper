@@ -2395,6 +2395,14 @@ static BOOL ShowStateAllowed(HWND h, int cmd)
 
 static BOOL WINAPI Impl_ShowWindow(HWND h, int cmd)
 {
+#ifdef BYPASS_STUCK_HOOK
+    /* P2b-3 test build: only the FIRST call blocks, so the phase-1 refusal can
+       be observed and a later reload can still succeed. */
+    {
+        static volatile LONG once;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0) Sleep(5000);
+    }
+#endif
     if (!g_disabled && IsTargetWindow(h) &&
         cmd != SW_SHOW && cmd != SW_SHOWNORMAL &&
         InterlockedIncrement(&g_showLogs) <= 20)
@@ -3986,7 +3994,13 @@ static DWORD WINAPI Worker(LPVOID p)
         BOOL off;
         int  fixedCount = 0;
 
-        if (InterlockedCompareExchange(&g_workerRunning, 0, 0) == 0) break;
+        if (InterlockedCompareExchange(&g_workerRunning, 0, 0) == 0) {
+#ifdef BYPASS_STUCK_WORKER
+            /* P2b-3 test build: never acknowledge the stop request quickly */
+            Sleep(60000);
+#endif
+            break;
+        }
 
         off = (GetFileAttributesA(g_offPath) != INVALID_FILE_ATTRIBUTES);
 
@@ -4480,6 +4494,12 @@ static int Core_RemoveSubclasses(void)
             continue;
         }
         KillTimer(h, TIMER_CAPTION);
+#ifdef BYPASS_SUBCLASS_FAIL
+        /* P2b-3 test build: pretend the restore failed, leave the window on
+           SubclassProc so the phase-2 failure path can be exercised. */
+        failed++;
+        continue;
+#endif
         if (real_SetWindowLongPtrW &&
             (WNDPROC)real_SetWindowLongPtrW(h, GWLP_WNDPROC,
                                            (LONG_PTR)olds[i]) == SubclassProc) {
@@ -4491,9 +4511,13 @@ static int Core_RemoveSubclasses(void)
         }
     }
 
-    EnterCriticalSection(&g_subCs);
-    memset(g_sub, 0, sizeof(g_sub));
-    LeaveCriticalSection(&g_subCs);
+    /* ★ 有窗口恢复失败时不能清表: 下一次 reload 会看到空表、误判"都摘干净了"
+       然后把仍指向 SubclassProc 的旧 Core 卸载掉。保留表项, 重试时再恢复一次。 */
+    if (failed == 0) {
+        EnterCriticalSection(&g_subCs);
+        memset(g_sub, 0, sizeof(g_sub));
+        LeaveCriticalSection(&g_subCs);
+    }
 
     HookLog("[Core] unsubclass: removed=%d gone=%d replaced=%d failed=%d",
             removed, gone, replaced, failed);

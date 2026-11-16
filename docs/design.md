@@ -816,6 +816,13 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
 - 已知限制：`g_sub[]` 存 HWND；窗口销毁后 HWND 被复用、且新窗口恰好有同名
   属性时，`replaced` 分支的 `KillTimer`/`RemoveProp` 可能作用到新窗口。这是
   `SetWindowLongPtrW` 子类化方案的固有限制。
+- **`failed > 0` 时不清 `g_sub[]`**：否则下一次 reload 看到空表会误判“都摘干净
+  了”，把仍指向 `SubclassProc` 的旧 Core 卸载掉。保留表项，重试时再恢复；
+  `replaced`/`gone` 的条目在成功时随整表清空。
+- 机械检查（每次改 hook 后跑）：33 个 dispatcher 每个恰好 1 次
+  `InterlockedIncrement`、2 次 `Decrement`、且 Increment 在 `Tbl()` 之前；
+  45 个 hook/Impl 函数体内不出现
+  `g_stateView|g_stateMap|g_stateEvent|g_sub|EnsureSubclassed|StateReadView`。
 
 ---
 
@@ -980,7 +987,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\fake_core_test.ps1
 证明 `Core_Init` 返回 1 后 Loader 没有 `FreeLibrary`（否则线程会执行已释放代码、进程崩）。
 最后恢复真 Core，`wmode` 必须回到 `FIXED`。
 
-验证 P2a 的缓存副本 / 重载 / 回滚 / `still mapped`（`make.bat fakecores corehost` + 脚本）：
+验证 P2a/P2b 的缓存副本 / 重载 / 回滚 / 子类化 / UEF（`make.bat fakecores corehost` + 脚本）：
 
 ```bat
 make.bat all fakecores corehost
@@ -994,10 +1001,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\reload_test.ps1
 |---|---|
 | 首次加载 | `bin\core_cache\core.<pid>.1.dll` 存在，`status` 返回 `seq=1` |
 | 重载成功 | `ok seq=2`，新缓存存在，旧缓存被删 |
+| 窗口子类化 | 日志 `subclassed hwnd=` → 重载 `[Core] unsubclass: removed=1` → 新 Core 重新 `subclassed` |
+| 重载期间后台 hammer `ShowWindow` | 宿主存活，新 Core 正常（`--hammer-show`） |
+| 初始加载失败后 reload | `err load-failed` → 换回真 Core 后 `ok seq=N` |
 | 新 Core `Core_Init` 返回 0 | `rolledback`，日志有 `reload failed: Core_Init returned 0` 和 `rollback ok` |
 | 新 Core 返回 1 但 ABI 不对 | `rolledback`，日志有 `bad ABI ... leaving it mapped`（不卸载它） |
 | 装一个“泄漏” Core（自己多 `LoadLibrary` 一次）再重载 | `err coreDead`，日志有 `still mapped after FreeLibrary`，`status` 里 `dead=1`，进程不崩 |
-| 真实 Core（P2a 无 drain）重载 | `err no-drain (P2b)`，**不卸载** |
+| 重载后 `RaiseException` | 新 Core 的 `CrashFilter` 记录该 pid 的 `!! crash`（UEF 链没指向旧 Core） |
+
+验证阶段 1/2 的失败路径（`make.bat testcores corehost` + 脚本）：
+
+```bat
+make.bat testcores corehost
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\stuck_test.ps1
+```
+
+三个测试构建（`-DBYPASS_STUCK_HOOK` / `_WORKER` / `_SUBCLASS_FAIL`，只影响测试 DLL）：
+
+| 场景 | 断言 |
+|---|---|
+| hook 卡死（第一次 `ShowWindow` Sleep 5s） | reload → `err refused-by-core`，日志 `hooks still executing`；5s 后再次 reload → `ok seq=` |
+| Worker 卡死（收到停止请求后 Sleep 60s） | reload → 0（阶段 2 超时），日志 `(phase 2): worker did not stop`；再 reload 被阶段 1 拒绝；进程存活 |
+| 子类恢复失败 | reload → 0（阶段 2），日志 `(phase 2): a window still points`；再 reload 仍是阶段 2 失败；进程存活 |
 
 验证"跨进程兜底不会卡死 enforcer"（`make.bat hangwintest` + 脚本）：
 
