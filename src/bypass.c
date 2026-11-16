@@ -546,10 +546,21 @@ void EnableRequiredPrivileges(void) {
     for (int i = 0; privs[i]; i++) EnablePrivilege(privs[i]);
 }
 
-/* 日志互斥 (无初始化依赖的自旋锁, 因为日志会被多个工作线程调用) */
-static volatile LONG g_logSpin = 0;
-static void LogLock(void)   { while (InterlockedExchange(&g_logSpin, 1)) Sleep(0); }
-static void LogUnlock(void) { InterlockedExchange(&g_logSpin, 0); }
+/* 日志互斥。★ 以前是自旋锁 (InterlockedExchange + Sleep(0)) 包着 fputs+fflush:
+   日志文件被杀软扫描 / 放在慢盘上时, 别的线程 (包括 UI 线程) 会在这段里
+   100% 空转一个核。改成临界区 —— 阻塞的线程让出 CPU, 等待时间也不会更长。 */
+static CRITICAL_SECTION g_logCs;
+static int              g_logCsReady;
+
+static void LogLock(void)   { if (g_logCsReady) EnterCriticalSection(&g_logCs); }
+static void LogUnlock(void) { if (g_logCsReady) LeaveCriticalSection(&g_logCs); }
+
+static void LogInit(void)
+{
+    if (g_logCsReady) return;
+    InitializeCriticalSection(&g_logCs);
+    g_logCsReady = 1;
+}
 
 /* 日志输出到编辑框 (同时支持静默模式) */
 void AppendLog(HWND hwnd, const char* fmt, ...) {
@@ -691,6 +702,7 @@ BOOL KillProcessByName(const char* name) {
     DWORD  pids[32];
     int    npid = 0, i;
     BOOL   found = FALSE;
+    BOOL   truncated = FALSE;
 
     if (snapshot == INVALID_HANDLE_VALUE) return FALSE;
 
@@ -703,6 +715,8 @@ BOOL KillProcessByName(const char* name) {
         do {
             if (_stricmp(pe.szExeFile, name) == 0 && npid < 32) {
                 pids[npid++] = pe.th32ProcessID;
+            } else if (_stricmp(pe.szExeFile, name) == 0 && npid >= 32) {
+                truncated = TRUE;   /* 同名实例超过 32 个: 剩下的杀不到, 要留证据 */
             }
         } while (Process32Next(snapshot, &pe));
     }
@@ -720,11 +734,18 @@ BOOL KillProcessByName(const char* name) {
         if (hProcess) {
             if (TerminateProcess(hProcess, 0)) {
                 found = TRUE;
-                WaitForSingleObject(hProcess, 3000);
+                /* 别等满 3 秒: 驱动/看守进程可能卡在内核里, 这里只是"等它退干净",
+                   超时就先处理下一个 (它已经是 Terminating 状态了)。 */
+                if (WaitForSingleObject(hProcess, 1000) == WAIT_TIMEOUT)
+                    SafeLog("[Process] pid %lu still terminating, moving on\r\n",
+                            (unsigned long)pids[i]);
             }
             CloseHandle(hProcess);
         }
     }
+    if (truncated)
+        SafeLog("[Process] %s: more than 32 instances, only the first 32 handled\r\n",
+                name);
     return found;
 }
 
@@ -815,15 +836,24 @@ static BOOL UnlockKeyboardViaRundll(HWND hwnd) {
     sei.nShow = SW_HIDE;
 
     ok = ShellExecuteExA(&sei);
-    if (ok && sei.hProcess) {
-        WaitForSingleObject(sei.hProcess, 5000);
-        GetExitCodeProcess(sei.hProcess, &exitCode);
-        CloseHandle(sei.hProcess);
+    if (ok) {
+        /* ★ hProcess 可能是 NULL (DDE/外壳代理), GetExitCodeProcess 也可能失败:
+           以前 exitCode 初值 0, 这两种情况都会把"什么都没执行"报成"解锁成功"。 */
+        ok = FALSE;
+        if (sei.hProcess) {
+            DWORD wait = WaitForSingleObject(sei.hProcess, 5000);
+            exitCode = (DWORD)-1;
+            if (wait == WAIT_OBJECT_0 &&
+                GetExitCodeProcess(sei.hProcess, &exitCode) && exitCode == 0)
+                ok = TRUE;
+            if (wait == WAIT_TIMEOUT) exitCode = 259;   /* STILL_ACTIVE */
+            CloseHandle(sei.hProcess);
+        }
     }
     if (hwnd)
-        AppendLog(hwnd, "[Keyboard] rundll32 proxy EnableKeyboard -> exit=%lu\r\n",
-                  exitCode);
-    return ok && exitCode == 0;
+        AppendLog(hwnd, "[Keyboard] rundll32 proxy EnableKeyboard -> exit=%ld\r\n",
+                  (long)exitCode);
+    return ok;
 }
 
 /* 通过厂商DLL解锁键盘 (最可靠) */
@@ -831,24 +861,26 @@ static BOOL UnlockKeyboardByDll(HWND hwnd) {
     char dllPath[MAX_PATH];
     HMODULE hDll = NULL;
 
-    if (FindLockKeyboardDll(dllPath, sizeof(dllPath))) {
-        AppendLog(hwnd, "[Keyboard] Found DLL: %s\r\n", dllPath);
-        hDll = LoadLibraryA(dllPath);
+    if (!FindLockKeyboardDll(dllPath, sizeof(dllPath))) {
+        AppendLog(hwnd, "[Keyboard] LockKeyboard.dll not found in the install dirs\r\n");
+        return FALSE;
     }
 
+    AppendLog(hwnd, "[Keyboard] Found DLL: %s\r\n", dllPath);
+    hDll = LoadLibraryA(dllPath);
     if (!hDll) {
         DWORD err = GetLastError();
-        AppendLog(hwnd, "[Keyboard] Cannot load LockKeyboard.dll (Error: %lu)\r\n",
-                  err);
+        AppendLog(hwnd, "[Keyboard] Cannot load %s (Error: %lu)\r\n", dllPath, err);
         if (err == 193 /*ERROR_BAD_EXE_FORMAT*/) {
             /* 32 位 DLL 无法载入 x64 进程 -> 交给 32 位 rundll32 执行 */
             AppendLog(hwnd,
                 "[Keyboard] 32-bit DLL + x64 process, using rundll32 proxy\r\n");
             return UnlockKeyboardViaRundll(hwnd);
         }
-        AppendLog(hwnd, "[Keyboard] DLL not found in common paths, trying default search...\r\n");
-        hDll = LoadLibraryA("LockKeyboard.dll");
-        if (!hDll) return FALSE;
+        /* ★ 不再退化成 LoadLibraryA("LockKeyboard.dll"):
+           提权进程的默认搜索顺序包含当前工作目录 / PATH, 普通用户在那些位置
+           放一个同名 DLL 就能在本进程里执行任意代码。只认上面找到的绝对路径。 */
+        return FALSE;
     }
 
     {
@@ -1120,6 +1152,8 @@ static BOOL RemoveKeyboardClassFilterEntry(HWND hwnd, const char* filterName) {
                 DWORD outLen = 0;
 
                 if (out) {
+                    BOOL removedOne = FALSE;
+
                     while (p < end && *p) {
                         size_t l = strlen(p);
                         if (_stricmp(p, filterName) != 0) {
@@ -1128,23 +1162,35 @@ static BOOL RemoveKeyboardClassFilterEntry(HWND hwnd, const char* filterName) {
                         } else {
                             AppendLog(hwnd, "[Driver] removing '%s' from keyboard class %s\r\n",
                                       filterName, valueNames[v]);
-                            touched = TRUE;
+                            removedOne = TRUE;
                         }
                         p += l + 1;
                     }
                     ((char*)out)[outLen] = '\0';
 
-                    if (outLen > 0) {
-                        if (RegSetValueExA(hKey, valueNames[v], 0, REG_MULTI_SZ,
-                                           out, outLen + 1) == ERROR_SUCCESS) {
+                    /* ★ 没删到东西就一个字节都不写: 以前无论有没有命中都会
+                       RegSetValueEx, 还把 REG_SZ 顺手改写成 REG_MULTI_SZ ——
+                       对启动关键键做无意义写入。 */
+                    if (!removedOne) {
+                        free(out);
+                    } else if (outLen > 0) {
+                        DWORD outType = (type == REG_SZ) ? REG_SZ : REG_MULTI_SZ;
+                        DWORD cb = (outType == REG_SZ)
+                                   ? (DWORD)(strlen((char*)out) + 1)
+                                   : outLen + 1;
+                        if (RegSetValueExA(hKey, valueNames[v], 0, outType,
+                                           out, cb) == ERROR_SUCCESS) {
                             AppendLog(hwnd, "[Driver] %s updated\r\n", valueNames[v]);
+                            touched = TRUE;
                         }
+                        free(out);
                     } else {
                         if (RegDeleteValueA(hKey, valueNames[v]) == ERROR_SUCCESS) {
                             AppendLog(hwnd, "[Driver] %s deleted (was only entry)\r\n", valueNames[v]);
+                            touched = TRUE;
                         }
+                        free(out);
                     }
-                    free(out);
                 }
             }
         }
@@ -1173,7 +1219,13 @@ static BOOL RemoveOneDriver(SC_HANDLE scm, HWND hwnd, const char* driverName) {
                 if (status.dwCurrentState == SERVICE_STOPPED) break;
                 Sleep(250);
             }
-            AppendLog(hwnd, "[Driver] %s stopped\r\n", driverName);
+            /* ★ 只有真的停了才报 stopped: 20 次轮询后仍是 RUNNING 的话,
+               驱动还在内存里继续锁键盘, 日志不能替它宣布成功。 */
+            if (status.dwCurrentState == SERVICE_STOPPED)
+                AppendLog(hwnd, "[Driver] %s stopped\r\n", driverName);
+            else
+                AppendLog(hwnd, "[Driver] WARNING: %s still state=%lu after 5s\r\n",
+                          driverName, (unsigned long)status.dwCurrentState);
         } else {
             DWORD err = GetLastError();
             if (err == ERROR_SERVICE_NOT_ACTIVE) {
@@ -1266,13 +1318,20 @@ BOOL UninstallDriver(HWND hwnd) {
         sei.nShow = SW_HIDE;
         
         if (ShellExecuteEx(&sei)) {
-            WaitForSingleObject(sei.hProcess, 10000);
-            DWORD exitCode;
-            GetExitCodeProcess(sei.hProcess, &exitCode);
-            CloseHandle(sei.hProcess);
-            
-            AppendLog(hwnd, "[Driver] DriverInstall returned: %d\r\n", exitCode);
-            success = (exitCode == 0);
+            /* ★ hProcess 可能是 NULL (外壳代理), GetExitCodeProcess 也可能失败:
+               以前 exitCode 未初始化, 这两种情况会把成败判成栈垃圾。 */
+            DWORD exitCode = (DWORD)-1;
+
+            success = FALSE;
+            if (sei.hProcess) {
+                DWORD wait = WaitForSingleObject(sei.hProcess, 10000);
+                if (wait == WAIT_OBJECT_0 &&
+                    GetExitCodeProcess(sei.hProcess, &exitCode) && exitCode == 0)
+                    success = TRUE;
+                if (wait == WAIT_TIMEOUT) exitCode = 259;   /* STILL_ACTIVE */
+                CloseHandle(sei.hProcess);
+            }
+            AppendLog(hwnd, "[Driver] DriverInstall returned: %ld\r\n", (long)exitCode);
         }
         
         AppendLog(hwnd, "[Driver] A system restart may be required\r\n");
@@ -1326,6 +1385,8 @@ static void SetInstallDir(const char* dir) {
 
 static BOOL GetInstallDir(char* out, DWORD size) {
     BOOL ok = FALSE;
+
+    if (!out || size < 2) return FALSE;         /* 以前 size==0 会写 out[-1] */
     while (InterlockedExchange(&g_installLock, 1)) Sleep(0);
     if (g_installDir[0]) {
         snprintf(out, size, "%s", g_installDir);
@@ -1385,6 +1446,37 @@ static BOOL FindDirFromProcesses(char* outDir, DWORD size) {
 }
 
 /* 从注册表卸载项查询安装目录 */
+/* 注册表里的安装目录经常带引号 / 尾反斜杠 / %ProgramFiles% 环境变量。
+   直接拿来用会让之后**所有** FindSoftwareFile 失效, 而且它会被缓存住
+   (一条脏值能把这个会话里所有 DLL/EXE 查找全废掉), 所以这里统一清洗 +
+   校验目录真的还在。 */
+static BOOL CleanInstallDir(const char* raw, char* out, DWORD size) {
+    char   tmp[MAX_PATH * 2];
+    char*  p;
+    size_t n;
+
+    if (!raw || !raw[0] || !out || size < 3) return FALSE;
+
+    if (strchr(raw, '%')) {
+        if (!ExpandEnvironmentStringsA(raw, tmp, sizeof(tmp))) return FALSE;
+    } else {
+        _snprintf(tmp, sizeof(tmp) - 1, "%s", raw);
+        tmp[sizeof(tmp) - 1] = '\0';
+    }
+
+    p = tmp;
+    while (*p == ' ' || *p == '\t' || *p == '"') p++;
+    n = strlen(p);
+    while (n && (p[n - 1] == '"' || p[n - 1] == ' ' || p[n - 1] == '\t' ||
+                 p[n - 1] == '\\'))
+        p[--n] = '\0';
+    if (!n || n >= size) return FALSE;
+    if (GetFileAttributesA(p) == INVALID_FILE_ATTRIBUTES) return FALSE;
+
+    memcpy(out, p, n + 1);
+    return TRUE;
+}
+
 static BOOL FindDirFromRegistry(char* outDir, DWORD size) {
     /* 优先查询卸载项 (含完整卸载路径) */
     static const char* uninstallRoots[] = {
@@ -1428,9 +1520,8 @@ static BOOL FindDirFromRegistry(char* outDir, DWORD size) {
             DWORD type = 0;
 
             if (RegQueryValueEx(hSub, "InstallLocation", NULL, &type,
-                    (LPBYTE)buf, &bufSize) == ERROR_SUCCESS && buf[0] != '\0') {
-                snprintf(outDir, size, "%s", buf);
-                outDir[size - 1] = '\0';
+                    (LPBYTE)buf, &bufSize) == ERROR_SUCCESS && buf[0] != '\0' &&
+                CleanInstallDir(buf, outDir, size)) {
                 RegCloseKey(hSub);
                 RegCloseKey(hRoot);
                 return TRUE;
@@ -1441,12 +1532,8 @@ static BOOL FindDirFromRegistry(char* outDir, DWORD size) {
                     (LPBYTE)buf, &bufSize) == ERROR_SUCCESS && buf[0] != '\0') {
                 /* 去掉文件名, 保留目录 */
                 char* p1 = strrchr(buf, '\\');
-                if (p1) {
-                    *p1 = '\0';
-                    /* 去掉可能的引号 */
-                    if (buf[0] == '"') memmove(buf, buf + 1, strlen(buf));
-                    snprintf(outDir, size, "%s", buf);
-                    outDir[size - 1] = '\0';
+                if (p1) *p1 = '\0';
+                if (CleanInstallDir(buf, outDir, size)) {
                     RegCloseKey(hSub);
                     RegCloseKey(hRoot);
                     return TRUE;
@@ -1506,23 +1593,32 @@ static BOOL FindSoftwareFile(const char* relName, char* outPath, DWORD size) {
 
     /* 找不到时也必须给调用方一个确定值: 之前不改 outPath, 调用方拿着
        未初始化的栈缓冲去当路径用 (可能连 NUL 都没有 -> 越界读)。 */
-    if (outPath && size) outPath[0] = '\0';
     if (!outPath || size < 2) return FALSE;
+    outPath[0] = '\0';
 
-    GetModuleFileName(NULL, exeDir, MAX_PATH);
+    if (!GetModuleFileName(NULL, exeDir, MAX_PATH)) return FALSE;
+    exeDir[MAX_PATH - 1] = '\0';
     PathRemoveFileSpec(exeDir);
 
     /* 1. 动态定位的安装目录 (核心) */
     if (FindInstallDir(installDir, sizeof(installDir))) {
-        snprintf(searchPaths[n++], MAX_PATH, "%s\\%s", installDir, relName);
-        snprintf(searchPaths[n++], MAX_PATH, "%s\\x64\\%s", installDir, relName);
+        _snprintf(searchPaths[n], MAX_PATH - 1, "%s\\%s", installDir, relName);
+        searchPaths[n][MAX_PATH - 1] = '\0';
+        n++;
+        _snprintf(searchPaths[n], MAX_PATH - 1, "%s\\x64\\%s", installDir, relName);
+        searchPaths[n][MAX_PATH - 1] = '\0';
+        n++;
     }
 
     /* 2. exe 同级 */
-    snprintf(searchPaths[n++], MAX_PATH, "%s\\%s", exeDir, relName);
+    _snprintf(searchPaths[n], MAX_PATH - 1, "%s\\%s", exeDir, relName);
+    searchPaths[n][MAX_PATH - 1] = '\0';
+    n++;
 
     /* 3. 当前工作目录 */
-    snprintf(searchPaths[n++], MAX_PATH, "%s", relName);
+    _snprintf(searchPaths[n], MAX_PATH - 1, "%s", relName);
+    searchPaths[n][MAX_PATH - 1] = '\0';
+    n++;
 
     for (int i = 0; i < n; i++) {
         if (GetFileAttributes(searchPaths[i]) != INVALID_FILE_ATTRIBUTES) {
@@ -1585,14 +1681,46 @@ static BOOL ReadConfigValue(const char* path, const char* key, char* out, size_t
  * 所以这里不写死键名, 而是扫描各 Run/RunOnce 的"值数据",
  * 命中教室软件相关进程名即删除 —— 比猜键名可靠。
  * ------------------------------------------------------------------ */
+/* Run 值里"提到某个进程"必须按路径分段精确判断。
+   以前直接 _stristr(data, "Student.exe"): "C:\x\MyStudent.exe"、
+   "x64\Student.exe.bak" 也会命中 —— 删自启动项是不可恢复的, 不能靠子串。 */
+static BOOL DataMentionsProcess(const char* data, const char* name)
+{
+    const char* p;
+    size_t      nlen;
+
+    if (!data || !name || !(nlen = strlen(name))) return FALSE;
+    p = data;
+    while ((p = _stristr(p, name)) != NULL) {
+        char before = (p == data) ? '\0' : p[-1];
+        char after  = p[nlen];
+
+        if ((before == '\0' || before == '\\' || before == '"' ||
+             before == ' '  || before == '\'') &&
+            (after == '\0' || after == '"' || after == ' ' || after == '\'' ||
+             after == ',' || after == '\r' || after == '\n'))
+            return TRUE;
+        p += nlen;
+    }
+    return FALSE;
+}
+
 static BOOL RemoveStartupPersistence(HWND hwnd) {
-    struct { HKEY root; const char* sub; } roots[] = {
-        { HKEY_CURRENT_USER,  "Software\\Microsoft\\Windows\\CurrentVersion\\Run" },
-        { HKEY_CURRENT_USER,  "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
-        { HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run" },
-        { HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
-        { HKEY_LOCAL_MACHINE, "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run" },
-        { HKEY_LOCAL_MACHINE, "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
+    /* ★ HKLM 必须**两种视图各扫一遍**: 32 位进程访问 HKLM\Software 会被 WOW64
+       重定向到 WOW6432Node, 所以以前那两行手写的 "WOW6432Node\..." 在 32 位
+       构建里等于把同一个键扫了两遍, 真正的 64 位 Run/RunOnce 永远漏掉 ——
+       看守进程就是这样把 Student.exe 拉回来的。 */
+    struct { HKEY root; const char* sub; REGSAM view; } roots[] = {
+        { HKEY_CURRENT_USER,  "Software\\Microsoft\\Windows\\CurrentVersion\\Run",      0 },
+        { HKEY_CURRENT_USER,  "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",  0 },
+        { HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+          KEY_WOW64_64KEY },
+        { HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+          KEY_WOW64_64KEY },
+        { HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+          KEY_WOW64_32KEY },
+        { HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+          KEY_WOW64_32KEY },
     };
     int removed = 0;
 
@@ -1601,7 +1729,7 @@ static BOOL RemoveStartupPersistence(HWND hwnd) {
         DWORD subCount = 0;
 
         if (RegOpenKeyExA(roots[r].root, roots[r].sub, 0,
-                          KEY_READ | KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+                          KEY_READ | KEY_SET_VALUE | roots[r].view, &hKey) != ERROR_SUCCESS) {
             continue;
         }
         RegQueryInfoKeyA(hKey, NULL, NULL, NULL, NULL, NULL, NULL,
@@ -1621,7 +1749,7 @@ static BOOL RemoveStartupPersistence(HWND hwnd) {
             data[sizeof(data) - 1] = '\0';
 
             for (int n = 0; STARTUP_PROCESS_NAMES[n]; n++) {
-                if (_stristr(data, STARTUP_PROCESS_NAMES[n])) { match = TRUE; break; }
+                if (DataMentionsProcess(data, STARTUP_PROCESS_NAMES[n])) { match = TRUE; break; }
             }
             if (!match) continue;
 
@@ -2238,27 +2366,22 @@ static BOOL IsAlreadyDemoted(HWND hwnd, int screenW, int screenH) {
    改了大小就被判成"未就位", 下一轮 200ms 轮询又把窗口按回小窗。
    现在的规则是: 接管过的窗口, 除非它又变回"满屏/置顶",
    否则一律不碰 —— 尺寸和位置完全交给用户。 */
-#define MAX_MANAGED_WIN 32
-static HWND g_managedWin[MAX_MANAGED_WIN];
-static volatile LONG g_managedWinNext;
-
+/* ------------------- 已被接管的窗口标记 -------------------
+   只认窗口属性 (BypassSmall): 属性挂在窗口对象上, 窗口销毁时系统一起回收,
+   不会出现"句柄复用 -> 误判已接管"。
+   以前还有一张进程内 HWND 表兜底, 但表项只比数值: 旧广播窗销毁后新窗口
+   拿到同一个句柄, IsManagedWin() 直接返回 TRUE -> SHOW 事件里连队都不排,
+   新广播窗只能等 200ms 轮询 (而且会被当成"用户拖过的窗口"放过)。 */
 static void MarkManagedWin(HWND h) {
-    LONG slot;
-
-    if (!h) return;
-    SetPropA(h, "BypassSmall", (HANDLE)1);   /* 跨进程可见, DLL 也认这个属性 */
-    slot = InterlockedIncrement(&g_managedWinNext) & (MAX_MANAGED_WIN - 1);
-    g_managedWin[slot] = h;
+    if (!h || !IsWindow(h)) return;
+    if (!SetPropA(h, "BypassSmall", (HANDLE)1))
+        SafeLog("[SmallWin] WARNING: SetProp(BypassSmall) failed hwnd=%p err=%lu\r\n",
+                (void*)h, (unsigned long)GetLastError());
 }
 
 static BOOL IsManagedWin(HWND h) {
-    int i;
-
-    if (!h) return FALSE;
-    if (GetPropA(h, "BypassSmall")) return TRUE;
-    for (i = 0; i < MAX_MANAGED_WIN; i++)
-        if (g_managedWin[i] == h && IsWindow(h)) return TRUE;
-    return FALSE;
+    if (!h || !IsWindow(h)) return FALSE;
+    return GetPropA(h, "BypassSmall") ? TRUE : FALSE;
 }
 
 /* 基础降级: 去置顶 + 普通窗口样式 + 缩成右下角小窗 (原实现) */
@@ -2267,6 +2390,11 @@ static BOOL DemoteWindowBase(HWND hwnd, int screenW, int screenH) {
     RECT    rc;
 
     if (!IsWindow(hwnd)) return FALSE;
+    /* ★ 最小化到任务栏的窗口绝不能在这里"救"回来, 也不该按小窗重排:
+       跨进程 ShowWindow/SetWindowPos 不经过被注入 DLL 的钩子, 用户会看到
+       任务栏里的窗口自己弹出来。加固档 (DemoteWindowHard) 一直有这条保护,
+       基础档漏了 —— 最小化窗口的 GetWindowRect 还会让验证误判"成功"。 */
+    if (IsIconic(hwnd)) return FALSE;
 
     /* ★ 用户主动(模拟)最大化过的窗口: 绝不再降级。
        标记由注入的 DLL 打在窗口属性上 (跨进程可读)。 */
@@ -2348,6 +2476,7 @@ static BOOL VerifyDemoted(HWND hwnd, int screenW, int screenH) {
     int     w, h;
 
     if (!IsWindow(hwnd)) return FALSE;
+    if (IsIconic(hwnd)) return FALSE;              /* 最小化: 矩形是幽灵值, 不能算成功 */
     if (!IsWindowVisible(hwnd)) return FALSE;      /* 被隐藏 = 不算"小窗化成功" */
     if (!GetWindowRect(hwnd, &r)) return FALSE;
 
@@ -2358,8 +2487,10 @@ static BOOL VerifyDemoted(HWND hwnd, int screenW, int screenH) {
 
     w = r.right - r.left;
     h = r.bottom - r.top;
-    /* 目标宽度是屏幕 1/3; 若仍接近全屏, 判定失败 */
-    if (w >= screenW * 2 / 3 && h >= screenH * 2 / 3) return FALSE;
+    /* 目标宽度是屏幕 1/3; 只要**任一维**还接近全屏就算没降下来。
+       以前用 && : 1920x200 这种"全宽窄条"会被判成验证成功, 于是不再加固,
+       下一轮 IsAlreadyDemoted 又说没就位 -> 200ms 重设/闪烁的死循环。 */
+    if (w >= screenW * 2 / 3 || h >= screenH * 2 / 3) return FALSE;
     return TRUE;
 }
 
@@ -2470,9 +2601,15 @@ static void QueuePendingDemote(HWND hwnd) {
     g_pendingDemote[g_pendingDemoteCount++] = hwnd;
 }
 
-/* 复核队列里的窗口并小窗化; 返回处理数量 */
+/* 复核队列里的窗口并小窗化; 返回处理数量。
+   ★ 每次最多真正处理 2 个: 这个函数运行在 UI 线程 (WM_TIMER), 每个窗口
+     最坏 200ms 的 WindowResponds + 跨进程 SetWindowPos, 16 个就是 3 秒多的
+     消息循环停摆 (界面"假死")。剩下的留到下一拍, 队列非空就再装一次定时器。 */
+#define MAX_PER_TICK 2
 static int FlushPendingDemote(void) {
     int    n = 0;
+    int    handled = 0;
+    int    left = 0;
     int    screenW = GetSystemMetrics(SM_CXSCREEN);
     int    screenH = GetSystemMetrics(SM_CYSCREEN);
 
@@ -2512,6 +2649,12 @@ static int FlushPendingDemote(void) {
               !(GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOPMOST))))
             continue;
 
+        if (handled >= MAX_PER_TICK) {          /* 剩下的留到下一拍, 别霸占 UI 线程 */
+            g_pendingDemote[left++] = h;
+            continue;
+        }
+        handled++;
+
         GetClassNameA(h, cls, sizeof(cls));
         tier = DemoteWindowTiered(h, screenW, screenH);
         if (tier > 0) {
@@ -2531,7 +2674,9 @@ static int FlushPendingDemote(void) {
             }
         }
     }
-    g_pendingDemoteCount = 0;
+    g_pendingDemoteCount = left;
+    if (left && g_hwndMain)          /* 还有没处理完的: 100ms 后再来一拍 */
+        SetTimer(g_hwndMain, IDT_DEMOTE_RECHECK, 100, NULL);
     return n;
 }
 
@@ -2615,9 +2760,15 @@ static void CALLBACK BroadcastWinEventProc(HWINEVENTHOOK hook, DWORD event, HWND
         }
     }
 
-    /* 2) 再排队 150ms 后复核一次, 兜住 "先 Show 再 Resize 到全屏" 的情况 */
-    QueuePendingDemote(hwnd);
-    SetTimer(g_hwndMain, IDT_DEMOTE_RECHECK, 150, NULL);
+    /* 2) 再排队 150ms 后复核一次, 兜住 "先 Show 再 Resize 到全屏" 的情况。
+       ★ 只在队列原本为空时装定时器: 每来一个 SHOW 事件就 SetTimer(150) 会
+         把复核一直往后推 (Windows 的定时器是重置而不是叠加)。 */
+    {
+        BOOL wasEmpty = (g_pendingDemoteCount == 0);
+
+        QueuePendingDemote(hwnd);
+        if (wasEmpty) SetTimer(g_hwndMain, IDT_DEMOTE_RECHECK, 150, NULL);
+    }
 }
 
 static void InstallBroadcastHook(HWND hwndLog) {
@@ -2661,6 +2812,10 @@ static BOOL CALLBACK DemoteEnumProc(HWND hwnd, LPARAM lp) {
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid == 0 || pid == GetCurrentProcessId()) return TRUE;
     if (!IsWindowVisible(hwnd)) return TRUE;
+    /* 最小化在任务栏里的窗口不要碰 (和事件路径 FlushPendingDemote 保持一致) */
+    if (IsIconic(hwnd)) return TRUE;
+    /* 有 owner 的顶层窗口是对话框/浮层 (渲染器也会弹), 不是广播画面 */
+    if (GetWindow(hwnd, GW_OWNER) != NULL) return TRUE;
 
     GetClassNameA(hwnd, cls, sizeof(cls));
     knownClass = FALSE;
@@ -2699,8 +2854,6 @@ static BOOL CALLBACK DemoteEnumProc(HWND hwnd, LPARAM lp) {
        小窗 —— 实测就是这样冒出来"两个小窗"的。 */
     if (!fullscreen && IsPlainWindow(hwnd, ctx->screenW, ctx->screenH)) return TRUE;
 
-    if (fullscreen) ctx->fullscreen++;   /* 只要看到满屏就保持高频复核 */
-
     /* 用户主动(模拟)最大化的广播窗: 已经接管, 尺寸是用户要的。
        它的标题栏可能已被自动隐藏 (没有 WS_CAPTION), 绝不能再降级一次。 */
     if (GetPropA(hwnd, "BypassUserMax")) {
@@ -2728,7 +2881,14 @@ static BOOL CALLBACK DemoteEnumProc(HWND hwnd, LPARAM lp) {
     }
 
     if (knownClass || fullscreen || big || topmost) {
-        int tier = DemoteWindowTiered(hwnd, ctx->screenW, ctx->screenH);
+        int tier;
+
+        /* ★ 计数放在所有"故意跳过"的分支之后: 用户自己最大化的窗口也是
+           "满屏", 以前把它算进来, 于是轮询永远停在 200ms 档, 还每 2 秒打一条
+           误导性的 "likely exclusive fullscreen"。 */
+        if (fullscreen) ctx->fullscreen++;
+
+        tier = DemoteWindowTiered(hwnd, ctx->screenW, ctx->screenH);
         if (tier > 0) {
             RECT rr;
             MarkManagedWin(hwnd);
@@ -2926,6 +3086,7 @@ void RunInjector(HWND hwndLog, BOOL verbose) {
     PROCESS_INFORMATION pi;
     SECURITY_ATTRIBUTES sa;
     HANDLE rd = NULL, wr = NULL;
+    HANDLE nulIn = INVALID_HANDLE_VALUE;
     DWORD now = GetTickCount();
     char  out[8192];
     DWORD total = 0;
@@ -2933,16 +3094,22 @@ void RunInjector(HWND hwndLog, BOOL verbose) {
     BOOL  ok;
 
     if (!verbose) {
-        DWORD th = TargetPidHash();
+        DWORD th;
 
-        /* 没有课堂进程: 不启动 inject32 (省得每秒拉一个进程) */
+        /* ★ 先看时间再拉快照: 200ms 节拍下以前每秒做 5 次整表进程快照。 */
+        if (g_lastInjectTick && (now - g_lastInjectTick) < 2000) return;
+
+        th = TargetPidHash();
+
+        /* 没有课堂进程: 不启动 inject32 (省得每轮拉一个进程)。
+           同时清掉"上次的 PID 集合": 进程集合清空后再出现, 要能立刻注入。 */
         if (!th) {
+            g_lastTargetHash = 0;
             g_lastInjectTick = now;
             return;
         }
         /* PID 集合没变: 15 秒复查一次即可; 变了(有新进程) -> 立刻注入 */
-        if (th == g_lastTargetHash && g_lastInjectTick &&
-            (now - g_lastInjectTick) < 15000) {
+        if (th == g_lastTargetHash && (now - g_lastInjectTick) < 15000) {
             return;
         }
         g_lastTargetHash = th;
@@ -2978,14 +3145,23 @@ void RunInjector(HWND hwndLog, BOOL verbose) {
 
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
-    si.hStdOutput = wr ? wr : GetStdHandle(STD_OUTPUT_HANDLE);
-    si.hStdError  = si.hStdOutput;
+    /* ★ 只有真的拿到管道时才声明 STARTF_USESTDHANDLES: GUI 进程里
+       GetStdHandle 通常是 NULL, 而 STARTF_USESTDHANDLES + 无效句柄会让
+       CreateProcess 直接失败 (ERROR_INVALID_HANDLE)。stdin 给 NUL。 */
+    if (wr) {
+        nulIn = CreateFileA("NUL", GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                            OPEN_EXISTING, 0, NULL);
+        si.dwFlags    = STARTF_USESTDHANDLES;
+        si.hStdInput  = (nulIn != INVALID_HANDLE_VALUE) ? nulIn : wr;
+        si.hStdOutput = wr;
+        si.hStdError  = wr;
+    }
 
     memset(&pi, 0, sizeof(pi));
-    ok = CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                        NULL, dir, &si, &pi);
+    ok = CreateProcessA(NULL, cmdLine, NULL, NULL, wr ? TRUE : FALSE,
+                        CREATE_NO_WINDOW, NULL, dir, &si, &pi);
+    if (nulIn != INVALID_HANDLE_VALUE) CloseHandle(nulIn);
     if (wr) { CloseHandle(wr); wr = NULL; }
 
     if (!ok) {
@@ -3017,7 +3193,12 @@ void RunInjector(HWND hwndLog, BOOL verbose) {
             break;
         }
         if (total >= sizeof(out) - 1) {      /* 输出过多: 不再读, 等它自己结束 */
-            WaitForSingleObject(pi.hProcess, 8000);
+            if (WaitForSingleObject(pi.hProcess, 8000) != WAIT_OBJECT_0) {
+                /* 不结束就杀掉: 句柄一关它就成了孤儿, 还卡在写管道上 */
+                AppendLog(hwndLog, "[Hook] inject32.exe 输出过多且未退出, 强制结束\r\n");
+                TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, 500);
+            }
             break;
         }
     }
@@ -3072,14 +3253,26 @@ void RunInjector(HWND hwndLog, BOOL verbose) {
    "Default", 两边互相打架, 每次切换都是一次整屏重绘 —— 用户看到的就是
    "黑屏闪动"。回到用户桌面改为只提示, 由用户按 Ctrl+Alt+D 决定时机。 */
 DWORD WINAPI SmallWinThreadProc(LPVOID lp) {
-    (void)lp;
+    HWND  logWnd = (HWND)lp;
     DWORD lastDesktopWarn = 0;
     DWORD lastDemoteLog   = 0;
     DWORD lastGiveUpLog   = 0;
-    int   fightStreak     = 0;   /* 连续多少轮又在降级 = 渲染器在反复改回去 */
+    int   fightStreak     = 0;   /* 同一个窗口连续被降级几次 = 渲染器在反复改回去 */
+    HWND  lastFightHwnd   = NULL;
     BOOL  gaveUp          = FALSE;
 
     SafeLog("[SmallWin] fullscreen watcher started (adaptive, with back-off)\r\n");
+
+    /* 首轮准备工作 (以前在 UI 线程同步做 -> 点按钮白屏几秒):
+       放行标志归零 -> 注入 -> 兼容标志预设 -> 全量扫描。
+       每一步都检查 g_smallWinRun: 用户可能刚点上就关掉。 */
+    if (g_smallWinRun) {
+        SetHookOffFlag(FALSE);
+        AppendLog(logWnd, "[Hook] 注入 bypass_hook32.dll 到渲染进程...\r\n");
+        RunInjector(logWnd, TRUE);
+    }
+    if (g_smallWinRun) PresetFullscreenDowngrade(logWnd, TRUE);
+    if (g_smallWinRun) SmallWindowBroadcastCore(logWnd, TRUE);
     while (g_smallWinRun) {
         DemoteCtx ctx;
         int   step;
@@ -3095,12 +3288,25 @@ DWORD WINAPI SmallWinThreadProc(LPVOID lp) {
         ctx.screenH = GetSystemMetrics(SM_CYSCREEN);
 
         if (gaveUp) {
-            /* 已经认输: 只观察, 绝不再碰窗口 (再碰就是继续闪) */
+            /* 已经认输: 只观察, 绝不再碰窗口 (再碰就是继续闪)。
+               ★ 每轮用一次进程快照判断"这一场是不是结束了": 渲染器没了就
+                 解除 back-off (以前 gaveUp 一旦置位只能重启工具)。 */
             if (now - lastGiveUpLog > 30000) {
                 lastGiveUpLog = now;
                 SafeLog("[SmallWin] watcher idle: renderer keeps restoring "
                         "fullscreen. Use 'Kill classroom processes' "
                         "(or Ctrl+Alt+X) to stop it for real.\r\n");
+            }
+            {
+                DemoteCtx probe;
+                memset(&probe, 0, sizeof(probe));
+                probe.quiet = TRUE;
+                if (!CollectBroadcastPids(&probe)) {
+                    gaveUp = FALSE;
+                    fightStreak = 0;
+                    lastFightHwnd = NULL;
+                    SafeLog("[SmallWin] back-off cleared: no broadcast process left\r\n");
+                }
             }
             step = 3000;
         } else {
@@ -3108,8 +3314,16 @@ DWORD WINAPI SmallWinThreadProc(LPVOID lp) {
                 EnumWindows(DemoteEnumProc, (LPARAM)&ctx);
             }
 
-            if (ctx.demoted > 0) fightStreak++;
-            else if (ctx.fullscreen == 0) fightStreak = 0;
+            /* ★ 只统计"同一个窗口被反复改回去": 渲染器每轮新建窗口是正常行为,
+               以前按 ctx.demoted>0 累加, 连续弹 4 个窗口就永久放弃。 */
+            if (ctx.demoted > 0) {
+                if (ctx.firstHwnd && ctx.firstHwnd == lastFightHwnd) fightStreak++;
+                else                                                  fightStreak = 1;
+                lastFightHwnd = ctx.firstHwnd;
+            } else {
+                fightStreak = 0;
+                lastFightHwnd = NULL;
+            }
 
             if (now - lastDemoteLog > 2000) {
                 if (ctx.demoted > 0) {
@@ -3164,25 +3378,36 @@ DWORD WINAPI SmallWinThreadProc(LPVOID lp) {
 void StartSmallWin(HWND hwnd) {
     if (g_smallWinRun) return;
 
+    /* 上一轮的 watcher 可能还没退干净 (StopSmallWin 等超时过):
+       先收它, 否则两个线程同时 EnumWindows + SetWindowPos = 闪。 */
+    if (g_hSmallWinThread) {
+        if (WaitForSingleObject(g_hSmallWinThread, 1500) == WAIT_OBJECT_0) {
+            CloseHandle(g_hSmallWinThread);
+            g_hSmallWinThread = NULL;
+        } else {
+            AppendLog(hwnd, "[SmallWin] previous watcher is still busy; "
+                            "not starting a second one\r\n");
+            return;
+        }
+    }
+
     g_smallWinRun = TRUE;
 
-    /* 第 0 步: 让渲染进程"自己"失去做全屏的能力 (DLL 注入 + IAT hook)。
-       这是根治手段: 窗口从创建那一刻就是小窗, 不存在 200ms 抢一次的闪屏。 */
-    SetHookOffFlag(FALSE);
-    AppendLog(hwnd, "[Hook] 注入 bypass_hook32.dll 到渲染进程...\r\n");
-    RunInjector(hwnd, TRUE);
-
-    /* Tier 1.5: 先给广播进程预设"禁用全屏优化", 让之后 Tier 1 才有戏 */
-    PresetFullscreenDowngrade(hwnd, TRUE);
-
-    /* 事件驱动: 广播窗口一出现就处理 (即时) */
+    /* 事件驱动: 广播窗口一出现就处理 (即时)。
+       ★ 必须在 UI 线程装: WINEVENT_OUTOFCONTEXT 的事件投递到"装钩子的线程"。 */
     InstallBroadcastHook(hwnd);
 
-    /* 先做一次全量扫描, 处理已经存在的窗口 */
-    SmallWindowBroadcastCore(hwnd, TRUE);
+    /* ★ 注入 / 兼容标志预设 / 首轮全量扫描都挪进 watcher 线程 (见
+       SmallWinThreadProc 开头): 它们要跑进程枚举 + CreateProcess + 等
+       inject32 (最坏 8 秒), 在 UI 线程同步做就是"点了按钮白屏几秒"。 */
 
-    /* 轮询兜底 */
+    /* 轮询兜底 (也是首轮准备工作的执行者) */
     g_hSmallWinThread = CreateThread(NULL, 0, SmallWinThreadProc, hwnd, 0, NULL);
+    if (!g_hSmallWinThread) {
+        AppendLog(hwnd, "[SmallWin] WARNING: watcher thread failed (err=%lu) - "
+                        "only the WinEvent hook is active\r\n", GetLastError());
+        return;      /* g_smallWinRun 保持 TRUE: 钩子仍在工作 */
+    }
 
     AppendLog(hwnd,
         "[SmallWin] sticky small-window mode ENABLED "
@@ -3198,9 +3423,16 @@ void StopSmallWin(HWND hwnd) {
     RemoveBroadcastHook();
 
     if (g_hSmallWinThread) {
-        WaitForSingleObject(g_hSmallWinThread, 3000);
-        CloseHandle(g_hSmallWinThread);
-        g_hSmallWinThread = NULL;
+        /* ★ 超时后**不要**关句柄/置 NULL: 线程可能正卡在 RunInjector (最长
+           8 秒) 或 WindowResponds (每窗 200ms)。关掉句柄再点开就会起第二个
+           watcher; 而且卡住的那一轮回来时还会再降级一次 (用户已经关掉了)。 */
+        if (WaitForSingleObject(g_hSmallWinThread, 3000) == WAIT_OBJECT_0) {
+            CloseHandle(g_hSmallWinThread);
+            g_hSmallWinThread = NULL;
+        } else {
+            AppendLog(hwnd, "[SmallWin] watcher still busy - it will exit after "
+                            "the current pass (not starting another one)\r\n");
+        }
     }
 
     /* ⚠ 这里不写 bypass_hook.off: 退出程序 ≠ 要求放行。
@@ -3474,6 +3706,26 @@ static void LayoutControls(HWND hwnd) {
     SetRect(&g_rcTitleMin,   w - S(92), 0, w - S(46), g_titleH);
     SetRect(&g_rcTitleClose, w - S(46), 0, w,         g_titleH);
 
+    /* 功能按钮 + 勾选框也在这里统一摆位:
+       ★ 以前它们只在 CreateControls 里按当时的 DPI 建一次, 换到别的显示器
+         (WM_DPICHANGED) 后字号变大、按钮还是旧尺寸, 文字就被裁掉了。 */
+    {
+        static const int ids[4] = { ID_BTN_UNLOCK_KB, ID_BTN_KILL_PROC,
+                                    ID_BTN_UNINSTALL, ID_BTN_SMALLSTICKY };
+        int colX[2], i;
+
+        colX[0] = S(UI_PAD);
+        colX[1] = S(UI_PAD) + S(BTN2_W) + S(BTN_GAP);
+        for (i = 0; i < 4; i++) {
+            HWND b = GetDlgItem(hwnd, ids[i]);
+            if (b)
+                MoveWindow(b, colX[i & 1], S(i < 2 ? ROW1_Y : ROW2_Y),
+                           S(BTN2_W), S(BTN_H), TRUE);
+        }
+        hCtl = GetDlgItem(hwnd, ID_CHK_TRAY);
+        if (hCtl) MoveWindow(hCtl, S(UI_PAD), S(CHK_Y), S(300), S(24), TRUE);
+    }
+
     logTop    = S(LOG_Y);
     logBottom = h - S(56);
     if (g_hwndLog && (logBottom - logTop) > S(60)) {
@@ -3491,16 +3743,29 @@ static void LayoutControls(HWND hwnd) {
 
 /* ========== 创建控件 ========== */
 
+/* 只有这两个控件"持有"字体句柄 (owner-draw 按钮是绘制时现取的)。
+   ★ 重建字体 (WM_DPICHANGED) 之后必须重新下发一次, 否则它们还指着一个
+     已经 DeleteObject 掉的 HFONT —— 换到不同 DPI 的显示器后日志区/勾选框
+     会画不出来或者用回默认字体。 */
+static void ApplyControlFonts(HWND hwnd)
+{
+    HWND h;
+
+    if (!hwnd) return;
+    h = GetDlgItem(hwnd, ID_LOG_OUTPUT);
+    if (h) SendMessageW(h, WM_SETFONT, (WPARAM)g_hFontLog, TRUE);
+    h = GetDlgItem(hwnd, ID_CHK_TRAY);
+    if (h) SendMessageW(h, WM_SETFONT, (WPARAM)g_hFontHint, TRUE);
+}
+
 void CreateControls(HWND hwnd) {
     HINSTANCE hInstance = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
     int colX[2];
     int ids1[2], ids2[2];
     int i, y;
     HWND hBtn;
-    HWND hChk;
 
     CreateUIFonts();
-
     /* 两个宽按钮一列: 4 个功能按钮排成 2x2, 宽度占满整行 */
     colX[0] = S(UI_PAD);
     colX[1] = S(UI_PAD) + S(BTN2_W) + S(BTN_GAP);
@@ -3535,14 +3800,12 @@ void CreateControls(HWND hwnd) {
         ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
         S(UI_PAD + 2), S(LOG_Y), S(BTN2_W) * 2 + S(BTN_GAP) - S(4), S(326),
         hwnd, (HMENU)(INT_PTR)ID_LOG_OUTPUT, hInstance, NULL);
-    SendMessageW(g_hwndLog, WM_SETFONT, (WPARAM)g_hFontLog, TRUE);
 
     /* 广播窗最小化行为: 任务栏(真最小化) / 收起(托盘) */
-    hChk = CreateWindowW(L"BUTTON", L"广播窗最小化到任务栏",
+    CreateWindowW(L"BUTTON", L"广播窗最小化到任务栏",
         WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
         S(UI_PAD), S(CHK_Y), S(300), S(24),
         hwnd, (HMENU)(INT_PTR)ID_CHK_TRAY, hInstance, NULL);
-    SendMessageW(hChk, WM_SETFONT, (WPARAM)g_hFontHint, TRUE);
     CheckDlgButton(hwnd, ID_CHK_TRAY,
                    ReadMinimizeTaskbarMode() ? BST_CHECKED : BST_UNCHECKED);
 
@@ -3559,6 +3822,7 @@ void CreateControls(HWND hwnd) {
         hwnd, (HMENU)(INT_PTR)ID_BTN_EXIT, hInstance, NULL);
     SetWindowSubclass(hBtn, BtnProc, (UINT_PTR)ID_BTN_EXIT, 0);
 
+    ApplyControlFonts(hwnd);
     LayoutControls(hwnd);
 }
 
@@ -3582,8 +3846,33 @@ void OnUnlockKeyboard(HWND hwnd) {
 
 
 /* 「结束课堂进程」: 看守进程优先, 再杀主体与广播链 */
+/* 后台执行"结束课堂进程": AppendLog 对非 UI 线程走 PostMessage,
+   UpdateStatus 只做 InvalidateRect + 托盘提示, 都是线程安全的。 */
+static volatile LONG g_killBusy = 0;
+
+static DWORD WINAPI KillProcThread(LPVOID lp)
+{
+    KillControlProcesses((HWND)lp);
+    InterlockedExchange(&g_killBusy, 0);
+    return 0;
+}
+
 void OnKillProcesses(HWND hwnd) {
-    KillControlProcesses(hwnd);
+    /* ★ 不能在 UI 线程上同步跑: 每个目标最多等 1 秒, 13 个目标 + 驱动卡死时
+       就是几十秒的"假死"。放后台线程, 日志照常流回编辑框。 */
+    HANDLE th;
+
+    if (InterlockedCompareExchange(&g_killBusy, 1, 0) != 0) {
+        AppendLog(hwnd, "[Process] termination already in progress\r\n");
+        return;
+    }
+    th = CreateThread(NULL, 0, KillProcThread, hwnd, 0, NULL);
+    if (th) {
+        CloseHandle(th);
+        return;
+    }
+    InterlockedExchange(&g_killBusy, 0);
+    KillControlProcesses(hwnd);      /* 线程建不起来就退回原来的同步路径 */
 }
 
 /* 「卸载过滤驱动」: 停删驱动服务 + 清键盘类 UpperFilters */
@@ -4248,6 +4537,8 @@ static void TrayShowMenu(HWND hwnd) {
             "\r\n[Hook] released: bypass_hook.off written, injected DLLs stand down\r\n"
             "[Hook] 教师端重新发起广播后即为全屏; 想再次小窗化请再点一次「持续保持小窗」\r\n");
         UpdateStatus(hwnd, "Status: released (fullscreen allowed)");
+        /* 「持续保持小窗」按钮上的文字是现取的 (g_smallWinRun), 这里要重画 */
+        InvalidateRect(hwnd, NULL, TRUE);
         break;
     case IDM_TRAY_ABOUT:
         ShowMainWindow(hwnd);
@@ -4401,6 +4692,9 @@ static void StartDesktopGuard(HWND hwnd)
    本窗口并 PostMessage 这条消息。已提权的窗口默认拒收低完整性进程的消息,
    所以窗口创建后要用 ChangeWindowMessageFilterEx 明确放行。 */
 #define WM_BYPASS_SHOW   (WM_APP + 4)
+/* /auto: 把"一键绕过"投递到消息循环里跑 (它含 Sleep / 等驱动停止, 同步跑会让
+   窗口在 ShowWindow 之后立刻"未响应")。 */
+#define WM_APP_AUTOALL   (WM_APP + 5)
 
 /* 应急点击: MultiClient 的 WH_MOUSE_LL 只放行 dwExtraInfo==0x12452 的事件,
    这里直接借用它自己的通行证 —— 鼠标被"冻结"时还能点一下。 */
@@ -4611,6 +4905,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetForegroundWindow(hwnd);
             return 0;
 
+        /* /auto: 在消息循环里跑, 不要卡住 WinMain */
+        case WM_APP_AUTOALL:
+            AppendLog(hwnd, "[Startup] /auto: running the bypass once\r\n");
+            AutoAllCore(hwnd);
+            return 0;
+
         /* full custom painting (dark theme) */
         case WM_PAINT: {
             PAINTSTRUCT ps;
@@ -4693,7 +4993,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 wstat[255] = L'\0';
                 SetTextColor(hdc, UI_TEXT);
             } else {
-                MultiByteToWideChar(CP_UTF8, 0, g_statusText, -1, wstat, 256);
+                wstat[0] = L'\0';
+                /* 状态串是 UpdateStatus 用 CP_ACP 存的 (见那里的 MultiByteToWideChar),
+                   这里必须用同一个代码页, 否则以后加中文状态就会显示成乱码 */
+                MultiByteToWideChar(CP_ACP, 0, g_statusText, -1, wstat, 256);
                 wstat[255] = L'\0';
                 SetTextColor(hdc, UI_TEXT_DIM);
             }
@@ -4961,6 +5264,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 DestroyUIFonts();
                 CreateUIFonts();
+                ApplyControlFonts(hwnd);   /* 控件不能继续拿着已删除的 HFONT */
                 LayoutControls(hwnd);
                 InvalidateRect(hwnd, NULL, TRUE);
             }
@@ -5094,6 +5398,7 @@ static void TruncateHookLog(void) {
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
+    LogInit();                       /* 日志临界区必须最先就绪 (静默模式也会用) */
     ParseCommandLine(lpCmdLine);
 
     /* ★ 早期单实例检查：必须在提权之前做，否则第二次双击 bypass.exe 会把
@@ -5264,9 +5569,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     UpdateWindow(hwnd);
     AppendLog(hwnd, "[UI] window shown at startup (nCmdShow=%d)\r\n", nCmdShow);
 
-    /* 如果指定了 /auto, 自动执行一次一键绕过 */
+    /* 如果指定了 /auto, 自动执行一次一键绕过。
+       ★ 投递到消息循环里跑: AutoAllCore 里有 Sleep + 等驱动停止 (最坏几十秒),
+         在 ShowWindow 之后同步跑, 窗口立刻"未响应"。 */
     if (g_autoMode) {
-        AutoAllCore(hwnd);
+        PostMessage(hwnd, WM_APP_AUTOALL, 0, 0);
     }
     
     /* 消息循环 */
