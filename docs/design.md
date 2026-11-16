@@ -627,6 +627,47 @@ FUN_00413560(cmd)
 > `[Guard] hooks installed:` / 没有 `[Guard] hook FAILED: ExitWindowsEx`；
 > `tests\shutguard_test.ps1` 在运行前会扫描二进制，发现这两类东西就拒绝执行。
 
+### 2.8 Loader / Core 分层（P1）
+
+目的：**改钩子逻辑不用重启课堂客户端**。直接 `FreeLibrary` 旧 DLL 是不行的——Worker
+线程、inline hook 的 jmp 目标、IAT 槽、窗口子类化都还指着它的代码段。所以拆成两层：
+
+```
+bypass_hook32.dll (Loader, 进程生命周期内不变)
+  ├─ DllMain → Manager 线程
+  ├─ 解析 real_* → 装 8 个 inline hook（入口 jmp 指向 L_* dispatcher）
+  ├─ PatchAllModules()  → 所有模块的 IAT 指向 L_* dispatcher
+  ├─ LoadLibrary(bypass_hook_core.dll) → Core_Init(&host, &api)
+  └─ g_table = &api  （原子发布；NULL = 直通）
+bypass_hook_core.dll (Core)
+  ├─ Core_Init() 填 HrCoreApi.hooks（33 个 Hook_*）+ build_id
+  ├─ Worker 线程、窗口/抓屏/关机守卫
+  └─ Hook_* 只通过 HrHost.real.* 调原函数（内联入口给的是 trampoline）
+```
+
+关键点：
+
+- **dispatcher 必须有 NULL 直通**：Core 不在/还在加载时 `g_table == NULL`，
+  `L_*` 直接调 `real_*`。这是 P2 卸载窗口期不崩的前提。
+- **谁装钩子谁拥有代码**：inline hook 和 IAT 槽永远指向 Loader，Core 卸载后
+  jmp 目标仍然有效——所以 **加新拦截点必须重编 Loader**；只改逻辑才只换 Core。
+- **real_* 不能再用 GetProcAddress**：入口已经被 Loader 打了 jmp，必须用
+  `HrHost.real.*`（trampoline），否则递归/崩溃。
+- **状态/日志/路径归 Loader**：日志句柄、`bin\` 前缀、Loader 完整路径都在
+  `HrHost` 里传给 Core；Core 不再用 `GetModuleFileName(g_self)` 推目录（P2 的
+  缓存副本文件名会变）。
+- **ABI 版本**：`bypass_abi.h` 的 `HR_ABI_VERSION`；`HrHost`/`HrCoreApi` 都带
+  `abi_version + size`，Loader 不一致拒绝加载。
+- **卸载安全**：`Core_Init` 返回 0 = Core 什么都还没做，Loader 可以安全
+  `FreeLibrary`；返回 1 之后 Core 可能已经起了线程，Loader **绝不能**再
+  `FreeLibrary`——表不完整时只是不发布（钩子保持直通），Core 留在内存里。
+- **入口补丁**：`PatchEntry5` 先挂起本进程所有其他线程；任何一个挂起/读上下文
+  失败就放弃本轮重试，绝不带着"没挂上的线程"去写 5 字节 `E9`。
+- **回退**：`bin\bypass_hook_single.dll` 是拆分前的单 DLL；改名覆盖
+  `bypass_hook32.dll` 后**必须重启课堂客户端**（进程里已有旧 DLL），
+  `inject32` 会同时识别两个文件名，避免两者同时注入打架。
+- 版本自检（2.7）现在同时比较 Loader 和 Core 的 PE `TimeDateStamp`。
+
 ---
 
 ## 3. 日志与排错

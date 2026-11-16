@@ -60,7 +60,7 @@ all: bypass hook32 lpe
 
 bypass: $(BIN)/bypass.exe
 
-hook32: $(BIN)/bypass_hook32.dll $(BIN)/inject32.exe
+hook32: $(BIN)/bypass_hook32.dll $(BIN)/bypass_hook_core.dll $(BIN)/inject32.exe
 
 # WalletService auto-elevation payload: bin\lpe\ (self-contained folder)
 lpe: lpebroker
@@ -100,7 +100,10 @@ $(BIN):
 $(BIN)/bypass.exe: src/bypass.c src/elevate.c src/elevate.h src/bypass_state.h | $(BIN)
 	"$(CC64)" $(CFLAGS64) "src/bypass.c" "src/elevate.c" -o "$@" $(LIBS64)
 
-$(BIN)/bypass_hook32.dll: src/bypass_hook.c src/bypass_vd.inc src/bypass_screen.inc src/bypass_shut.inc src/bypass_state.h | $(BIN)
+$(BIN)/bypass_hook32.dll: src/loader.c src/bypass_abi.h | $(BIN)
+	"$(CC32)" $(CFLAGS32) $(DLLFLAGS) "src/loader.c" -o "$@" -lpsapi -luser32
+
+$(BIN)/bypass_hook_core.dll: src/bypass_hook.c src/bypass_vd.inc src/bypass_screen.inc src/bypass_shut.inc src/bypass_abi.h src/bypass_state.h | $(BIN)
 	"$(CC32)" $(CFLAGS32) $(DLLFLAGS) "src/bypass_hook.c" -o "$@" $(DLLLIBS)
 
 $(BIN)/inject32.exe: src/inject32.c | $(BIN)
@@ -135,7 +138,7 @@ $(LPEOUT)/shell_broker.exe: src/lpe_broker.c | $(BIN)
 # 只删 bin\ 里的编译产物（三个交付文件也在内），不碰运行期配置和日志。
 #    想恢复就重新 `make.bat all`；正在运行的 bypass.exe 会锁住文件，先退出。
 clean:
-	-@del /q "$(BIN)\bypass.exe" "$(BIN)\bypass_hook32.dll" "$(BIN)\inject32.exe" 2>nul
+	-@del /q "$(BIN)\bypass.exe" "$(BIN)\bypass_hook32.dll" "$(BIN)\bypass_hook_core.dll" "$(BIN)\inject32.exe" 2>nul
 	-@del /q "$(BIN)\hooktest32.exe" 2>nul
 	-@del /q "$(BIN)\wmode_test.exe" 2>nul
 	-@del /q "$(BIN)\vd_pin_test.exe" 2>nul

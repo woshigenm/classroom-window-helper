@@ -39,54 +39,16 @@ static BITMAPINFO g_scBmi;
 static int        g_scW, g_scH;     /* cached frame size */
 static int        g_scSeeded;
 static DWORD      g_scCfgTick, g_scLastLog, g_scServed, g_scSeededTick;
-static HANDLE     g_scLogH;
 
-/* ---------------- logging (ASCII, same file as the rest of the DLL) -------- */
+/* ---------------- logging (goes through the Loader's single log) ----------- */
 
-static void SC_Log(const char* fmt, ...)
-{
-    char       line[512];
-    char       dir[MAX_PATH], path[MAX_PATH];
-    char*      p;
-    SYSTEMTIME st;
-    va_list    ap;
-    int        n;
-    DWORD      wrote = 0;
-
-    if (g_scLogH == INVALID_HANDLE_VALUE || !g_scLogH) {
-        if (!GetModuleFileNameA(g_self, dir, sizeof(dir))) return;
-        p = strrchr(dir, '\\');
-        if (!p) return;
-        *(p + 1) = '\0';
-        _snprintf(path, sizeof(path) - 1, "%sbypass_hook.log", dir);
-        path[sizeof(path) - 1] = '\0';
-        g_scLogH = CreateFileA(path, FILE_APPEND_DATA,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                               NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (g_scLogH == INVALID_HANDLE_VALUE) return;
-    }
-
-    GetLocalTime(&st);
-    n = _snprintf(line, sizeof(line) - 3, "[%02d:%02d:%02d.%03d] [pid %lu] ",
-                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                  (unsigned long)GetCurrentProcessId());
-    if (n < 0) return;
-    va_start(ap, fmt);
-    _vsnprintf(line + n, sizeof(line) - n - 3, fmt, ap);
-    va_end(ap);
-    line[sizeof(line) - 3] = '\0';
-    n = (int)strlen(line);
-    line[n++] = '\r';
-    line[n++] = '\n';
-    WriteFile(g_scLogH, line, (DWORD)n, &wrote, NULL);
-}
+#define SC_Log(...) HookLog(__VA_ARGS__)
 
 /* ---------------- config: bin\bypass_screen.ini ---------------------------- */
 
 static void SC_ReadConfig(void)
 {
-    char   dir[MAX_PATH], path[MAX_PATH];
-    char*  p;
+    char   path[MAX_PATH];
     FILE*  f;
     char   line[128];
     LONG   enabled = 0, mode = 0;
@@ -94,11 +56,8 @@ static void SC_ReadConfig(void)
     if (GetTickCount() - g_scCfgTick < 500) return;
     g_scCfgTick = GetTickCount();
 
-    if (!GetModuleFileNameA(g_self, dir, sizeof(dir))) return;
-    p = strrchr(dir, '\\');
-    if (!p) return;
-    *(p + 1) = '\0';
-    _snprintf(path, sizeof(path) - 1, "%s" SC_INI_NAME, dir);
+    if (!g_baseDir[0]) return;
+    _snprintf(path, sizeof(path) - 1, "%s" SC_INI_NAME, g_baseDir);
     path[sizeof(path) - 1] = '\0';
 
     f = fopen(path, "r");

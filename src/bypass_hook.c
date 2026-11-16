@@ -44,6 +44,10 @@
 #include <wchar.h>
 
 #include "bypass_state.h"
+#include "bypass_abi.h"
+
+/* our own HMODULE, independent of the file name (P2 loads a cache copy) */
+extern IMAGE_DOS_HEADER __ImageBase;
 
 /* Windows 内部使用的窗口状态变更标志 (ShowWindow 内部 SetWindowPos 会带它),
    旧 MinGW 头文件里没有定义 */
@@ -55,10 +59,11 @@
 /* 全局状态                                                            */
 /* ------------------------------------------------------------------ */
 
+static const HrHost* g_host;        /* Loader 传进来的 ABI (Core_Init 设置) */
+static char          g_baseDir[MAX_PATH];  /* "...\\bin\\" */
 static DWORD  g_pid;
 static HMODULE g_self;
 static volatile LONG g_disabled;
-static volatile LONG g_patchCount;
 static volatile LONG g_clampLogs;
 static volatile LONG g_fixLogs;
 static volatile LONG g_readLogs;
@@ -125,30 +130,7 @@ static BOOL LooksManaged(HWND h);
 static void MarkManaged(HWND h);
 static BOOL PidHasDll(DWORD pid);
 
-/* 真正的 user32 函数 (用 GetProcAddress 拿, 绕开我们自己的 IAT) */
-typedef BOOL     (WINAPI *PFN_SetWindowPos)(HWND, HWND, int, int, int, int, UINT);
-typedef LONG     (WINAPI *PFN_SetWindowLongW)(HWND, int, LONG);
-typedef LONG     (WINAPI *PFN_SetWindowLongA)(HWND, int, LONG);
-typedef LONG_PTR (WINAPI *PFN_SetWindowLongPtrW)(HWND, int, LONG_PTR);
-typedef LONG_PTR (WINAPI *PFN_SetWindowLongPtrA)(HWND, int, LONG_PTR);
-typedef BOOL     (WINAPI *PFN_MoveWindow)(HWND, int, int, int, int, BOOL);
-typedef BOOL     (WINAPI *PFN_SetWindowPlacement)(HWND, const WINDOWPLACEMENT*);
-typedef BOOL     (WINAPI *PFN_ShowWindow)(HWND, int);
-typedef BOOL     (WINAPI *PFN_ShowWindowAsync)(HWND, int);
-typedef int      (WINAPI *PFN_ShowCursor)(BOOL);
-typedef HCURSOR  (WINAPI *PFN_SetCursor)(HCURSOR);
-typedef BOOL     (WINAPI *PFN_SwitchDesktop)(HDESK);
-typedef HHOOK    (WINAPI *PFN_SetWindowsHookExA)(int, HOOKPROC, HINSTANCE, DWORD);
-typedef HHOOK    (WINAPI *PFN_SetWindowsHookExW)(int, HOOKPROC, HINSTANCE, DWORD);
-typedef BOOL     (WINAPI *PFN_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
-                                              LPSECURITY_ATTRIBUTES, BOOL, DWORD,
-                                              LPVOID, LPCSTR, LPSTARTUPINFOA,
-                                              LPPROCESS_INFORMATION);
-typedef BOOL     (WINAPI *PFN_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
-                                              LPSECURITY_ATTRIBUTES, BOOL, DWORD,
-                                              LPVOID, LPCWSTR, LPSTARTUPINFOW,
-                                              LPPROCESS_INFORMATION);
-
+/* 真正的函数指针: 由 Loader 在 Core_Init 里填入 (内联 hook 时是 trampoline) */
 static PFN_SetWindowPos        real_SetWindowPos;
 static PFN_SetWindowLongW      real_SetWindowLongW;
 static PFN_SetWindowLongA      real_SetWindowLongA;
@@ -168,9 +150,6 @@ static PFN_CreateProcessW      real_CreateProcessW;
 
 /* 定义在文件后面 (注入自身/子进程) */
 static void TryInjectOwner(DWORD pid);
-
-/* 定义在文件后面 (内联 hook), 关机守卫也要用 */
-static BOOL InstallInlineHook(void* target, void* hook, void** realSlot);
 
 /* 定义在 bypass_shut.inc (在 bypass_vd.inc 之后才 include):
    0x28 的倒计时窗 (class=ShutDownDlg) 由 CreateWindowExW 钩子压掉。 */
@@ -232,13 +211,11 @@ static BOOL IsInjectAtBirth(const char* app, const char* cmd)
 
 
 /* ------------------------------------------------------------------ */
-/* 极简日志 (追加写, 失败就静默)                                        */
+/* 日志: 由 Loader 统一持有 (文件路径/句柄都是它的)。Core 只转发, 保证同一个 */
+/* 文件、同样的 UTF-8->ACP 处理; 这样 Core 被卸载时日志句柄不会跟着消失。   */
 /* ------------------------------------------------------------------ */
 
-static CRITICAL_SECTION g_logCs;
-static int              g_logCsReady;
-static HANDLE           g_logH = INVALID_HANDLE_VALUE;
-static DWORD            g_logWrites;
+#define HookLog(...) do { if (g_host && g_host->log) g_host->log(__VA_ARGS__); } while (0)
 
 /* BYPASS_BROADCAST 是**本进程环境块**里的一个瞬时变量 (给刚创建的子进程当
    "我是广播渲染器"的身份证)。它必须串行化并恢复原值: 两个线程同时
@@ -265,70 +242,6 @@ static int BroadcastEnvSet(char* prev, size_t cch, int* had)
 static void BroadcastEnvRestore(const char* prev, int had)
 {
     SetEnvironmentVariableA("BYPASS_BROADCAST", had ? prev : NULL);
-}
-
-static void HookLog(const char* fmt, ...)
-{
-    char    buf[512];
-    char    line[640];
-    char    fmtA[512];
-    va_list ap;
-    int     n;
-    DWORD   wrote = 0;
-
-    if (!g_logCsReady) return;
-
-    /* 格式串是 UTF-8, %s 填的路径是 ACP: 统一转成 ACP 再格式化 */
-    {
-        wchar_t w[512];
-        if (MultiByteToWideChar(CP_UTF8, 0, fmt, -1, w, 512) > 0 &&
-            WideCharToMultiByte(CP_ACP, 0, w, -1, fmtA, sizeof(fmtA), NULL, NULL) > 0)
-            fmt = fmtA;
-    }
-
-    va_start(ap, fmt);
-    _vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
-    va_end(ap);
-    buf[sizeof(buf) - 1] = '\0';
-
-    {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        n = _snprintf(line, sizeof(line) - 1,
-                      "[%02u:%02u:%02u.%03u] [pid %lu] %s\r\n",
-                      (unsigned)st.wHour, (unsigned)st.wMinute,
-                      (unsigned)st.wSecond, (unsigned)st.wMilliseconds,
-                      (unsigned long)g_pid, buf);
-    }
-    /* ★ 先补结尾 0 再算长度: _snprintf 被截断时不写结尾 0, 那时 strlen 会越界读 */
-    line[sizeof(line) - 1] = '\0';
-    if (n < 0) n = (int)strlen(line);
-    if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
-    /* ★ 必须用 FILE_APPEND_DATA + 单次 WriteFile:
-       这个日志是 3~4 个进程 (Student/MultiClient/ScreenRender) 同时写的。
-       以前各进程用 fopen(...,"a") + fprintf — CRT 的 "a" 是"先 seek 到末尾再写",
-       两个进程可能算出同一个末尾偏移, 于是互相覆盖: 日志里出现
-       "fs=NTFS:29:14 [dll]..." 这种半行被吃掉、换行丢失的现象。
-       FILE_APPEND_DATA 由文件系统保证追加到末尾, 不会再撞车。 */
-    EnterCriticalSection(&g_logCs);
-    /* 用户清日志时会直接删掉 bypass_hook.log。已打开的句柄会继续写进
-       "已删除"的 inode, 于是文件再也不出现 —— 每 64 行检查一次, 没了就重开。 */
-    if (g_logH != INVALID_HANDLE_VALUE && (++g_logWrites & 63) == 0 &&
-        GetFileAttributesA(g_logPath) == INVALID_FILE_ATTRIBUTES) {
-        CloseHandle(g_logH);
-        g_logH = INVALID_HANDLE_VALUE;
-    }
-    if (g_logH == INVALID_HANDLE_VALUE) {
-        /* ★ 必须带 FILE_SHARE_DELETE: 3~4 个进程都持有句柄, 少了它,
-           用户/工具删日志时会遇到共享冲突, 下面"文件没了就重开"的自愈
-           分支就永远走不到。 */
-        g_logH = CreateFileA(g_logPath, FILE_APPEND_DATA,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                             NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    }
-    if (g_logH != INVALID_HANDLE_VALUE)
-        WriteFile(g_logH, line, (DWORD)n, &wrote, NULL);
-    LeaveCriticalSection(&g_logCs);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2947,112 +2860,6 @@ static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd,
 }
 
 /* ------------------------------------------------------------------ */
-/* IAT 打补丁                                                          */
-/* ------------------------------------------------------------------ */
-
-static void PatchOne(HMODULE mod, const char* dllName,
-                     const char* fnName, void* hook)
-{    IMAGE_DOS_HEADER*        dos;
-    IMAGE_NT_HEADERS*        nt;
-    IMAGE_IMPORT_DESCRIPTOR* imp;
-    DWORD                    rva;
-
-    if (!mod || (HMODULE)mod == g_self) return;
-
-    dos = (IMAGE_DOS_HEADER*)mod;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-
-    nt = (IMAGE_NT_HEADERS*)((BYTE*)mod + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
-
-    rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    if (!rva) return;
-
-    imp = (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)mod + rva);
-    for (; imp->Name; imp++) {
-        const char*           name = (const char*)((BYTE*)mod + imp->Name);
-        IMAGE_THUNK_DATA*     oft;
-        IMAGE_THUNK_DATA*     ft;
-
-        if (_stricmp(name, dllName) != 0) continue;
-
-        oft = (IMAGE_THUNK_DATA*)((BYTE*)mod +
-              (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
-        ft  = (IMAGE_THUNK_DATA*)((BYTE*)mod + imp->FirstThunk);
-
-        for (; oft->u1.Function; oft++, ft++) {
-            IMAGE_IMPORT_BY_NAME* ibn;
-            DWORD old;
-
-            if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
-            ibn = (IMAGE_IMPORT_BY_NAME*)((BYTE*)mod + oft->u1.AddressOfData);
-            if (strcmp((const char*)ibn->Name, fnName) != 0) continue;
-
-            if (ft->u1.Function == (DWORD_PTR)hook) continue;   /* 已打过 */
-
-            if (VirtualProtect(&ft->u1.Function, sizeof(DWORD_PTR),
-                               PAGE_READWRITE, &old)) {
-                ft->u1.Function = (DWORD_PTR)hook;
-                VirtualProtect(&ft->u1.Function, sizeof(DWORD_PTR), old, &old);
-                g_patchCount++;
-            }
-        }
-    }
-}
-
-static void PatchAllModules(void)
-{
-    HMODULE mods[512];
-    DWORD   needed = 0, i;
-    HANDLE  hp = GetCurrentProcess();
-
-    if (!EnumProcessModules(hp, mods, sizeof(mods), &needed)) return;
-    if (needed > sizeof(mods)) needed = sizeof(mods);
-
-    for (i = 0; i < needed / sizeof(HMODULE); i++) {
-        PatchOne(mods[i], "user32.dll", "SetWindowPos",        (void*)Hook_SetWindowPos);
-        PatchOne(mods[i], "user32.dll", "SetWindowLongW",      (void*)Hook_SetWindowLongW);
-        PatchOne(mods[i], "user32.dll", "SetWindowLongA",      (void*)Hook_SetWindowLongA);
-        PatchOne(mods[i], "user32.dll", "SetWindowLongPtrW",   (void*)Hook_SetWindowLongPtrW);
-        PatchOne(mods[i], "user32.dll", "SetWindowLongPtrA",   (void*)Hook_SetWindowLongPtrA);
-        PatchOne(mods[i], "user32.dll", "MoveWindow",          (void*)Hook_MoveWindow);
-        PatchOne(mods[i], "user32.dll", "SetWindowPlacement",  (void*)Hook_SetWindowPlacement);
-        PatchOne(mods[i], "user32.dll", "ShowWindow",          (void*)Hook_ShowWindow);
-        PatchOne(mods[i], "user32.dll", "ShowWindowAsync",     (void*)Hook_ShowWindowAsync);
-        PatchOne(mods[i], "user32.dll", "ShowCursor",          (void*)Hook_ShowCursor);
-        PatchOne(mods[i], "user32.dll", "SetCursor",           (void*)Hook_SetCursor);
-        PatchOne(mods[i], "user32.dll", "SwitchDesktop",       (void*)Hook_SwitchDesktop);
-        PatchOne(mods[i], "user32.dll", "SetWindowsHookExA",   (void*)Hook_SetWindowsHookExA);
-        PatchOne(mods[i], "user32.dll", "SetWindowsHookExW",   (void*)Hook_SetWindowsHookExW);
-        PatchOne(mods[i], "kernel32.dll", "CreateProcessA",    (void*)Hook_CreateProcessA);
-        PatchOne(mods[i], "kernel32.dll", "CreateProcessW",    (void*)Hook_CreateProcessW);
-        /* 远程关机守卫 (0x27/0x28): 内联 hook 是主路径, 这里是 IAT 兜底 */
-        PatchOne(mods[i], "user32.dll",   "ExitWindowsEx",     (void*)SH_Hook_ExitWindowsEx);
-        PatchOne(mods[i], "kernel32.dll", "WinExec",           (void*)SH_Hook_WinExec);
-        PatchOne(mods[i], "shell32.dll",  "ShellExecuteA",     (void*)SH_Hook_ShellExecuteA);
-        PatchOne(mods[i], "shell32.dll",  "ShellExecuteW",     (void*)SH_Hook_ShellExecuteW);
-        PatchOne(mods[i], "advapi32.dll", "InitiateSystemShutdownA",
-                 (void*)SH_Hook_InitiateSystemShutdownA);
-        PatchOne(mods[i], "advapi32.dll", "InitiateSystemShutdownW",
-                 (void*)SH_Hook_InitiateSystemShutdownW);
-        PatchOne(mods[i], "advapi32.dll", "InitiateSystemShutdownExA",
-                 (void*)SH_Hook_InitiateSystemShutdownExA);
-        PatchOne(mods[i], "advapi32.dll", "InitiateSystemShutdownExW",
-                 (void*)SH_Hook_InitiateSystemShutdownExW);
-        PatchOne(mods[i], "user32.dll", "CreateWindowExW",     (void*)Hook_CreateWindowExW);
-        PatchOne(mods[i], "user32.dll", "SetForegroundWindow", (void*)Hook_SetForegroundWindow);
-        PatchOne(mods[i], "user32.dll", "BringWindowToTop",    (void*)Hook_BringWindowToTop);
-        PatchOne(mods[i], "user32.dll", "SetActiveWindow",     (void*)Hook_SetActiveWindow);
-        /* 抓屏守卫: 老师端"屏幕监控/录屏"走 GDI (CreateDC("DISPLAY")+BitBlt) */
-        PatchOne(mods[i], "gdi32.dll",   "BitBlt",             (void*)SC_Hook_BitBlt);
-        PatchOne(mods[i], "gdi32.dll",   "CreateDCW",          (void*)SC_Hook_CreateDCW);
-        PatchOne(mods[i], "gdi32.dll",   "CreateDCA",          (void*)SC_Hook_CreateDCA);
-        PatchOne(mods[i], "user32.dll",  "GetDC",              (void*)SC_Hook_GetDC);
-        PatchOne(mods[i], "user32.dll",  "GetWindowDC",        (void*)SC_Hook_GetWindowDC);
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /* 保险丝: 每 1s 兜一次底 (只在"真的变大/置顶"时才动手, 不会闪)          */
 /* ------------------------------------------------------------------ */
 
@@ -3078,7 +2885,9 @@ static BOOL HasOurDll(DWORD pid)
     me.dwSize = sizeof(me);
     if (Module32First(snap, &me)) {
         do {
-            if (g_dllBase[0] && !_stricmp(me.szModule, g_dllBase)) {
+            /* 旧单 DLL 也算"已经注入过": 两者同时存在会让 inline hook 打架 */
+            if ((g_dllBase[0] && !_stricmp(me.szModule, g_dllBase)) ||
+                !_stricmp(me.szModule, "bypass_hook_single.dll")) {
                 found = TRUE;
                 break;
             }
@@ -4040,278 +3849,15 @@ static DWORD WINAPI CaptionPumpProc(LPVOID p)
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* 内联 hook: 渲染器有一部分 ShowWindow 调用是用缓存的函数指针, 只改 IAT 拦不住 */
-/* ------------------------------------------------------------------ */
-
-/* user32 的导出经常是"跳板": FF 25 <绝对地址> (jmp dword ptr [IAT])。
-   必须跟到真正实现再打补丁。 */
-static void* FollowJump(void* target)
-{
-    unsigned char* b = (unsigned char*)target;
-    int i;
-
-    for (i = 0; i < 4; i++) {
-        if (b[0] == 0xFF && b[1] == 0x25) {          /* jmp dword ptr [abs] */
-            void** slot = (void**)(*(DWORD*)(b + 2));
-            void*  t = slot ? *slot : NULL;
-            if (!t || t == (void*)b) break;
-            b = (unsigned char*)t;
-            continue;
-        }
-        if (b[0] == 0xE9) {                          /* jmp rel32 */
-            b = b + 5 + *(LONG*)(b + 1);
-            continue;
-        }
-        if (b[0] == 0xEB) {                          /* jmp rel8 */
-            b = b + 2 + (signed char)b[1];
-            continue;
-        }
-        break;
-    }
-    return b;
-}
-
-/* 在 p 处落 5 字节 `E9 rel32`。**必须先挂起本进程里所有别的线程**:
-   直接写这 5 个字节时, 渲染器的定时器线程随时可能在 `ShowWindow` 入口
-   执行到"半个 E9" (或者 E9 已写、rel32 还是旧的), 那就是整进程崩。
-   步骤: 挂起其他线程 → 确认没有线程的 EIP 正停在 [p,p+5) 里
-   (有就放弃, 让调用方重试) → 写 → FlushInstructionCache → 恢复。
-   只用于"序言不是 hotpatch 形状"的回退路径; hotpatch 位那条路入口只落
-   一条 2 字节指令, 不需要挂线程。 */
-#define MAX_SUSP 64
-static BOOL PatchEntry5(unsigned char* p, void* hook)
-{
-    int attempt;
-
-    for (attempt = 0; attempt < 3; attempt++) {
-        HANDLE snap, th[MAX_SUSP];
-        THREADENTRY32 te;
-        DWORD  self = GetCurrentThreadId();
-        DWORD  old = 0;
-        int    n = 0, i, inside = -1;
-        BOOL   ok = FALSE;
-
-        snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap == INVALID_HANDLE_VALUE) return FALSE;
-        te.dwSize = sizeof(te);
-        if (Thread32First(snap, &te)) {
-            do {
-                if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
-                if (te.th32ThreadID == self) continue;
-                if (n >= MAX_SUSP) break;
-                th[n] = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                                   THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-                if (!th[n]) continue;
-                if (SuspendThread(th[n]) == (DWORD)-1) {
-                    CloseHandle(th[n]);
-                    continue;
-                }
-                n++;
-            } while (Thread32Next(snap, &te));
-        }
-        CloseHandle(snap);
-
-        for (i = 0; i < n; i++) {
-            CONTEXT c;
-            memset(&c, 0, sizeof(c));
-            c.ContextFlags = CONTEXT_CONTROL;
-            if (GetThreadContext(th[i], &c)) {
-                DWORD eip = (DWORD)c.Eip;
-                if (eip >= (DWORD)(DWORD_PTR)p &&
-                    eip <  (DWORD)(DWORD_PTR)p + 5) {
-                    inside = i;
-                    break;
-                }
-            }
-        }
-
-        if (inside < 0 && VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) {
-            *(LONG*)(p + 1) = (LONG)((unsigned char*)hook - (p + 5));
-            p[0] = 0xE9;
-            FlushInstructionCache(GetCurrentProcess(), p, 5);
-            VirtualProtect(p, 5, old, &old);
-            ok = TRUE;
-        }
-
-        for (i = 0; i < n; i++) {
-            ResumeThread(th[i]);
-            CloseHandle(th[i]);
-        }
-        if (ok) return TRUE;
-        Sleep(50);                  /* 有线程正卡在入口里: 等一下再试 */
-    }
-
-    HookLog("inline hook: 5-byte entry patch postponed at %p "
-            "(thread inside prologue or protect failed)", p);
-    return FALSE;
-}
-
-/* 把 target 入口改成 jmp hook, 原 5 字节搬进 trampoline 再跳回 target+5。
-   user32 的 ShowWindow(Async) 是 hotpatch 序言: 8B FF 55 8B EC, 正好 5 字节。
-   ★ *realSlot 在写补丁**之前**就指向 trampoline, 避免打补丁的瞬间
-     有线程调用 ShowWindow -> Hook -> real_ShowWindow 还在指向旧地址 -> 递归。 */
-static BOOL InstallInlineHook(void* target, void* hook, void** realSlot)
-{
-    unsigned char* p;
-    unsigned char* tr;
-    DWORD          old;
-
-    if (!target || !hook || !realSlot) return FALSE;
-    p = (unsigned char*)FollowJump(target);
-    if (p == (unsigned char*)hook) return FALSE;   /* 已经指向我们的 Hook */
-    if (p != (unsigned char*)target)
-        HookLog("inline hook: %p is a jump thunk -> real %p", target, p);
-    if (!((p[0] == 0x8B && p[1] == 0xFF && p[2] == 0x55 &&
-           p[3] == 0x8B && p[4] == 0xEC) ||
-          p[0] == 0xB8 ||    /* mov eax, imm32 —— win32u 的 syscall stub */
-          p[0] == 0x68)) {   /* push imm32 —— 同为整 5 字节单指令 */
-        /* 真正的实现不是"整 5 字节"的序言: 如果导出本身是 FF 25 跳板,
-           就把跳板的操作数改成指向我们的指针槽 —— 不碰目标代码。 */
-        unsigned char* o = (unsigned char*)target;
-        if (o[0] == 0xFF && o[1] == 0x25) {
-            void** slot = (void**)(*(DWORD*)(o + 2));
-            void*  real = slot ? *slot : NULL;
-            void** myslot;
-            DWORD  old2;
-
-            if (real) {
-                myslot = (void**)VirtualAlloc(NULL, sizeof(void*),
-                                              MEM_COMMIT | MEM_RESERVE,
-                                              PAGE_READWRITE);
-                if (myslot) {
-                    *myslot = hook;
-                    if (VirtualProtect(o, 6, PAGE_EXECUTE_READWRITE, &old2)) {
-                        *realSlot = real;    /* 先更新, 再改跳板 */
-                        *(DWORD*)(o + 2) = (DWORD)myslot;
-                        VirtualProtect(o, 6, old2, &old2);
-                        FlushInstructionCache(GetCurrentProcess(), o, 6);
-                        HookLog("thunk hook installed: %p -> %p (real %p prologue %02X %02X %02X %02X %02X)",
-                                target, hook, real, p[0], p[1], p[2], p[3], p[4]);
-                        return TRUE;
-                    }
-                    VirtualFree(myslot, 0, MEM_RELEASE);
-                }
-            }
-        }
-        HookLog("inline hook: unexpected prologue at %p (%02X %02X %02X %02X %02X)",
-                p, p[0], p[1], p[2], p[3], p[4]);
-        return FALSE;
-    }
-
-    /* ★ 优先用"微软 hotpatch 位"打补丁, 这样落笔是一整条 2 字节指令:
-       MSVC 编译的系统 DLL 在每个函数入口前留 5 字节填充 (CC/90), 入口是
-       2 字节的 8B FF (mov edi,edi, 无操作)。做法:
-         p-5 : E9 <rel32 -> hook>       (填充区, 永远不会被执行到)
-         p   : EB F9  (jmp short -7 -> p-5)
-       入口那次写是**对齐的 2 字节单次写**, 线程要么看到旧的两字节, 要么看到
-       新的两字节, 不会执行到半条指令。real = p+2 (跳过 mov edi,edi)。
-       以前直接改 p..p+4 的 5 字节: 渲染器有 500ms 定时器线程在调 ShowWindow,
-       撞上"半个 E9"就是整进程崩。 */
-    if (p[0] == 0x8B && p[1] == 0xFF && p[2] == 0x55 && p[3] == 0x8B && p[4] == 0xEC &&
-        ((DWORD_PTR)p & 1) == 0) {
-        unsigned char* pad = p - 5;
-        BOOL padding = TRUE;
-        int  i;
-
-        for (i = 0; i < 5; i++)
-            if (pad[i] != 0xCC && pad[i] != 0x90) { padding = FALSE; break; }
-
-        if (padding && VirtualProtect(pad, 5, PAGE_EXECUTE_READWRITE, &old)) {
-            *(LONG*)(pad + 1) = (LONG)((unsigned char*)hook - (pad + 5));
-            pad[0] = 0xE9;
-            FlushInstructionCache(GetCurrentProcess(), pad, 5);
-
-            if (VirtualProtect(p, 2, PAGE_EXECUTE_READWRITE, &old)) {
-                *realSlot = (void*)(p + 2);      /* 先更新, 再改入口 */
-                *(WORD*)p = (WORD)0xF9EB;        /* jmp short -7 */
-                FlushInstructionCache(GetCurrentProcess(), p, 2);
-                HookLog("inline hook (hotpatch): %p -> %p (real %p)",
-                        target, hook, (void*)(p + 2));
-                return TRUE;
-            }
-            /* 入口页改不动: 把填充区的补丁撤回 */
-            VirtualProtect(pad, 5, PAGE_EXECUTE_READWRITE, &old);
-            pad[0] = 0xCC;
-            FlushInstructionCache(GetCurrentProcess(), pad, 5);
-        }
-    }
-
-    tr = (unsigned char*)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE,
-                                      PAGE_EXECUTE_READWRITE);
-    if (!tr) return FALSE;
-
-    memcpy(tr, p, 5);
-    tr[5] = 0xE9;
-    *(LONG*)(tr + 6) = (LONG)((p + 5) - (tr + 5 + 5));   /* tr+10 -> target+5 */
-
-    *realSlot = tr;                     /* 先更新, 再打补丁 */
-    if (!PatchEntry5(p, hook)) {
-        /* 入口补丁没落上: IAT 那条路仍然有效 (Hook -> real=tr -> 原代码),
-           只是"缓存了函数指针"的调用绕不过去。不下补丁, 不留半成品。 */
-        HookLog("inline hook: IAT only (entry patch skipped) for %p", p);
-        return FALSE;
-    }
-
-    HookLog("inline hook installed: %p -> %p (trampoline %p, threads suspended)",
-            p, hook, tr);
-    return TRUE;
-}
-
 static DWORD WINAPI Worker(LPVOID p)
 {
-    HMODULE u32;
     int reps = 0;
     int patchTick = 0;
     (void)p;
 
-    /* ⚠ 不能在 DllMain 里 LoadLibrary (加载器锁)。全部初始化搬到这个线程里:
-       先确保 user32 已加载, 再解析真函数指针。 */
-    u32 = GetModuleHandleA("user32.dll");
-    if (!u32) u32 = LoadLibraryA("user32.dll");
-    if (!u32) {
-        HookLog("attach failed: user32.dll unavailable");
-        return 0;
-    }
-
-    real_SetWindowPos       = (PFN_SetWindowPos)(void*)GetProcAddress(u32, "SetWindowPos");
-    real_SetWindowLongW     = (PFN_SetWindowLongW)(void*)GetProcAddress(u32, "SetWindowLongW");
-    real_SetWindowLongA     = (PFN_SetWindowLongA)(void*)GetProcAddress(u32, "SetWindowLongA");
-    real_SetWindowLongPtrW  = (PFN_SetWindowLongPtrW)(void*)GetProcAddress(u32, "SetWindowLongPtrW");
-    real_SetWindowLongPtrA  = (PFN_SetWindowLongPtrA)(void*)GetProcAddress(u32, "SetWindowLongPtrA");
-    real_MoveWindow         = (PFN_MoveWindow)(void*)GetProcAddress(u32, "MoveWindow");
-    real_SetWindowPlacement = (PFN_SetWindowPlacement)(void*)GetProcAddress(u32, "SetWindowPlacement");
-    real_ShowWindow         = (PFN_ShowWindow)(void*)GetProcAddress(u32, "ShowWindow");
-    real_ShowWindowAsync    = (PFN_ShowWindowAsync)(void*)GetProcAddress(u32, "ShowWindowAsync");
-    real_ShowCursor         = (PFN_ShowCursor)(void*)GetProcAddress(u32, "ShowCursor");
-    real_SetCursor          = (PFN_SetCursor)(void*)GetProcAddress(u32, "SetCursor");
-    real_SwitchDesktop      = (PFN_SwitchDesktop)(void*)GetProcAddress(u32, "SwitchDesktop");
-    real_SetWindowsHookExA  = (PFN_SetWindowsHookExA)(void*)GetProcAddress(u32, "SetWindowsHookExA");
-    real_SetWindowsHookExW  = (PFN_SetWindowsHookExW)(void*)GetProcAddress(u32, "SetWindowsHookExW");
-
-    {   /* CreateProcess* 在 kernel32 里 */
-        HMODULE k32 = GetModuleHandleA("kernel32.dll");
-        if (!k32) k32 = LoadLibraryA("kernel32.dll");
-        if (k32) {
-            real_CreateProcessA = (PFN_CreateProcessA)(void*)GetProcAddress(k32, "CreateProcessA");
-            real_CreateProcessW = (PFN_CreateProcessW)(void*)GetProcAddress(k32, "CreateProcessW");
-        }
-    }
-    /* ⚠ 32 位的 user32 不导出 SetWindowLongPtrW/A (winuser.h 里那两个只是
-       映射到 SetWindowLongW/A 的宏), 所以不能把它们当成"必须存在"。 */
-    if (!real_SetWindowPos || !real_SetWindowLongW || !real_SetWindowLongA ||
-        !real_MoveWindow || !real_SetWindowPlacement || !real_ShowWindow ||
-        !real_ShowCursor || !real_SetCursor) {
-        HookLog("attach failed: missing user32 exports "
-                "(pos=%p lw=%p la=%p mv=%p wp=%p sw=%p sc=%p)",
-                (void*)real_SetWindowPos, (void*)real_SetWindowLongW,
-                (void*)real_SetWindowLongA, (void*)real_MoveWindow,
-                (void*)real_SetWindowPlacement, (void*)real_ShowWindow,
-                (void*)real_ShowCursor);
-        return 0;
-    }
-    if (!real_SetWindowLongPtrW) real_SetWindowLongPtrW = (PFN_SetWindowLongPtrW)(void*)real_SetWindowLongW;
-    if (!real_SetWindowLongPtrA) real_SetWindowLongPtrA = (PFN_SetWindowLongPtrA)(void*)real_SetWindowLongA;
+    /* real_* 指针由 Core_Init 从 HrHost.real 填入 (内联入口的是 trampoline)。
+       以前在这里 GetProcAddress 解析 —— 那样拿到的会是被 Loader 打过 jmp 的
+       入口, 调用它会绕回 dispatcher。 */
 
     StateOpen();
     StateRefresh();
@@ -4331,45 +3877,32 @@ static DWORD WINAPI Worker(LPVOID p)
         return 0;
     }
 
-    /* ★ 内联 hook user32!ShowWindow/ShowWindowAsync:
-       渲染器有些调用用的是缓存的函数指针, 只改 IAT 拦不住 —— 这就是
-       "最小化后又被 ShowWindow(SW_SHOW) 顶回来" 的根因。
-       成功时把 real_* 指向 trampoline, 我们的 Hook 内部继续调用原函数。
-       ⚠ 必须放在"教师端进程直接退出"之后, 否则会把教师端的 user32 也改掉。 */
     /* virtual desktop pin: own STA thread, never COM on the renderer thread */
     VD_Start();
-    if (real_ShowWindow) {
-        if (!InstallInlineHook((void*)real_ShowWindow, (void*)Hook_ShowWindow,
-                               (void**)&real_ShowWindow))
-            HookLog("WARNING: inline ShowWindow hook failed (IAT only)");
-    }
-    if (real_ShowWindowAsync) {
-        if (!InstallInlineHook((void*)real_ShowWindowAsync, (void*)Hook_ShowWindowAsync,
-                               (void**)&real_ShowWindowAsync))
-            HookLog("WARNING: inline ShowWindowAsync hook failed (IAT only)");
-    }
 
-    /* 抓屏守卫的 real_ 指针 + 配置 (必须在 PatchAllModules 之前) */
+    /* 抓屏守卫的 real_ 指针 + 配置 (必须在 IAT 打补丁之前) */
     SC_Init();
 
-    /* 远程关机守卫: 内联 hook exit/process 入口 (systemoper.dll 是运行时
-       才加载的, 只打 IAT 会错过它第一次被调用的时机) */
+    /* 远程关机守卫: 配置 + InitiateSystemShutdown 真指针。
+       内联入口 (WinExec/CreateProcess/ExitWindowsEx/ShellExecute) 由 Loader 装。 */
     SH_Init();
 
-    PatchAllModules();
-
-    /* 标题栏自动隐藏的兜底心跳 (见 CaptionPumpProc): 不依赖 WM_TIMER */
-    if (CreateThread(NULL, 0, CaptionPumpProc, NULL, 0, NULL))
-        HookLog("caption pump started (250ms, WM_BYPASS_CAP)");
-    else
-        HookLog("WARNING: caption pump thread failed (err=%lu)", GetLastError());
     {
-        char desk[128];
-        DesktopName(desk, sizeof(desk));
-        HookLog("attached: %s - IAT patched (%ld entries), small window = %dx%d at (%d,%d) "
-                "[cfg=%dx%d, ratio follows source]",
-                g_ownImage, (long)g_patchCount, g_smallW, g_smallH, g_smallX, g_smallY,
-                g_cfgW, g_cfgH);
+        long patched = g_host->patch_modules();
+
+        /* 标题栏自动隐藏的兜底心跳 (见 CaptionPumpProc): 不依赖 WM_TIMER */
+        if (CreateThread(NULL, 0, CaptionPumpProc, NULL, 0, NULL))
+            HookLog("caption pump started (250ms, WM_BYPASS_CAP)");
+        else
+            HookLog("WARNING: caption pump thread failed (err=%lu)", GetLastError());
+
+        {
+            char desk[128];
+            DesktopName(desk, sizeof(desk));
+            HookLog("attached: %s - IAT patched (%ld entries), small window = %dx%d at (%d,%d) "
+                    "[cfg=%dx%d, ratio follows source]",
+                    g_ownImage, patched, g_smallW, g_smallH, g_smallX, g_smallY,
+                    g_cfgW, g_cfgH);
         HookLog("desktop=%s, window_mode=%s",
                 desk,
                 (WindowModeOn()) ? "on" : "off");
@@ -4386,6 +3919,7 @@ static DWORD WINAPI Worker(LPVOID p)
         HookLog("own desktop=%s", g_ownDesktop[0] ? g_ownDesktop : "?");
         HookLog("window_mode=%s (bypass_config.ini)", WindowModeOn() ? "on" : "off");
         HookLog("title_autohide=%s (bypass_config.ini)", CaptionAutoHideOn() ? "on" : "off");
+        }
     }
 
     for (;;) {
@@ -4432,11 +3966,11 @@ static DWORD WINAPI Worker(LPVOID p)
            之后降到每 5 秒扫一次 —— 旧版在这里彻底停了, 30 秒后才加载
            的模块永远不会被 hook。 */
         if (reps < 60) {
-            PatchAllModules();
+            g_host->patch_modules();
             reps++;
             StateWait(500);
         } else {
-            if (++patchTick >= 5) { patchTick = 0; PatchAllModules(); }
+            if (++patchTick >= 5) { patchTick = 0; g_host->patch_modules(); }
             StateWait(fixedCount > 0 ? 300 : 1000);
         }
     }
@@ -4510,33 +4044,28 @@ static void InitOwnDesktop(void)
 
 static void BuildPaths(void)
 {
-    char dll[MAX_PATH];
-    char* p;
-
     g_offPath[0] = '\0';
     g_logPath[0] = '\0';
     g_configPath[0] = '\0';
+    g_dllPath[0] = '\0';
+    g_dllBase[0] = '\0';
 
-    if (!GetModuleFileNameA(g_self, dll, sizeof(dll))) return;
+    /* Core 可能是从 core_cache\ 里映射的, 不能再用 GetModuleFileName(g_self)
+       推目录; 一律用 Loader 传进来的 bin\ 和 Loader 的完整路径。 */
+    if (!g_baseDir[0]) return;
 
-    _snprintf(g_dllPath, sizeof(g_dllPath) - 1, "%s", dll);
+    _snprintf(g_dllPath, sizeof(g_dllPath) - 1, "%s", g_host->loader_path);
     g_dllPath[sizeof(g_dllPath) - 1] = '\0';
     {
-        /* 记下自己的文件名: HasOurDll 用它判断"目标进程里已经有我们的 DLL",
-           以前硬编码 "bypass_hook32.dll", 换名部署时会一直判没有 -> 每 3 秒
-           重复自注入一次。 */
+        /* HasOurDll 用它判断"目标进程里已经有我们的 DLL" */
         const char* b = strrchr(g_dllPath, '\\');
         _snprintf(g_dllBase, sizeof(g_dllBase) - 1, "%s", b ? b + 1 : g_dllPath);
         g_dllBase[sizeof(g_dllBase) - 1] = '\0';
     }
 
-    p = strrchr(dll, '\\');
-    if (!p) return;
-    *(p + 1) = '\0';
-
-    _snprintf(g_offPath, sizeof(g_offPath) - 1, "%sbypass_hook.off", dll);
-    _snprintf(g_logPath, sizeof(g_logPath) - 1, "%sbypass_hook.log", dll);
-    _snprintf(g_configPath, sizeof(g_configPath) - 1, "%s%s", dll, BYPASS_CONFIG_FILE);
+    _snprintf(g_offPath, sizeof(g_offPath) - 1, "%sbypass_hook.off", g_baseDir);
+    _snprintf(g_logPath, sizeof(g_logPath) - 1, "%sbypass_hook.log", g_baseDir);
+    _snprintf(g_configPath, sizeof(g_configPath) - 1, "%s%s", g_baseDir, BYPASS_CONFIG_FILE);
     g_offPath[sizeof(g_offPath) - 1] = '\0';
     g_logPath[sizeof(g_logPath) - 1] = '\0';
     g_configPath[sizeof(g_configPath) - 1] = '\0';
@@ -4670,40 +4199,124 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
+/* ------------------------------------------------------------------ */
+/* Core_Init: Loader 调用 (DllMain 里什么都不做)                        */
+/* ------------------------------------------------------------------ */
+
+static void AssignReals(const HrHost* host)
 {
-    (void)reserved;
+    real_SetWindowPos       = (PFN_SetWindowPos)host->real.SetWindowPos;
+    real_SetWindowLongW     = (PFN_SetWindowLongW)host->real.SetWindowLongW;
+    real_SetWindowLongA     = (PFN_SetWindowLongA)host->real.SetWindowLongA;
+    real_SetWindowLongPtrW  = (PFN_SetWindowLongPtrW)host->real.SetWindowLongPtrW32;
+    real_SetWindowLongPtrA  = (PFN_SetWindowLongPtrA)host->real.SetWindowLongPtrA32;
+    real_MoveWindow         = (PFN_MoveWindow)host->real.MoveWindow;
+    real_SetWindowPlacement = (PFN_SetWindowPlacement)host->real.SetWindowPlacement;
+    real_ShowWindow         = (PFN_ShowWindow)host->real.ShowWindow;
+    real_ShowWindowAsync    = (PFN_ShowWindowAsync)host->real.ShowWindowAsync;
+    real_ShowCursor         = (PFN_ShowCursor)host->real.ShowCursor;
+    real_SetCursor          = (PFN_SetCursor)host->real.SetCursor;
+    real_SwitchDesktop      = (PFN_SwitchDesktop)host->real.SwitchDesktop;
+    real_SetWindowsHookExA  = (PFN_SetWindowsHookExA)host->real.SetWindowsHookExA;
+    real_SetWindowsHookExW  = (PFN_SetWindowsHookExW)host->real.SetWindowsHookExW;
+    real_CreateProcessA     = (PFN_CreateProcessA)host->real.CreateProcessA;
+    real_CreateProcessW     = (PFN_CreateProcessW)host->real.CreateProcessW;
+}
 
-    if (reason == DLL_PROCESS_ATTACH) {
-        g_self = hInst;
-        g_pid  = GetCurrentProcessId();
-        DisableThreadLibraryCalls(hInst);
+static void FillHookTable(HrHooks* h)
+{
+    memset(h, 0, sizeof(*h));
+    h->SetWindowPos        = Hook_SetWindowPos;
+    h->SetWindowLongW      = Hook_SetWindowLongW;
+    h->SetWindowLongA      = Hook_SetWindowLongA;
+    h->SetWindowLongPtrW32   = Hook_SetWindowLongPtrW;
+    h->SetWindowLongPtrA32   = Hook_SetWindowLongPtrA;
+    h->MoveWindow          = Hook_MoveWindow;
+    h->SetWindowPlacement  = Hook_SetWindowPlacement;
+    h->ShowWindow          = Hook_ShowWindow;
+    h->ShowWindowAsync     = Hook_ShowWindowAsync;
+    h->ShowCursor          = Hook_ShowCursor;
+    h->SetCursor           = Hook_SetCursor;
+    h->SwitchDesktop       = Hook_SwitchDesktop;
+    h->SetWindowsHookExA   = Hook_SetWindowsHookExA;
+    h->SetWindowsHookExW   = Hook_SetWindowsHookExW;
+    h->CreateWindowExW     = Hook_CreateWindowExW;
+    h->SetForegroundWindow = Hook_SetForegroundWindow;
+    h->BringWindowToTop    = Hook_BringWindowToTop;
+    h->SetActiveWindow     = Hook_SetActiveWindow;
+    h->ExitWindowsEx       = SH_Hook_ExitWindowsEx;
 
-        InitializeCriticalSection(&g_logCs);
-        g_logCsReady = 1;
+    h->CreateProcessA      = Hook_CreateProcessA;
+    h->CreateProcessW      = Hook_CreateProcessW;
+    h->WinExec             = SH_Hook_WinExec;
 
-        InitializeCriticalSection(&g_subCs);
-        g_subCsReady = 1;
+    h->BitBlt              = SC_Hook_BitBlt;
+    h->CreateDCW           = SC_Hook_CreateDCW;
+    h->CreateDCA           = SC_Hook_CreateDCA;
+    h->GetDC               = SC_Hook_GetDC;
+    h->GetWindowDC         = SC_Hook_GetWindowDC;
 
-        InitializeCriticalSection(&g_envCs);
-        g_envCsReady = 1;
+    h->ShellExecuteA       = SH_Hook_ShellExecuteA;
+    h->ShellExecuteW       = SH_Hook_ShellExecuteW;
 
-        InitializeCriticalSection(&g_geoSs);
-        g_geoSsReady = 1;
+    h->InitiateSystemShutdownA   = SH_Hook_InitiateSystemShutdownA;
+    h->InitiateSystemShutdownW   = SH_Hook_InitiateSystemShutdownW;
+    h->InitiateSystemShutdownExA = SH_Hook_InitiateSystemShutdownExA;
+    h->InitiateSystemShutdownExW = SH_Hook_InitiateSystemShutdownExW;
+}
 
-        BuildPaths();
+__declspec(dllexport) int __cdecl Core_Init(const HrHost* host, HrCoreApi* api)
+{
+    if (!host || !api) return 0;
+    if (host->abi_version != HR_ABI_VERSION ||
+        host->size < sizeof(HrHost) ||
+        !host->log || !host->patch_modules || !host->base_dir || !host->loader_path)
+        return 0;
 
-        /* 崩溃取证 (只记录, 继续调用宿主原来的过滤器) */
-        g_prevUef = SetUnhandledExceptionFilter(CrashFilter);
+    g_host = host;
+    g_pid  = GetCurrentProcessId();
+    /* 模块句柄用 __ImageBase: P2 的缓存副本文件名会变, GetModuleHandle 按
+       文件名查不到。 */
+    g_self = (HMODULE)&__ImageBase;
+    _snprintf(g_baseDir, sizeof(g_baseDir) - 1, "%s", host->base_dir);
+    g_baseDir[sizeof(g_baseDir) - 1] = '\0';
 
-        /* DllMain 里只做这些"绝对安全"的事, 其余全交给 Worker 线程。
-           这里绝不能 LoadLibrary / GetProcAddress / 等待任何东西。 */
-        {
-            HANDLE th = CreateThread(NULL, 0, Worker, NULL, 0, NULL);
-            if (th) CloseHandle(th);      /* 线程句柄不用留 (以前一直泄漏) */
+    InitializeCriticalSection(&g_subCs);
+    g_subCsReady = 1;
+    InitializeCriticalSection(&g_envCs);
+    g_envCsReady = 1;
+    InitializeCriticalSection(&g_geoSs);
+    g_geoSsReady = 1;
+
+    BuildPaths();
+    AssignReals(host);
+
+    /* 先把共享状态读进来, 再让 Loader 发布钩子表: 否则 IAT 槽在
+       StateOpen 之前就指向我们, 窗口模式/标题栏配置会读到零值。 */
+    StateOpen();
+    StateRefresh();
+    ComputeSmallRect();
+
+    api->abi_version = HR_ABI_VERSION;
+    api->size        = sizeof(*api);
+    api->build_id    = __DATE__ " " __TIME__;
+    api->on_frame    = NULL;
+    api->before_unload = NULL;      /* P2 */
+    FillHookTable(&api->hooks);
+
+    /* 崩溃取证 (只记录, 继续调用宿主原来的过滤器) */
+    g_prevUef = SetUnhandledExceptionFilter(CrashFilter);
+
+    HookLog("[build] core=%s built=%s %s pid=%lu",
+            HR_CORE_NAME, __DATE__, __TIME__, (unsigned long)g_pid);
+
+    {
+        HANDLE th = CreateThread(NULL, 0, Worker, NULL, 0, NULL);
+        if (!th) {
+            HookLog("[Core] Worker thread failed (err=%lu)", GetLastError());
+            return 0;
         }
+        CloseHandle(th);
     }
-    /* DLL_PROCESS_DETACH 时不要 DeleteCriticalSection: Worker 线程可能还在跑,
-       进程退出时由系统回收即可。 */
-    return TRUE;
+    return 1;
 }

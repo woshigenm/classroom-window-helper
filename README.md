@@ -10,7 +10,9 @@
 | 文件 | 作用 |
 |---|---|
 | `bin\bypass.exe` | 主程序：界面、托盘、看门狗、注入调度 |
-| `bin\bypass_hook32.dll` | 注入课堂进程的钩子（32 位） |
+| `bin\bypass_hook32.dll` | **Loader**：注入课堂进程，装钩子、打 IAT、持有日志/路径；逻辑改动时不用换它 |
+| `bin\bypass_hook_core.dll` | **Core**：所有窗口/抓屏/关机守卫的实现；改逻辑只换这个 |
+| `bin\bypass_hook_single.dll` | 回退用的旧版单 DLL（P1 之前那版），把名字改回 `bypass_hook32.dll` 即可回退 |
 | `bin\inject32.exe` | 注入器（主程序自动拉起，也可手动） |
 | `bin\lpe\` | 启动时的自动提权载荷（可选；没有它就走 UAC） |
 
@@ -163,6 +165,28 @@ enabled=1
 - 版本自检：主界面「检查当前状态」会列出每个课堂进程里 `bypass_hook32.dll` 的构建时间，
   和磁盘上的 DLL 比对；不一致会提示 **restart the classroom client**——重启 `bypass.exe`
   不会替换已经注入的旧 DLL。
+
+### 5.6 Loader / Core 分层
+
+注入的 DLL 拆成两层：
+
+| 层 | 文件 | 负责 |
+|---|---|---|
+| Loader | `bin\bypass_hook32.dll` | 装所有 inline/IAT 钩子、持有 trampoline、日志、路径、教师端判断 |
+| Core | `bin\bypass_hook_core.dll` | `Hook_*` 实现、窗口/抓屏/关机守卫；由 Loader `LoadLibrary` 后调 `Core_Init` |
+
+**什么时候要重编什么**（很重要）：
+
+| 改动 | 重编 | 重启课堂客户端 |
+|---|---|---|
+| 改 `Hook_*` 的拦截逻辑 | Core | 是（进程里还是旧 Core） |
+| 加一个新的拦截点（新的 inline hook） | Loader + Core | 是 |
+| 只改主界面 / 托盘 / 文档 | `bypass.exe` | 否 |
+
+**回退**：`bin\bypass_hook_single.dll` 是拆分前那版的完整 DLL。把它复制成
+`bin\bypass_hook32.dll`（覆盖 Loader），**重启课堂客户端**，再打开主程序。
+只换文件不重启无效——旧 DLL 已经在进程里；`inject32` 看到
+`bypass_hook32.dll` 或 `bypass_hook_single.dll` 任一个已加载都会跳过。
 
 ## 6. 安全与回退
 

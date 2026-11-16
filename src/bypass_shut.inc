@@ -35,15 +35,7 @@
 #define SH_LOG_EVERY    25      /* ... then one heartbeat every 25th */
 #define SH_WBUF         1024
 
-typedef BOOL      (WINAPI *PFN_ExitWindowsEx)(UINT, DWORD);
-typedef UINT      (WINAPI *PFN_WinExec)(LPCSTR, UINT);
-typedef HINSTANCE (WINAPI *PFN_ShellExecuteA)(HWND, LPCSTR, LPCSTR, LPCSTR, LPCSTR, INT);
-typedef HINSTANCE (WINAPI *PFN_ShellExecuteW)(HWND, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, INT);
-typedef BOOL      (WINAPI *PFN_InitiateSystemShutdownA)(LPSTR, LPSTR, DWORD, BOOL, BOOL);
-typedef BOOL      (WINAPI *PFN_InitiateSystemShutdownW)(LPWSTR, LPWSTR, DWORD, BOOL, BOOL);
-typedef BOOL      (WINAPI *PFN_InitiateSystemShutdownExA)(LPSTR, LPSTR, DWORD, BOOL, BOOL, DWORD);
-typedef BOOL      (WINAPI *PFN_InitiateSystemShutdownExW)(LPWSTR, LPWSTR, DWORD, BOOL, BOOL, DWORD);
-
+/* typedefs live in bypass_abi.h (shared with the Loader) */
 static PFN_ExitWindowsEx              real_ExitWindowsEx;
 static PFN_WinExec                    real_WinExec;
 static PFN_ShellExecuteA              real_ShellExecuteA;
@@ -73,8 +65,7 @@ static BOOL WINAPI Hook_CreateProcessW(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
 
 static void SH_ReadConfig(void)
 {
-    char   dir[MAX_PATH], path[MAX_PATH];
-    char*  p;
+    char   path[MAX_PATH];
     FILE*  f;
     char   line[128];
     LONG   enabled = 0;
@@ -82,11 +73,8 @@ static void SH_ReadConfig(void)
     if (g_shutCfgTick && GetTickCount() - g_shutCfgTick < 500) return;
     g_shutCfgTick = GetTickCount();
 
-    if (!GetModuleFileNameA(g_self, dir, sizeof(dir))) return;
-    p = strrchr(dir, '\\');
-    if (!p) return;
-    *(p + 1) = '\0';
-    _snprintf(path, sizeof(path) - 1, "%s" SH_INI_NAME, dir);
+    if (!g_baseDir[0]) return;
+    _snprintf(path, sizeof(path) - 1, "%s" SH_INI_NAME, g_baseDir);
     path[sizeof(path) - 1] = '\0';
 
     f = fopen(path, "r");
@@ -418,115 +406,23 @@ static BOOL WINAPI SH_Hook_InitiateSystemShutdownExW(LPWSTR machine, LPWSTR msg,
 
 /* ---------------- setup + heartbeat ---------------------------------------- */
 
-/* One summary line per process instead of one per hooked API (the classroom
-   spawns several of them; six lines each drowned the interesting entries). */
-static void SH_LogHookSummary(const char* const* names, const BOOL* ok, int n)
-{
-    char list[256], failed[128];
-    int  i, good = 0;
-
-    list[0] = 0;
-    failed[0] = 0;
-    for (i = 0; i < n; i++) {
-        char*  dst = ok[i] ? list : failed;
-        size_t cap = ok[i] ? sizeof(list) : sizeof(failed);
-
-        if (dst[0]) strncat(dst, " ", cap - strlen(dst) - 1);
-        strncat(dst, names[i], cap - strlen(dst) - 1);
-        if (ok[i]) good++;
-    }
-
-    if (good == n) {
-        HookLog("[Guard] hooks installed: %s", list);
-    } else {
-        HookLog("[Guard] hooks %d/%d installed: %s", good, n, list);
-        HookLog("[Guard] hook FAILED: %s", failed);
-    }
-}
-
 static void SH_Init(void)
 {
-    HMODULE        mod;
-    const char*    names[6];
-    BOOL           ok[6];
-    int            n = 0;
-    FARPROC        p;
-
     SH_ReadConfig();
 
-    mod = GetModuleHandleA("kernel32.dll");
-    if (mod) {
-        p = GetProcAddress(mod, "WinExec");
-        if (p) {
-            real_WinExec = (PFN_WinExec)p;
-            names[n] = "WinExec";
-            ok[n++] = InstallInlineHook((void*)p, (void*)SH_Hook_WinExec,
-                                        (void**)&real_WinExec);
-        }
-
-        /* The 0x28 path runs `shutdown -s -t 1` through systemoper.dll, which
-           is LoadLibrary'd on first use.  Its own IAT may never be patched in
-           time, but the kernel32 entry is shared by every module in this
-           process, so an entry hook covers it from the first call. */
-        if (real_CreateProcessW) {
-            p = GetProcAddress(mod, "CreateProcessW");
-            if (p) {
-                names[n] = "CreateProcessW";
-                ok[n++] = InstallInlineHook((void*)p, (void*)Hook_CreateProcessW,
-                                            (void**)&real_CreateProcessW);
-            }
-        }
-        if (real_CreateProcessA) {
-            p = GetProcAddress(mod, "CreateProcessA");
-            if (p) {
-                names[n] = "CreateProcessA";
-                ok[n++] = InstallInlineHook((void*)p, (void*)Hook_CreateProcessA,
-                                            (void**)&real_CreateProcessA);
-            }
-        }
-    }
-
-    mod = GetModuleHandleA("user32.dll");
-    if (mod) {
-        p = GetProcAddress(mod, "ExitWindowsEx");
-        if (p) {
-            real_ExitWindowsEx = (PFN_ExitWindowsEx)p;
-            names[n] = "ExitWindowsEx";
-            ok[n++] = InstallInlineHook((void*)p, (void*)SH_Hook_ExitWindowsEx,
-                                        (void**)&real_ExitWindowsEx);
-        }
-    }
-
-    mod = GetModuleHandleA("shell32.dll");
-    if (mod) {
-        p = GetProcAddress(mod, "ShellExecuteA");
-        if (p) {
-            real_ShellExecuteA = (PFN_ShellExecuteA)p;
-            names[n] = "ShellExecuteA";
-            ok[n++] = InstallInlineHook((void*)p, (void*)SH_Hook_ShellExecuteA,
-                                        (void**)&real_ShellExecuteA);
-        }
-        p = GetProcAddress(mod, "ShellExecuteW");
-        if (p) {
-            real_ShellExecuteW = (PFN_ShellExecuteW)p;
-            names[n] = "ShellExecuteW";
-            ok[n++] = InstallInlineHook((void*)p, (void*)SH_Hook_ShellExecuteW,
-                                        (void**)&real_ShellExecuteW);
-        }
-    }
-
-    SH_LogHookSummary(names, ok, n);
-
-    mod = GetModuleHandleA("advapi32.dll");
-    if (mod) {
-        p = GetProcAddress(mod, "InitiateSystemShutdownA");
-        if (p) real_InitiateSystemShutdownA = (PFN_InitiateSystemShutdownA)p;
-        p = GetProcAddress(mod, "InitiateSystemShutdownW");
-        if (p) real_InitiateSystemShutdownW = (PFN_InitiateSystemShutdownW)p;
-        p = GetProcAddress(mod, "InitiateSystemShutdownExA");
-        if (p) real_InitiateSystemShutdownExA = (PFN_InitiateSystemShutdownExA)p;
-        p = GetProcAddress(mod, "InitiateSystemShutdownExW");
-        if (p) real_InitiateSystemShutdownExW = (PFN_InitiateSystemShutdownExW)p;
+    /* The inline entries (WinExec, CreateProcessA/W, ExitWindowsEx,
+       ShellExecuteA/W) are installed by the Loader; the real pointers are the
+       trampolines from HrHost.real.  Only the InitiateSystemShutdown* fallbacks
+       (which are not inline-hooked) need wiring here. */
+    if (g_host) {
+        real_WinExec             = (PFN_WinExec)g_host->real.WinExec;
+        real_ExitWindowsEx       = (PFN_ExitWindowsEx)g_host->real.ExitWindowsEx;
+        real_ShellExecuteA       = (PFN_ShellExecuteA)g_host->real.ShellExecuteA;
+        real_ShellExecuteW       = (PFN_ShellExecuteW)g_host->real.ShellExecuteW;
+        real_InitiateSystemShutdownA   = (PFN_InitiateSystemShutdownA)g_host->real.InitiateSystemShutdownA;
+        real_InitiateSystemShutdownW   = (PFN_InitiateSystemShutdownW)g_host->real.InitiateSystemShutdownW;
+        real_InitiateSystemShutdownExA = (PFN_InitiateSystemShutdownExA)g_host->real.InitiateSystemShutdownExA;
+        real_InitiateSystemShutdownExW = (PFN_InitiateSystemShutdownExW)g_host->real.InitiateSystemShutdownExW;
     }
 }
 

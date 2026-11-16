@@ -193,12 +193,18 @@ static BOOL StageToLocal(const char* src, char* out, size_t outSize,
     return TRUE;
 }
 
-/* DLL 是否已经在目标进程里加载过 */
+/* DLL 是否已经在目标进程里加载过。
+   ★ 当问的是 loader (bypass_hook32.dll) 时, 旧单 DLL (bypass_hook_single.dll)
+     也算"已经加载": 两者同时打 inline hook 会互相覆盖/装不上。 */
 static BOOL IsModuleLoaded(DWORD pid, const char* dllBaseName)
 {
     HANDLE          snap;
     MODULEENTRY32   me;
     BOOL            found = FALSE;
+    BOOL            alsoSingle;
+
+    alsoSingle = (dllBaseName &&
+                  !_stricmp(dllBaseName, "bypass_hook32.dll")) ? TRUE : FALSE;
 
     snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snap == INVALID_HANDLE_VALUE) return FALSE;
@@ -206,7 +212,8 @@ static BOOL IsModuleLoaded(DWORD pid, const char* dllBaseName)
     me.dwSize = sizeof(me);
     if (Module32First(snap, &me)) {
         do {
-            if (!_stricmp(me.szModule, dllBaseName)) {
+            if (!_stricmp(me.szModule, dllBaseName) ||
+                (alsoSingle && !_stricmp(me.szModule, "bypass_hook_single.dll"))) {
                 found = TRUE;
                 break;
             }

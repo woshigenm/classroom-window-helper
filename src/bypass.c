@@ -1929,85 +1929,103 @@ static void StampText(DWORD stamp, char* out, DWORD n)
 }
 
 /* verbose=1: 把逐进程结果写进日志（给「检查当前状态」用）
-   verbose=0: 只在发现旧 DLL 时警告（给启动后的一次性定时器用） */
+   verbose=0: 只在发现旧 DLL 时警告（给启动后的一次性定时器用）
+   P1 起有两层: bypass_hook32.dll (Loader, 很少变) 和 bypass_hook_core.dll
+   (Core, 改逻辑只换它)。两个都要比, 否则 Core 旧了也报"current"。 */
 static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
 {
     static const char* images[] = { "Student.exe", "MultiClient.exe",
                                     "ScreenRecord.exe", "ScreenRender.exe" };
-    char  dll[MAX_PATH] = "";
+    static const char* dllNames[2] = { "bypass_hook32.dll",
+                                       "bypass_hook_core.dll" };
+    static const char* dllTags[2]  = { "loader", "core" };
     char  dir[MAX_PATH] = "";
-    char  stale[160] = "";
-    DWORD disk, oldStamp = 0;
-    int   i, staleCount = 0;
+    char  stale[200] = "";
+    DWORD disk[2] = { 0, 0 };
+    int   i, d, staleCount = 0;
 
     if (GetModuleFileNameA(NULL, dir, sizeof(dir))) {
         char* p = strrchr(dir, '\\');
-        if (p) {
-            *(p + 1) = '\0';
-            PathCombineA(dll, dir, "bypass_hook32.dll");
-        }
+        if (p) *(p + 1) = '\0';
+        else dir[0] = '\0';
     }
-    disk = dll[0] ? PeStampFile(dll) : 0;
+
+    for (d = 0; d < 2; d++) {
+        char path[MAX_PATH] = "";
+
+        if (dir[0]) PathCombineA(path, dir, dllNames[d]);
+        disk[d] = path[0] ? PeStampFile(path) : 0;
+    }
 
     if (verbose) {
-        char t[40];
+        char t1[40], t2[40];
 
         AppendLog(hwnd, "\r\n--- Guard Status ---\r\n");
         AppendLog(hwnd, "  screen guard   : %s (bin\\bypass_screen.ini)\r\n",
                   g_screenGuard ? "ON" : "off");
         AppendLog(hwnd, "  shutdown guard : %s (bin\\bypass_shut.ini)\r\n",
                   g_shutGuard ? "ON" : "off");
-        StampText(disk, t, sizeof(t));
-        AppendLog(hwnd, "  DLL on disk    : %s\r\n", disk ? t : "NOT FOUND");
+        StampText(disk[0], t1, sizeof(t1));
+        StampText(disk[1], t2, sizeof(t2));
+        AppendLog(hwnd, "  DLL on disk    : loader %s / core %s\r\n",
+                  disk[0] ? t1 : "NOT FOUND", disk[1] ? t2 : "NOT FOUND");
     }
 
     for (i = 0; i < (int)(sizeof(images) / sizeof(images[0])); i++) {
-        DLLPROBE pr;
-        char     t[40];
+        DWORD pid = FindPidByName(images[i]);
+        char  line[256] = "";
+        int   bad = 0;
 
-        pr.image = images[i];
-        pr.pid   = FindPidByName(images[i]);
-        pr.stamp = pr.pid ? PeStampLoaded(pr.pid, "bypass_hook32.dll") : 0;
-
-        if (!pr.pid) {
+        if (!pid) {
             if (verbose)
-                AppendLog(hwnd, "  %-14s : not running\r\n", pr.image);
-            continue;
-        }
-        if (!pr.stamp) {
-            if (verbose)
-                AppendLog(hwnd, "  %-14s : DLL not loaded / no access\r\n", pr.image);
+                AppendLog(hwnd, "  %-14s : not running\r\n", images[i]);
             continue;
         }
 
-        StampText(pr.stamp, t, sizeof(t));
-        if (disk && pr.stamp != disk) {
-            if (!oldStamp) oldStamp = pr.stamp;
-            if (stale[0]) strncat(stale, ", ", sizeof(stale) - strlen(stale) - 1);
-            strncat(stale, pr.image, sizeof(stale) - strlen(stale) - 1);
-            staleCount++;
-            if (verbose)
-                AppendLog(hwnd, "  %-14s : DLL %s  <== OLD (restart the classroom client)\r\n",
-                          pr.image, t);
-        } else if (verbose) {
-            AppendLog(hwnd, "  %-14s : DLL %s  (current)\r\n", pr.image, t);
+        for (d = 0; d < 2; d++) {
+            DWORD stamp = PeStampLoaded(pid, dllNames[d]);
+            char  t[40];
+            char  part[96];
+
+            if (!stamp) {
+                _snprintf(part, sizeof(part) - 1, "%s not loaded", dllTags[d]);
+            } else {
+                StampText(stamp, t, sizeof(t));
+                if (disk[d] && stamp != disk[d]) {
+                    _snprintf(part, sizeof(part) - 1, "%s %s <== OLD", dllTags[d], t);
+                    bad = 1;
+                    if (stale[0]) strncat(stale, ", ", sizeof(stale) - strlen(stale) - 1);
+                    {
+                        char one[64];
+                        _snprintf(one, sizeof(one) - 1, "%s(%s)", images[i], dllTags[d]);
+                        one[sizeof(one) - 1] = '\0';
+                        strncat(stale, one, sizeof(stale) - strlen(stale) - 1);
+                    }
+                    staleCount++;
+                } else {
+                    _snprintf(part, sizeof(part) - 1, "%s %s", dllTags[d], t);
+                }
+            }
+            part[sizeof(part) - 1] = '\0';
+            if (line[0]) strncat(line, " / ", sizeof(line) - strlen(line) - 1);
+            strncat(line, part, sizeof(line) - strlen(line) - 1);
         }
+
+        if (verbose)
+            AppendLog(hwnd, "  %-14s : %s%s\r\n", images[i], line,
+                      bad ? "   (restart the classroom client)" : "");
     }
 
     if (staleCount) {
-        char told[40], tnew[40];
-
-        StampText(oldStamp, told, sizeof(told));
-        StampText(disk, tnew, sizeof(tnew));
-        AppendLog(hwnd, "\r\n[Build] WARNING: %s 里还是旧 DLL（%s），磁盘上是 %s。\r\n"
-                        "[Build] 旧的守卫仍然有效，但新加的日志/钩子要重启课堂客户端才会加载。\r\n",
-                  stale, told, tnew);
+        AppendLog(hwnd, "\r\n[Build] WARNING: %s 里跑的是旧 DLL。\r\n"
+                        "[Build] 旧守卫仍然有效，但新逻辑/日志要重启课堂客户端才会加载。\r\n",
+                  stale);
         UpdateStatus(hwnd, "Status: WARNING - old DLL in classroom client (restart it)");
         return TRUE;
     }
 
-    if (verbose && disk)
-        AppendLog(hwnd, "  (all classroom processes run the current DLL)\r\n");
+    if (verbose)
+        AppendLog(hwnd, "  (all classroom processes run the current DLLs)\r\n");
     return FALSE;
 }
 
