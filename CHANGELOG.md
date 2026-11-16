@@ -43,6 +43,8 @@
 - drain 原用 `3000 × Sleep(1)`（Windows 下约 45 秒），改为墙钟 deadline。
 - LPE 提权：上一次中断留下的「文档」重定向会被当成原始路径反复恢复；
   `trigger.ps1` 现在检测到 LPE 临时目录就直接改用 `%USERPROFILE%\Documents`。
+- 缺少 `bin\lpe\` 时不再先尝试 LPE（会白等一次 Wallet 请求）而是直接走 UAC；
+  发布包也会带上完整的 `bin\lpe\`。
 
 ### 兼容性
 
