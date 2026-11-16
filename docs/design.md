@@ -1088,6 +1088,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\stuck_test.ps1
 
 > `g_coreDead` 是终态：该进程不能恢复，测试必须用独立宿主、且不包含“恢复后 reload”的断言。
 
+**一键回归**（`make.bat` 目标 + 全部 PowerShell 套件）：
+
+```bat
+:: 构建 + 跑全部套件
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1
+:: 用现有 bin\ 直接跑（不重新编译）
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1 -NoBuild
+:: 只跑名字匹配的套件
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1 -NoBuild -Filter *reload*
+```
+
+`run_all.ps1` 先构建 `all / fakecores / testcores / corehost / wmodetest /
+screentest / shuttest`，然后依次跑：fake cores、reload、stuck、恶意 Core、wmode、
+screenguard、foreign_fix、shutguard，最后打印汇总；任一失败退出码非 0。
+恶意 Core 那组是终态，脚本把它排在 reload 系最后，且后面不再做“恢复后重载”断言。
+
 验证"跨进程兜底不会卡死 enforcer"（`make.bat hangwintest` + 脚本）：
 
 ```bat

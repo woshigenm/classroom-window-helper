@@ -45,8 +45,17 @@ make.bat wmodetest    :: bin\wmode_test.exe
 make.bat vdtest       :: bin\vd_pin_test.exe
 make.bat hangwintest  :: bin\hangwin_test.exe（跨进程兜底测试用的"不泵消息"受害者）
 make.bat screentest   :: bin\screenguard_test.exe（屏幕监控守卫自测载体）
+make.bat fakecores | testcores | corehost   :: 失败注入用的假/坏 Core、长驻宿主
 make.bat clean | rebuild | check
 ```
+
+跑全部回归（构建 + 8 个套件，任一失败退出码非 0）：
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1
+```
+
+`-NoBuild` 用现有 `bin\` 直接跑，`-Filter *reload*` 只跑名字匹配的套件。
 
 - 工具链：32 位 `i686-w64-mingw32-gcc`（课堂软件全是 32 位，主程序也用 32 位编），
   `make.bat` / `Makefile` 自动探测 RedPanda-Cpp 与 `C:\mingw32`；直接
