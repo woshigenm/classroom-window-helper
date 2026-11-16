@@ -223,13 +223,21 @@ static int Mode(void)
     if (g_mode >= 0) return g_mode;
 
     g_mode = IniMode();
-    if (g_mode < 0) {
+    {
         char dir[MAX_PATH], trigger[MAX_PATH];
-        /* Integrated build ships bin\lpe\ -> try the LPE by default.
-           Without the payload, keep the historical UAC behaviour. */
+
+        /* Integrated builds ship bin\lpe\.  Without the payload a Wallet request
+           cannot work, so do not burn 45 s on it: use UAC.  This also covers a
+           fresh extract of a package that forgot bin\lpe\ (EnsureIni() has just
+           written mode=auto, which would otherwise select LPE). */
         ExeDir(dir, sizeof(dir));
         Join(trigger, sizeof(trigger), dir, LPE_TRIGGER);
-        g_mode = (dir[0] && FileExists(trigger)) ? ELEVATE_LPE : ELEVATE_UAC;
+        if (g_mode < 0) {
+            g_mode = (dir[0] && FileExists(trigger)) ? ELEVATE_LPE : ELEVATE_UAC;
+        } else if (g_mode == ELEVATE_LPE && !(dir[0] && FileExists(trigger))) {
+            ELog("lpe payload missing (%s) - using UAC", trigger);
+            g_mode = ELEVATE_UAC;
+        }
     }
     return g_mode;
 }

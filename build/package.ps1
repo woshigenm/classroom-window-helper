@@ -70,6 +70,23 @@ try {
         ) | Set-Content -LiteralPath (Join-Path $stageBin "bypass_config.ini") -Encoding ASCII
     }
 
+    # Runtime ini files that carry explicit (default) settings.  bypass_vd.ini is
+    # deliberately NOT shipped: it stores the pinned desktop GUID of the machine
+    # that produced the zip.
+    foreach ($ini in @("bypass_shut.ini", "bypass_elevate.ini")) {
+        $p = Join-Path $Bin $ini
+        if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $stageBin }
+    }
+
+    # Auto-elevation payload (bin\lpe\trigger.ps1 + wallet helpers).  Without it
+    # the launcher can only fall back to UAC, so ship the whole tree.
+    $lpeSrc = Join-Path $Bin "lpe"
+    if (Test-Path -LiteralPath $lpeSrc) {
+        Copy-Item -LiteralPath $lpeSrc -Destination $stageBin -Recurse -Force
+    } else {
+        Write-Warning "bin\lpe missing: the package can only elevate through UAC"
+    }
+
     # Keep the docs\ subfolder: README links to docs/design.md and
     # docs/how-to-use.md, so flattening them would break the links.
     $stageDocs = Join-Path $stage "docs"

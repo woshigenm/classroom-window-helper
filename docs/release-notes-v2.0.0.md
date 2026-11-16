@@ -95,7 +95,10 @@ bin\bypass_hook32.dll       Loader
 bin\bypass_hook_core.dll    Core (hot-reload target)
 bin\bypass_hook_single.dll  rollback: old single-DLL build
 bin\inject32.exe            injector
+bin\lpe\                    auto-elevation payload (trigger.ps1 + wallet helpers)
 bin\bypass_config.ini       runtime config
+bin\bypass_elevate.ini      elevation mode (auto = lpe, falls back to UAC)
+bin\bypass_shut.ini         remote shutdown guard
 docs\how-to-use.md          usage
 docs\design.md              internals
 README.md
@@ -104,4 +107,4 @@ CHANGELOG.md                (中文 / Chinese only)
 ```
 
 SHA256 `classroom-window-helper-v2.0.0-bin.zip`:
-`524A10B541C7F328BA8004F90F08386AA0ACB9BEF21B39862B314EFED0AAEF03`
+`07E7C454B08486B371CF04B62AAA1854EB55E67886964E6CF35355662DD12259`
