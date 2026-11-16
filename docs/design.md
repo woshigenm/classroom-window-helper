@@ -763,12 +763,16 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
 
 **P2b-2 已实现的部分（ABI 3）**：
 
-- **`g_inHookCount` 上移 Loader**：33 个 dispatcher 统一
-  `g_unloading ? 直通 : 计数 + 调用 Core + 减计数`。`HrHost.in_hook_count`
-  指向 Loader 的计数，`before_unload` 读的就是“所有 hook 都不在执行”。
-  `g_unloading` 从 `before_unload` 前一直保持到新 Core 发布，期间的调用全部直通。
-- **Loader 侧权威 drain**：`before_unload` 返回 1 后，Loader 再等
-  `g_inHookCount == 0`（最多 3s）才 `FreeLibrary`；超时返回 `err hooks-busy`
+- **`g_inHookCount` 上移 Loader（双层计数）**：33 个 dispatcher
+  `g_unloading ? 直通 : 计数 + 调用 Core + 减计数`；Core 的 11 个包装通过
+  `HOOK_ENTER/HOOK_LEAVE` 对**同一个** Loader 计数器再加减一次。一次调用是
+  `0 -> 1(Loader) -> 2(Core) -> 1 -> 0`，只有两层都返回才归零 —— 这是刻意
+  更严格的 drain，不是“仅在直接调用时才有意义”。
+- **`g_unloading` 在 `before_unload` 之后才置 1**：`before_unload` 里 Core 自己
+  调 hook 函数（比如恢复窗口位置）仍然走完整 Loader → Core 路径；只有排空完成
+  后，新调用才在 Loader 直接直通。
+- **Loader 侧权威 drain**：`before_unload` 返回 1、`g_unloading=1` 之后，Loader
+  再等共享计数归零（最多 3s）才 `FreeLibrary`；超时返回 `err hooks-busy`
   且不卸载。
 - **异常过滤器链上移 Loader**：`LoaderUefForward` 是永不更新的转发器；
   `uef_push(CoreUef)` 压栈并只在第一次 `SetUnhandledExceptionFilter(转发器)`，
@@ -776,6 +780,14 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
   `EXCEPTION_CONTINUE_SEARCH`，不再持有“前一个”指针。
 - 测试补了 **“重载后 CoreUef 仍被调用”**：宿主在重载后 `RaiseException`，日志里
   必须出现该 pid 的 `!! crash`（如果链还指向已卸载的旧 Core，就不会有这行）。
+
+**P2b-2 剩余三项的顺序**：
+
+1. `RemoveWindowSubclass`（`g_coreDisabled=1` 之后；它本身不触发 `SubclassProc`）；
+2. `StateClose`（不依赖窗口，Worker 已停，`UnmapViewOfFile` 安全）；
+3. `KillTimer` → `DestroyWindow`（确认 `IsWindow(h)==FALSE`）→ `UnregisterClass`。
+   `WndProc`/`SubclassProc` 里的 `g_coreDisabled` 检查**不能**跳过
+   `WM_DESTROY`/`WM_NCDESTROY` 的清理分支，否则 `DestroyWindow` 会漏释放资源。
 
 ---
 

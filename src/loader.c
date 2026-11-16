@@ -1394,17 +1394,19 @@ static int DoReload(int noRollback, char* resp, size_t cap)
     _snprintf(prev, sizeof(prev) - 1, "%s", g_cur.path);
     prev[sizeof(prev) - 1] = '\0';
 
-    /* all dispatchers become passthrough: the refcount can drain even if the
-       host keeps calling into the hooks while the Core shuts down */
-    InterlockedExchange(&g_unloading, 1);
-
     /* table still points at the old Core: let it drain while its hooks are
-       still reachable (Core sets its own disabled flag internally). */
+       still reachable.  g_unloading stays 0 here so that Core-internal calls
+       made by before_unload (e.g. restoring a window) still go through the
+       normal Loader -> Core path; core's own g_coreDisabled handles new
+       external calls. */
     if (!g_core.before_unload()) {
-        InterlockedExchange(&g_unloading, 0);
         _snprintf(resp, cap - 1, "err refused-by-core\n");
         return 0;
     }
+
+    /* Core threads are stopped; from here new calls passthrough at the
+       Loader and are not counted.  In-flight calls still drain to 0. */
+    InterlockedExchange(&g_unloading, 1);
 
     /* Loader-side drain: authoritative, covers all 33 dispatchers, not just
        the hooks the Core knows about. */

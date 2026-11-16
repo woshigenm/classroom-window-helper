@@ -65,22 +65,26 @@ static char          g_baseDir[MAX_PATH];  /* "...\\bin\\" */
 /* P2b: unload handshake.  Guards are added to hooks incrementally (P2b-1:
    ShowWindow / SetWindowPos / CreateProcessW). */
 static volatile LONG g_coreDisabled;
-static volatile LONG g_inHookCount;
 static volatile LONG g_workerRunning;
 static HANDLE        g_hWorker;
 static volatile LONG g_captionRunning;
 static HANDLE        g_hCaption;
 
 /* Core-side wrappers: fast passthrough while draining, then count the call.
-   The authoritative count for before_unload is the Loader's (all 33
-   dispatchers); this one is a second layer for direct calls. */
+   The counter is the LOADER's (HrHost.in_hook_count), shared with the Loader
+   dispatcher, so one call is counted twice (Loader then Core) and drains
+   2 -> 1 -> 0.  That is deliberate: the count only reaches 0 when every
+   Loader forward AND the Core logic have returned. */
+#define HR_IN_HOOKS() (g_host ? g_host->in_hook_count : NULL)
 #define HOOK_ENTER(realCall) \
     do { \
+        volatile LONG* _c = HR_IN_HOOKS(); \
         if (InterlockedCompareExchange(&g_coreDisabled, 0, 0)) return (realCall); \
-        InterlockedIncrement(&g_inHookCount); \
+        if (_c) InterlockedIncrement(_c); \
     } while (0)
 
-#define HOOK_LEAVE() InterlockedDecrement(&g_inHookCount)
+#define HOOK_LEAVE() \
+    do { volatile LONG* _c = HR_IN_HOOKS(); if (_c) InterlockedDecrement(_c); } while (0)
 static DWORD  g_pid;
 static HMODULE g_self;
 static volatile LONG g_disabled;
