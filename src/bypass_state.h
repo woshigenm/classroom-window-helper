@@ -35,8 +35,8 @@ typedef struct BypassState {
     int small_h;
     int small_permille;         /* 350 = 屏宽 0.35; 与 small_w/h 二选一 */
 
-    unsigned int show_seq;      /* +1 = 恢复被收起的广播窗 */
-    unsigned int small_seq;     /* +1 = 立即强制小窗一次 */
+    unsigned int show_seq;      /* reserved: 手动「小窗化/显示」按钮已移除, 不再自增 */
+    unsigned int small_seq;     /* reserved: 同上 (保留字段以维持共享内存布局) */
     unsigned int config_seq;    /* 配置代次（诊断用） */
 
     unsigned int reserved[7];

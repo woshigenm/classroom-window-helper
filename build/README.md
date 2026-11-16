@@ -11,6 +11,10 @@ build\build_bypass.bat
 build\build_hook32.bat
 ```
 
+`make.bat` 会额外把自动提权载荷装到 `bin\lpe\`（`src\lpe_broker.c` 编译的
+`shell_broker.exe` + `lpe\trigger.ps1` + `lpe\payload\` 里三个 PoC 二进制）。
+只想更新这一块用 `make.bat lpe`。
+
 ## 2. 签名
 
 ### 2.1 生成内网测试用自签证书

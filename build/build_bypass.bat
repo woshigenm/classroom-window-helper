@@ -8,16 +8,22 @@ rem
 rem  NOTE: if bypass.exe is running it is locked and the link
 rem        will fail. Close it first (tray -> exit, or Ctrl+Alt+Q).
 rem
-rem  Toolchain: C:\Program Files\RedPanda-Cpp\mingw64\bin
+rem  Toolchain: 64-bit MinGW if present, else the 32-bit one next to it
+rem             (this machine: C:\Program Files (x86)\RedPanda-Cpp\mingw32\bin)
 rem  Keep this file ASCII-only.
 rem ============================================================
 setlocal
-set MINGW=C:\Program Files\RedPanda-Cpp\mingw64\bin
+set "MINGW="
+if exist "C:\Program Files\RedPanda-Cpp\mingw64\bin\gcc.exe" set "MINGW=C:\Program Files\RedPanda-Cpp\mingw64\bin"
+if not defined MINGW if exist "C:\Program Files (x86)\RedPanda-Cpp\mingw64\bin\gcc.exe" set "MINGW=C:\Program Files (x86)\RedPanda-Cpp\mingw64\bin"
+if not defined MINGW if exist "C:\Program Files (x86)\RedPanda-Cpp\mingw32\bin\gcc.exe" set "MINGW=C:\Program Files (x86)\RedPanda-Cpp\mingw32\bin"
+if not defined MINGW if exist "C:\mingw32\bin\i686-w64-mingw32-gcc.exe" set "MINGW=C:\mingw32\bin"
 set PATH=%MINGW%;%PATH%
 
 set ROOT=%~dp0..
 set OUT=%ROOT%\bin\
 set SRC=%ROOT%\src\bypass.c
+set SRC2=%ROOT%\src\elevate.c
 
 if not exist "%OUT%" mkdir "%OUT%"
 
@@ -38,7 +44,7 @@ echo [build] compiler : %MINGW%\gcc.exe
 
 "%MINGW%\gcc.exe" -mwindows -O2 -D__USE_MINGW_ANSI_STDIO=1 ^
     -Wall -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable ^
-    "%SRC%" -o "%OUT%%TARGET%" ^
+    "%SRC%" "%SRC2%" -o "%OUT%%TARGET%" ^
     -lgdi32 -lcomctl32 -ladvapi32 -lshell32 -luser32 -lshlwapi -lwinmm -liphlpapi
 
 if errorlevel 1 (

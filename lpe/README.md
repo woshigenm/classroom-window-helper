@@ -1,0 +1,75 @@
+# lpe\ —— 启动时的自动提权载荷
+
+这个目录只解决一件事：**把 `bin\bypass.exe` 以管理员身份拉起来**。
+工具本身仍然需要一个管理员进程（驱动 IOCTL + 注入课堂进程），老的流程是弹 UAC；
+这里额外提供一条“不需要用户点 UAC”的路，并且**失败就退回 UAC / 手动**。
+
+## 文件编码约定（改代码前必读）
+
+| 文件 | 编码 | 谁写 | 谁读 |
+|---|---|---|---|
+| `payload\result.txt` | **纯 ASCII 追加** | 回调 DLL（原样）+ `shell_broker.exe`（事件行 `event=...` + 诊断行 `note=...`） | `trigger.ps1`（默认编码 + 正则） |
+| `payload\command.txt` | UTF-16LE + BOM | `trigger.ps1`（来自 `-TargetCommand` 参数） | 只被 `shell_broker.exe` 读 |
+| `bin\bypass_hook.log` | ACP（中文系统 = GBK） | 启动器 / `trigger.ps1`（`[elevate]` 进度行）/ broker 拉起的实例 / 注入的 DLL | 人 + 启动器的握手扫描 |
+
+`result.txt` 里混进任何非 ASCII 字节 = 集成版必挂（原版 PoC 两边都是 ASCII 所以能跑）。
+
+## 文件
+
+| 路径 | 说明 |
+|---|---|
+| `trigger.ps1` | 本次的入口。构造并触发 WalletService 链路，结束后无条件还原 Documents 路径 |
+| `payload\wallet_ese_seed.exe` | PoC 原样：造带持久化回调的 `wallet.db` |
+| `payload\wallet_callback_shell.dll` | PoC 原样：被 WalletService 以 SYSTEM 加载，创建按需服务 |
+| `payload\documents_path.exe` | PoC 原样：读写 `FOLDERID_Documents` |
+| `payload\README.txt` | 来源、SHA256、与原版的差异说明 |
+| `..\src\lpe_broker.c` | 由本仓库编译成 `bin\lpe\shell_broker.exe`：拉起 `bin\bypass.exe` |
+
+构建：`make.bat lpe`（`make.bat all` 也会带上）。产物全部落到 `bin\lpe\`，
+**运行期只读 `bin\lpe\`**，本目录不参与运行。
+
+## 调用链
+
+```
+bin\bypass.exe（普通用户，非管理员）
+  └─ powershell -EncodedCommand <trigger.ps1 + TargetCommand>
+       ├─ seed/Documents 重定向 + WalletManager.RequestStoreAsync()
+       ├─ WalletService(LocalSystem) 加载 wallet_callback_shell.dll
+       ├─ 该 DLL 创建按需服务 -> shell_broker.exe <result.txt>
+       ├─ broker 读 command.txt（= "bin\bypass.exe ..."）
+       └─ CreateProcessAsUserW(winsta0\default) -> 管理员身份的 bypass.exe
+            └─ 往 bin\bypass_hook.log 写握手行（elevated instance pid=... is up）
+```
+
+启动器（`src\elevate.c`）扫共享日志的尾部找握手行，**不等退出码**：退出码只能证明“服务跑过”，
+握手行才能证明“我们的程序真的以管理员身份在跑”。
+
+## 安全性 / 限制
+
+- 只启动 `command.txt` 里那一行命令，而那是启动器编进 `-EncodedCommand` 的 `bin\bypass.exe` 路径。
+- 优先取会话令牌的**未过滤链接令牌**（真正的管理员组身份），拿不到才退回 SYSTEM（PoC 原行为）。
+- `trigger.ps1` 的 `finally` 会恢复 Documents 已知文件夹。
+- 漏洞在 **2026 年 7 月**修复；补丁机上必然失败，此时自动走 UAC → 手动提示。
+- 只用于自己的机器 / 自己的课堂环境。分发前请确认当地法律与学校规定。
+
+## 手动自测
+
+```bat
+rem 1) 先确认不是管理员（普通 PowerShell 里执行）
+rem 2) 直接跑 trigger（等价于 bypass.exe 自动提权）
+powershell -NoProfile -ExecutionPolicy Bypass ^
+  -File bin\lpe\trigger.ps1 ^
+  -TargetCommand '"C:\classroom-window-helper\bin\bypass.exe"' -TimeoutSec 45
+
+rem 3) 只想看进度/报错（全部都在共享日志里）：
+type bin\bypass_hook.log
+
+rem 结果：
+rem   bin\bypass_hook.log 里有 elevated instance pid=... is up = 已经以管理员在跑
+rem   %LOCALAPPDATA%\ClassroomBypass-LPE\<runid>\payload\result.txt  PoC 的原始事件
+```
+
+> 直接 `.\trigger.ps1` 会被执行策略拦住——这是 PowerShell 对**脚本文件**的限制。
+> `bypass.exe` 用的是 `-EncodedCommand`（内容 Base64 后执行），不经过脚本文件，所以
+> 即使 `Get-ExecutionPolicy` 是 `Restricted` 或被组策略锁死也能跑。手工执行时加
+> `-ExecutionPolicy Bypass -File` 即可。

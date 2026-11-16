@@ -102,7 +102,6 @@ static int          g_stWindow = 1;
 static int          g_stTitle = 1;
 static int          g_stMinTray = 0;
 static int          g_stSmallW, g_stSmallH, g_stSmallPermille;
-static unsigned int g_lastShowSeq, g_lastSmallSeq;
 static DWORD        g_stateNextOpen;
 static char g_ownImage[MAX_PATH] = "?";
 static int  g_isBroadcastProc;        /* 1 = 本进程是全屏广播渲染器 (身份判定) */
@@ -345,6 +344,7 @@ static BOOL IsClassroomExe(const char* name)
 {
     static const char* t[] = {
         "Student.exe", "StudentMain.exe", "MultiClient.exe",
+        "MmcStudent.exe",
         "MultiRender.exe", "ScreenRender.exe", "MultiScreen.exe",
         /* 与 inject32.exe 的目标列表对齐: 这些进程也可能创建/摆放广播窗口 */
         "AudioRender.exe", "AudioSender.exe", "SharedDesktop.exe",
@@ -678,7 +678,7 @@ static BOOL SubAdd(HWND h, WNDPROC old)
 #define PROP_USERCMD "BypassUserCmd"     /* 用户刚下过命令时的 GetTickCount */
 #define PROP_USERMAX "BypassUserMax"     /* 用户主动(模拟)最大化: enforcer 不许再降级 */
 #define PROP_ICONIC  "BypassIconic"      /* 窗口正处于最小化状态 (用于"恢复时保持最大化") */
-#define PROP_PARKED  "BypassParked"      /* 用户点最小化 -> 窗口已隐藏, 等待 Ctrl+Alt+S 恢复 */
+#define PROP_PARKED  "BypassParked"      /* 用户点最小化 -> 窗口已隐藏 (关掉持续保持小窗后渲染器会重新显示) */
 #define PROP_TASKBARMIN "BypassTaskbarMin" /* 真最小化到任务栏期间: 应用任何"显示/还原"都吃掉 */
 #define PROP_CLICKACTIVE "BypassClickActive" /* 最近一次"点击激活"(WA_CLICKACTIVE) 的 tick */
 #define PROP_MENUTICK  "BypassMenuTick"   /* 最近一次窗口被激活/打开系统菜单的 tick */
@@ -722,8 +722,8 @@ static BOOL UserCmdRecent(HWND h, DWORD ms)
      - 直接点窗口 (如果它已经被顶出来一瞬)
    这些动作都有共同的"输入"特征: 光标在任务栏(或菜单)上且刚刚有输入, 或者
    窗口刚收到 WA_CLICKACTIVE, 或者按着 Win/Alt 键。应用自己发消息时没有这些特征。
-   ★ 判错了也不要紧: 主程序的"小窗化/显示"按钮和 Ctrl+Alt+S 会发
-     WM_BYPASS_UNPARK, 那条路强制解除这个锁。 */
+   ★ 判错了也不要紧: 关掉「持续保持小窗」(写 bypass_hook.off) 后 DLL 完全放行,
+     渲染器下一次 ShowWindow 会把窗口重新显示出来。 */
 static BOOL UserRestoreSignal(HWND h, DWORD withinMs)
 {
     DWORD now = GetTickCount();
@@ -1274,7 +1274,7 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     if (msg == WM_BYPASS_UNPARK) {
-        /* 主程序「小窗化 / 显示广播窗口」按钮、托盘菜单、Ctrl+Alt+S 都走这里。
+        /* 主程序的「持续保持小窗」恢复路径仍会投递这条消息。
            不论是"收起"(PARKED)、"任务栏最小化"(TASKBARMIN), 还是锁已经意外
            丢了但窗口仍然是 iconic / 还在 -32000 的兜底状态, 都强制恢复一次。 */
         if (GetPropA(h, PROP_PARKED) || TaskbarMinimized(h) ||
@@ -1413,8 +1413,8 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 
             /* ★ 最小化 = 把广播窗"收起来"(隐藏), 不是真的 minimize:
                渲染器会不断 ShowWindow(SW_SHOW) 把最小化顶回来, 所以隐藏后
-               在 PARKED 期间拦掉应用的显示请求; 用 Ctrl+Alt+S / 托盘
-               「小窗化广播窗口」恢复 (主程序通过共享状态 seq 通知)。 */
+               在 PARKED 期间拦掉应用的显示请求; 恢复方式: 关掉
+               「持续保持小窗」(写 bypass_hook.off) 后渲染器会自己重新显示。 */
             if (c == SC_MINIMIZE && (LooksManaged(h) || GetPropA(h, PROP_USERMAX))) {
                 if (MinimizeToTaskbarMode()) {
                     /* 真最小化到任务栏。ShowWindow 已被内联 hook, 渲染器
@@ -1436,11 +1436,11 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                     if (InterlockedIncrement(&g_minLogs) <= 10)
                         HookLog("minimize to taskbar hwnd=%p", (void*)h);
                 } else {
-                    /* 收起: 隐藏, 不占任务栏; Ctrl+Alt+S / 托盘菜单恢复 */
+                    /* 收起: 隐藏, 不占任务栏 (关掉持续保持小窗后渲染器会重新显示) */
                     SetPropA(h, PROP_PARKED, (HANDLE)1);
                     if (real_ShowWindow) real_ShowWindow(h, SW_HIDE);
                     if (InterlockedIncrement(&g_minLogs) <= 10)
-                        HookLog("parked hwnd=%p (hidden; Ctrl+Alt+S to restore)", (void*)h);
+                        HookLog("parked hwnd=%p (hidden; toggle sticky off to restore)", (void*)h);
                 }
                 return 0;
             }
@@ -1867,10 +1867,54 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     return r;
 }
 
+/* ---- virtual desktop pinning (see bypass_vd.inc) ---- */
+#include "bypass_vd.inc"
+
+/* ---- window-mode (control-side) small broadcast window ----
+   The teacher's console can send the broadcast in window mode: the renderer
+   then creates the render window ALREADY SMALL (WS_EX_TOPMOST + caption).
+   Nothing demotes it, so the topmost flag it was born with would stay
+   forever, and every app re-assert of HWND_TOPMOST (which we turn into
+   HWND_NOTOPMOST) lifted it above the student's active window again.
+   1 = freeze app-driven z-order for this window (user clicks still raise
+   it normally, because then it is the foreground window). */
+static BOOL SmallBcastNoRaise(HWND h)
+{
+    char cls[64];
+
+    if (!h || !IsWindow(h)) return FALSE;
+    if (GetForegroundWindow() == h) return FALSE;   /* active: raising is harmless */
+    if (LooksManaged(h)) return FALSE;              /* demoted window: own rules */
+    if (IsWorthFixing(h)) return FALSE;             /* fullscreen-like: demote path */
+    cls[0] = 0;
+    GetClassNameA(h, cls, sizeof(cls));
+    if (!IsRenderWindowClass(cls)) return FALSE;    /* class-based only */
+    if (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOPMOST) return FALSE;
+    return TRUE;                                    /* plain small broadcast window */
+}
+
 static BOOL WINAPI Hook_SetWindowPos(HWND h, HWND after,
                                      int x, int y, int cx, int cy, UINT flags)
 {
     BOOL changed = FALSE;
+
+    /* virtual desktop: pin before SWP_SHOWWINDOW can make it visible, and
+       before VD_NoActivate() is consulted (a fresh process still has to
+       resolve the target, and the first show is the critical one).
+       Not gated on IsBroadcastWindow(): the window-mode small window must be
+       covered as well. */
+    if (!g_disabled && (flags & SWP_SHOWWINDOW) != 0)
+        VD_PinNow(h, "setwindowpos");
+
+    /* virtual desktop: never let a call activate a render window sitting on a
+       desktop the user is not looking at - activation is what makes the shell
+       jump to that desktop. */
+    if (!g_disabled && (flags & SWP_NOACTIVATE) == 0 && VD_NoActivate(h)) {
+        flags |= SWP_NOACTIVATE;
+        if (VD_LogWanted(h, VD_LOG_SWP, VD_LOG_MS))
+            HookLog("vd: forced SWP_NOACTIVATE hwnd=%p (pinned desktop is not current)",
+                    (void*)h);
+    }
 
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (GetPropA(h, PROP_PARKED))
@@ -1907,7 +1951,14 @@ static BOOL WINAPI Hook_SetWindowPos(HWND h, HWND after,
         /* 1) 绝不允许置顶 (HWND_NOTOPMOST 才是唯一能清 WS_EX_TOPMOST 的)。
            注意不要动 HWND_TOP: 那是"置顶到 Z 序最前", 不改变 topmost 属性,
            改掉它会把应用合法的 Z 序请求弄坏。 */
+        /* virtual desktop: pinned at the top of this function (before the
+           activation check), nothing left to do here */
         if (after == HWND_TOPMOST) {
+            if (SmallBcastNoRaise(h)) {
+                /* plain small broadcast window: freeze z-order, do not raise */
+                after = NULL;
+                flags |= SWP_NOZORDER;
+            } else
             after = HWND_NOTOPMOST;
             changed = TRUE;
         }
@@ -2091,6 +2142,22 @@ static BOOL WINAPI Hook_MoveWindow(HWND h, int x, int y, int w, int hgt, BOOL re
 static BOOL WINAPI Hook_SetWindowPlacement(HWND h, const WINDOWPLACEMENT* wp)
 {
     WINDOWPLACEMENT tmp;
+
+    /* virtual desktop: SetWindowPlacement can show *and activate* a window
+       without going through ShowWindow(), so it needs the same treatment.
+       Handled before the broadcast-window logic so the window-mode small
+       window is covered too. */
+    if (!g_disabled && wp && VD_NoActivate(h) &&
+        (wp->showCmd == SW_SHOW || wp->showCmd == SW_SHOWNORMAL ||
+         wp->showCmd == SW_SHOWDEFAULT || wp->showCmd == SW_RESTORE ||
+         wp->showCmd == SW_SHOWMAXIMIZED || wp->showCmd == SW_MAXIMIZE)) {
+        WINDOWPLACEMENT vd = *wp;
+        if (VD_LogWanted(h, VD_LOG_PLACEMENT, VD_LOG_MS))
+            HookLog("vd: SetWindowPlacement(show=%d) -> SW_SHOWNOACTIVATE hwnd=%p "
+                    "(pinned desktop is not current)", wp->showCmd, (void*)h);
+        vd.showCmd = SW_SHOWNOACTIVATE;
+        return real_SetWindowPlacement(h, &vd);
+    }
 
     if (!g_disabled && IsTargetWindow(h) && wp && IsBroadcastWindow(h)) {
         int rqW, rqH, nx, ny, nw, nh;
@@ -2279,6 +2346,24 @@ static BOOL WINAPI Hook_ShowWindow(HWND h, int cmd)
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h) && !LooksManaged(h) &&
         (cmd == SW_SHOWMAXIMIZED || cmd == SW_MAXIMIZE))
         cmd = SW_SHOWNORMAL;
+
+    /* virtual desktop: pin before the window becomes visible */
+    if (!g_disabled)
+        VD_PinNow(h, "showwindow");
+
+    /* Showing a window that lives on a virtual desktop the user is NOT looking
+       at makes the shell switch to that desktop - that is exactly the
+       "re-broadcast drags me from desktop 2 back to desktop 1" bug.
+       Such show requests lose their activate semantics only: the window still
+       shows up, the user's desktop does not move. */
+    if (!g_disabled && VD_NoActivate(h) &&
+        (cmd == SW_SHOW || cmd == SW_SHOWNORMAL || cmd == SW_SHOWDEFAULT ||
+         cmd == SW_RESTORE || cmd == SW_SHOWMAXIMIZED || cmd == SW_MAXIMIZE)) {
+        if (VD_LogWanted(h, VD_LOG_SHOW, VD_LOG_MS))
+            HookLog("vd: ShowWindow(%d) -> SW_SHOWNOACTIVATE hwnd=%p "
+                    "(pinned desktop is not current)", cmd, (void*)h);
+        cmd = SW_SHOWNOACTIVATE;
+    }
     return real_ShowWindow(h, cmd);
 }
 
@@ -2299,6 +2384,18 @@ static BOOL WINAPI Hook_ShowWindowAsync(HWND h, int cmd)
     if (!g_disabled && IsTargetWindow(h) && !ShowStateAllowed(h, cmd))
         return TRUE;
     if (!real_ShowWindowAsync) return TRUE;
+    if (!g_disabled)
+        VD_PinNow(h, "showwindowasync");
+
+    /* same as ShowWindow: no activation when the window is on another desktop */
+    if (!g_disabled && VD_NoActivate(h) &&
+        (cmd == SW_SHOW || cmd == SW_SHOWNORMAL || cmd == SW_SHOWDEFAULT ||
+         cmd == SW_RESTORE || cmd == SW_SHOWMAXIMIZED || cmd == SW_MAXIMIZE)) {
+        if (VD_LogWanted(h, VD_LOG_SHOWASYNC, VD_LOG_MS))
+            HookLog("vd: ShowWindowAsync(%d) -> SW_SHOWNOACTIVATE hwnd=%p "
+                    "(pinned desktop is not current)", cmd, (void*)h);
+        cmd = SW_SHOWNOACTIVATE;
+    }
     return real_ShowWindowAsync(h, cmd);
 }
 
@@ -2759,6 +2856,10 @@ static void PatchAllModules(void)
         PatchOne(mods[i], "user32.dll", "SetWindowsHookExW",   (void*)Hook_SetWindowsHookExW);
         PatchOne(mods[i], "kernel32.dll", "CreateProcessA",    (void*)Hook_CreateProcessA);
         PatchOne(mods[i], "kernel32.dll", "CreateProcessW",    (void*)Hook_CreateProcessW);
+        PatchOne(mods[i], "user32.dll", "CreateWindowExW",     (void*)Hook_CreateWindowExW);
+        PatchOne(mods[i], "user32.dll", "SetForegroundWindow", (void*)Hook_SetForegroundWindow);
+        PatchOne(mods[i], "user32.dll", "BringWindowToTop",    (void*)Hook_BringWindowToTop);
+        PatchOne(mods[i], "user32.dll", "SetActiveWindow",     (void*)Hook_SetActiveWindow);
     }
 }
 
@@ -3122,23 +3223,6 @@ static void SpreadSelf(void)
     CloseHandle(snap);
 }
 
-/* 强制小窗 / 恢复: 主程序只递增共享内存里的 seq 计数器，
-   这里在状态刷新时置位；真正的窗口操作仍回窗口线程。 */
-static volatile LONG g_forceOnce;
-static volatile LONG g_forceActive;
-
-/* 恢复被"收起"(隐藏)的广播窗: 枚举本进程的窗口,
-   给带 PARKED 的窗口 PostMessage(WM_BYPASS_UNPARK)。 */
-static BOOL CALLBACK UnparkEnumProc(HWND h, LPARAM lp)
-{
-    (void)lp;
-    if (h && IsWindow(h) &&
-        (GetPropA(h, PROP_PARKED) || GetPropA(h, PROP_TASKBARMIN) ||
-         (IsManaged(h) && IsIconic(h))))
-        PostMessageA(h, WM_BYPASS_UNPARK, 0, 0);
-    return TRUE;
-}
-
 /* ---------------- 共享状态 / 配置回退 ---------------- */
 
 static char* StateTrim(char* s)
@@ -3301,11 +3385,6 @@ static BOOL StateRefresh(void)
         if (!StateReadConfig(&g_stateSnap, 1)) return FALSE;
     }
 
-    if (g_stateFirst) {
-        g_lastShowSeq = g_stateSnap.show_seq;
-        g_lastSmallSeq = g_stateSnap.small_seq;
-        g_stateFirst = 0;
-    }
 
     g_stWindow = g_stateSnap.window_mode ? 1 : 0;
     g_stTitle = g_stateSnap.title_autohide ? 1 : 0;
@@ -3326,20 +3405,6 @@ static BOOL StateRefresh(void)
         g_cfgH = 0;
     }
 
-    if (!g_disabled && g_stateSnap.show_seq != g_lastShowSeq) {
-        if (g_stateSnap.show_seq > g_lastShowSeq) {
-            HookLog("show request (shared state)");
-            EnumWindows(UnparkEnumProc, 0);
-        }
-        g_lastShowSeq = g_stateSnap.show_seq;
-    }
-    if (!g_disabled && g_stateSnap.small_seq != g_lastSmallSeq) {
-        if (g_stateSnap.small_seq > g_lastSmallSeq) {
-            HookLog("force small requested (shared state)");
-            InterlockedExchange(&g_forceOnce, 1);
-        }
-        g_lastSmallSeq = g_stateSnap.small_seq;
-    }
     return TRUE;
 }
 
@@ -3371,6 +3436,19 @@ static void FixOnOwnerThread(HWND h, int force)
        才执行, 会把 WS_MINIMIZE 清掉、顺手 SetWindowPos 摆回小窗 —— 表现就是
        "最小化后自己弹回来"。 */
     if (IsIconic(h) || TaskbarMinimized(h)) return;
+    if (force == 2) {
+        /* window-mode (control-side) small broadcast window: strip the
+           WS_EX_TOPMOST it was created with; geometry stays untouched */
+        ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        if (ex & WS_EX_TOPMOST) {
+            real_SetWindowLongW(h, GWL_EXSTYLE, (LONG)(ex & ~WS_EX_TOPMOST));
+            real_SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
+                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (InterlockedIncrement(&g_fixLogs) <= 40)
+                HookLog("untopmost hwnd=%p (window-mode broadcast)", (void*)h);
+        }
+        return;
+    }
     if (!GetWindowRect(h, &r)) return;
     w  = r.right - r.left;
     hh = r.bottom - r.top;
@@ -3507,11 +3585,20 @@ static BOOL CALLBACK EnforceProc(HWND h, LPARAM lp){
 
     /* 自己进程的窗口: 一律"投递"给窗口线程, 绝不在 enforcer 线程直接改 */
     if (opid == g_pid) {
-        if (g_forceActive && IsWorthFixing(h)) {
-            PostMessageA(h, WM_BYPASS_FIX, 1, 0);
+        if (!IsWorthFixing(h) && !LooksManaged(h)) {
+            /* window-mode (control-side) small broadcast window: nothing ever
+               demotes it, so the WS_EX_TOPMOST it was created with would stay
+               forever.  Strip it on the window thread (force=2 = topmost only). */
+            {
+                char qb[64];
+                qb[0] = 0;
+                GetClassNameA(h, qb, sizeof(qb));
+                if (IsRenderWindowClass(qb) &&
+                    (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOPMOST))
+                    PostMessageA(h, WM_BYPASS_FIX, 2, 0);
+            }
             return TRUE;
         }
-        if (!IsWorthFixing(h) && !LooksManaged(h)) return TRUE;
 
         st = GetWindowLongPtrW(h, GWL_STYLE);
         ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
@@ -3594,7 +3681,7 @@ static void DumpBigWindows(void)
     char  uimg[MAX_PATH] = "?";
     char  ucls[64] = "?";
 
-    if (g_dumpRound >= 6) return;
+    if (g_dumpRound >= 2) return;
 
     DesktopName(desk, sizeof(desk));
 
@@ -3837,6 +3924,8 @@ static DWORD WINAPI Worker(LPVOID p)
        "最小化后又被 ShowWindow(SW_SHOW) 顶回来" 的根因。
        成功时把 real_* 指向 trampoline, 我们的 Hook 内部继续调用原函数。
        ⚠ 必须放在"教师端进程直接退出"之后, 否则会把教师端的 user32 也改掉。 */
+    /* virtual desktop pin: own STA thread, never COM on the renderer thread */
+    VD_Start();
     if (real_ShowWindow) {
         if (!InstallInlineHook((void*)real_ShowWindow, (void*)Hook_ShowWindow,
                                (void**)&real_ShowWindow))
@@ -3889,10 +3978,11 @@ static DWORD WINAPI Worker(LPVOID p)
         StateRefresh();
         ComputeSmallRect();
 
-        /* 广播期间反复 dump (4s/9s/14s/19s/24s/29s), 用来抓
-           "看得见桌面却点不动" 或 "画面还在满屏" 的那个窗口是谁的。 */
-        if (!off && (reps == 8 || reps == 18 || reps == 28 ||
-                     reps == 38 || reps == 48 || reps == 58))
+        /* Two dump rounds during a broadcast (4s / 19s): enough to see which
+           window covers the screen, without burying the log.  Only the
+           broadcast renderer does it - every broadcast spawns a new process,
+           and the student shell / MultiClient windows are never the culprit. */
+        if (!off && g_isBroadcastProc && (reps == 8 || reps == 38))
             DumpBigWindows();
 
         if (!off) {
@@ -3910,11 +4000,6 @@ static DWORD WINAPI Worker(LPVOID p)
             /* 用户按了"小窗化"按钮 (共享内存 seq 变化) -> 强制降级一次。
                标志要在枚举前清掉, 否则本轮枚举 + 下轮轮询会各 FORCE 一次,
                导致多闪一下。 */
-            if (InterlockedExchange(&g_forceOnce, 0)) {
-                InterlockedExchange(&g_forceActive, 1);
-                EnumWindows(EnforceProc, (LPARAM)&fixedCount);
-                InterlockedExchange(&g_forceActive, 0);
-            }
 
             if (fixedCount > 0) {
                 HookLog("enforcer fixed %d window(s)", fixedCount);

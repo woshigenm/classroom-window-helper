@@ -37,6 +37,7 @@ static const char* TARGETS[] = {
     "AudioRender.exe",
     "AudioSender.exe",
     "Student.exe",
+    "MmcStudent.exe",          /* 本机学生端界面进程 (没有 Student.exe 的版本) */
     "SharedDesktop.exe",
     "StudentScreenHelper.exe",
     "hooktest32.exe",          /* 自测载体: 只在本机测试时存在 */
@@ -137,7 +138,7 @@ static BOOL StageToLocal(const char* src, char* out, size_t outSize,
     char  dst[MAX_PATH];
     char* base;
     static const char* SWITCH[] = {
-        "bypass_config.ini", "bypass_hook.off", NULL
+        "bypass_config.ini", "bypass_vd.ini", "bypass_hook.off", NULL
     };
     int   i;
 
@@ -152,13 +153,26 @@ static BOOL StageToLocal(const char* src, char* out, size_t outSize,
     _snprintf(dst, sizeof(dst) - 1, "%s%s", dir, base);
     dst[sizeof(dst) - 1] = '\0';
 
+    /* DLL 落地。★ 已经有进程把它加载着（上次注入的残留）时 CopyFileA 会因
+       共享冲突失败 —— 但那个本地副本恰恰是能用的（映射过的 DLL 文件本身可以
+       再 LoadLibrary）。这时直接沿用旧副本，比整个注入失败强得多；
+       只有 dst 也不存在才是真的失败。 */
     if (!CopyFileA(src, dst, FALSE)) {
-        Log("[dll] 复制到本地失败: %s err=%lu", dst, (unsigned long)GetLastError());
-        return FALSE;
+        DWORD err = GetLastError();
+        if (GetFileAttributesA(dst) != INVALID_FILE_ATTRIBUTES) {
+            Log("[dll] 复制到本地失败 err=%lu, 但 %s 已存在 -> 沿用旧副本 "
+                "(可能是上一轮注入的进程还加载着它)",
+                (unsigned long)err, dst);
+        } else {
+            Log("[dll] 复制到本地失败: %s err=%lu", dst, (unsigned long)err);
+            return FALSE;
+        }
     }
 
     /* 配置/安全阀跟着走: 源目录有就复制, 没有就删掉本地旧的那份,
-       否则本地残留的 bypass_hook.off 会让钩子一直是关的 */
+       否则本地残留的 bypass_hook.off 会让钩子一直是关的。
+       ★ bypass_vd.ini 也要跟: DLL 按自己的位置找它, 少了它转存模式下
+         虚拟桌面固定会静默失效。 */
     for (i = 0; SWITCH[i]; i++) {
         char s[MAX_PATH], d[MAX_PATH];
         _snprintf(s, sizeof(s) - 1, "%.*s%s", (int)(base - src), src, SWITCH[i]);

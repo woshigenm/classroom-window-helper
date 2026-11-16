@@ -10,10 +10,7 @@
  *  「解锁键盘」        向键盘类设备发送实证控制码 0xB2008, 解除 KbFilter 的
  *                      按键拦截。首选 x64 原生 IOCTL; 失败才退回厂商
  *                      LockKeyboard.dll / 32 位 rundll32 代理。
- *
- *  「解除黑屏」        终止黑屏进程 -> 关闭锁定桌面 "MCLOCK Desktop" ->
- *                      SwitchDesktop 切回 "Default" -> 解锁键盘。
- *                      (实测黑屏时键盘同时被锁, 所以这里一定要连带解锁。)
+ *                      （只有手动入口：点「解锁键盘」按钮；自动解锁已移除。）
  *
  *  「结束课堂进程」    按"先看守、后主体"的顺序终止课堂客户端, 否则主体会被
  *                      看守进程重新拉起:
@@ -25,39 +22,25 @@
  *                      OeNetLimit 服务, 并从键盘类 UpperFilters 里移除 KbFilter。
  *                      (只删服务不删 UpperFilters, 重启后系统仍会加载该驱动。)
  *
- *  「改写配置文件」    把 skin\core.conf 里的 LockedAfterNetBroken / LockSeat /
- *                      Limit 三个键改成 0。二进制读写、保留原 CRLF、先备份、
- *                      写临时文件后原子替换。
+ *  「持续保持小窗」    主开关。开 = 注入 DLL 并持续压制广播窗; 关 = 写
+ *                      bypass_hook.off 放行。小窗化本身由 DLL + 后台监视完成。
  *
- *  「一键全部执行」    依次执行: 提权 -> 清自启动 -> 结束进程 -> 解除黑屏/解锁
- *                      键盘 -> 改写配置 -> 卸载驱动 -> 小窗化广播窗口 -> 复查。
+ *  --silent            无人值守模式: 依次执行 提权 -> 清自启动 -> 结束进程 ->
+ *                      卸载驱动 -> 小窗化 -> 复查 (内部走 AutoAllCore)。
  *
- *  「实时解锁监控」    开关式。每 200ms 检查一次, 若发现锁定桌面或课堂进程复活,
- *                      自动切回 Default + 发解锁码 + 重杀。关闭后不再消耗资源。
- *
- *  「小窗化广播窗口」  先"根治", 再"补刀"。
- *                      1) 根治: 把 bypass_hook32.dll 注入 MultiRender / ScreenRender /
- *                         MultiClient 等渲染进程, 用 IAT hook 改掉它们自己的
- *                         SetWindowPos / SetWindowLong / MoveWindow / ShowWindow:
+ *  「小窗化」          主开关是「持续保持小窗」。开 = 注入 bypass_hook32.dll 并持续压制满屏窗口；
+ *                      关 = 写 bypass_hook.off，已注入的 DLL 2 秒内全部放行（不必重启渲染进程）。
+ *                      机制:
+ *                      1) 根治: 把 DLL 注入 MultiRender / ScreenRender / MultiClient 等渲染进程,
+ *                         用 IAT hook 改掉它们自己的 SetWindowPos / SetWindowLong /
+ *                         MoveWindow / ShowWindow:
  *                           - HWND_TOPMOST 一律改成 HWND_NOTOPMOST
  *                           - 尺寸超过屏幕 2/3 的一律改成右下角小窗
  *                           - 样式里的 WS_POPUP / WS_MAXIMIZE 一律抹掉
- *                         窗口从创建那一刻就是小窗, 渲染器自己算的客户区也小,
- *                         所以不会出现"我们 200ms 抢一次 -> 它改回去"的黑闪。
- *                      2) 补刀: 对注入之前就已经存在的窗口做一次降级
- *                         (去置顶、加标题栏边框、缩到右下角, 屏幕宽度 1/3),
- *                         并回读验证; 之后由 WinEvent 钩子 + 自适应轮询兜底,
- *                         已经在目标形态的窗口不会再被碰。
- *                      3) 若点击时正处于私有桌面 "NetTeachingDesktop", 先切回
- *                         用户桌面 (之后的持续监视不会再自动切桌面: 实测那会
- *                         与 MultiClient 反复抢 SwitchDesktop, 表现为黑屏闪动)。
- *                      同时预设"禁用全屏优化", 让独占全屏的渲染进程下次启动
- *                      后能被正常降级。
- *
- *  「持续保持小窗」    上面那套机制的总开关。
- *                      开 = 删 bypass_hook.off, 注入 DLL 并持续压制满屏窗口;
- *                      关 = 写 bypass_hook.off, 已注入的 DLL 2 秒内全部放行
- *                          (不必重启渲染进程), 同时停掉监视线程。
+ *                         窗口从创建那一刻就是小窗, 所以不会出现"抢一次 -> 它改回去"的黑闪。
+ *                      2) 补刀: 对注入之前就已经存在的窗口做一次降级(去置顶/加边框/缩到 1/3),
+ *                         并回读验证; 之后由 WinEvent 钩子 + 自适应轮询兜底。
+ *                      3) 预设"禁用全屏优化", 让独占全屏的渲染进程下次启动后能被降级。
  *
  *  「检查当前状态」    只读诊断: 管理员权限 / 驱动服务 / 关键进程状态 /
  *                      core.conf 的三个控制键 (含 View 实时值) / 当前输入桌面 /
@@ -72,19 +55,18 @@
  *   4.  UI 全局与按钮定义   BTNDEF 表 = 标签 + 一句话说明 + 配色
  *   5.  工具函数            提权、线程安全日志、进程枚举、路径探测
  *   6.  键盘解锁            KbFilter 控制码 + LockKeyboard.dll 兜底
- *   7.  黑屏解除            MCLOCK Desktop / SwitchDesktop
+ *   7.  桌面守护            MCLOCK Desktop / SwitchDesktop
  *   8.  进程终止            按看守->主体顺序
  *   9.  驱动卸载            服务 + 键盘类 UpperFilters 清理
- *   10. 配置改写            core.conf 二进制安全改写
- *   11. 自启动清理          Run/RunOnce 按"值内容"匹配
- *   12. 状态检查 / 一键执行
- *   13. 广播窗口小窗化      Tier1.5 禁用全屏优化 + Tier1 分级降级 + 回读验证
- *   14. 监控线程
- *   15. UI 绘制与消息处理
+ *   10. 自启动清理          Run/RunOnce 按"值内容"匹配
+ *   11. 状态检查            只读诊断
+ *   12. 广播窗口小窗化      Tier1.5 禁用全屏优化 + Tier1 分级降级 + 回读验证
+ *   13. 后台线程
+ *   14. UI 绘制与消息处理
  *
  * 命令行:
  *   bypass.exe                GUI 模式
- *   bypass.exe /auto          GUI 模式, 启动后自动跑一次"一键全部执行"
+ *   bypass.exe /auto          GUI 模式, 启动后自动跑一次自动流程
  *   bypass.exe /silent        静默模式 (无界面)
  *   bypass.exe /silent /auto  静默模式完整执行
  *
@@ -118,6 +100,7 @@
 #include <stddef.h>
 
 #include "bypass_state.h"
+#include "elevate.h"
 
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
@@ -150,26 +133,17 @@
 
 /* 控件ID */
 #define ID_BTN_UNLOCK_KB    1001
-#define ID_BTN_RELEASE_BS   1002
 #define ID_BTN_KILL_PROC    1003
 #define ID_BTN_UNINSTALL    1004
-#define ID_BTN_MODIFY_CFG   1005
-#define ID_BTN_AUTO_ALL     1006
 #define ID_BTN_CHECK_STATUS 1007
 #define ID_BTN_EXIT         1009
-#define ID_BTN_MONITOR      1011
-#define ID_BTN_SMALLWIN     1014
 #define ID_BTN_SMALLSTICKY  1015
 #define ID_CHK_TRAY         1020    /* 广播窗最小化: 任务栏(真最小化) / 收起(托盘) */
 #define ID_LOG_OUTPUT       1100
 #define ID_STATUS_BAR       1200
 #define ID_lblStatus        1201
 #define ID_HOTKEY_ESCAPE    1300    /* 全局热键 Ctrl+Alt+X: 鼠标被冻结时的逃生口 */
-#define ID_HOTKEY_UNLOCK    1301    /* Ctrl+Alt+K 解锁键盘 */
-#define ID_HOTKEY_BLACKSCR  1302    /* Ctrl+Alt+B 解除黑屏 */
-#define ID_HOTKEY_SMALLWIN  1303    /* Ctrl+Alt+S 小窗化广播窗口 */
 #define ID_HOTKEY_STICKY    1304    /* Ctrl+Alt+T 持续保持小窗 (开关) */
-#define ID_HOTKEY_MONITOR   1305    /* Ctrl+Alt+M 实时解锁监控 (开关) */
 #define ID_HOTKEY_QUIT      1306    /* Ctrl+Alt+Q 退出 */
 #define ID_HOTKEY_PANEL     1307    /* Ctrl+Alt+H 显示/隐藏主面板 */
 #define ID_HOTKEY_DESKTOP   1308    /* Ctrl+Alt+D 立即切回 Default 桌面 */
@@ -179,9 +153,10 @@
 /* 托盘 */
 #define WM_TRAYICON         (WM_APP + 2)
 #define TRAY_ICON_ID        1
+#define TRAY_RETRY_MAX      20      /* NIM_ADD 失败后最多重试次数 */
+#define TRAY_RETRY_MS       500     /* 重试间隔 */
+#define IDT_TRAY_RETRY      0x52    /* 托盘图标重试定时器 (0x51 被 demote recheck 占用) */
 #define IDM_TRAY_SHOW       2001
-#define IDM_TRAY_SMALLWIN   2002
-#define IDM_TRAY_RELEASE_BS 2003
 #define IDM_TRAY_UNLOCK     2004
 #define IDM_TRAY_ABOUT      2005
 #define IDM_TRAY_EXIT       2006
@@ -194,6 +169,7 @@
 #define TITLEBAR_H      40      /* custom title bar height */
 #define UI_PAD          16      /* content padding */
 #define BTN_W           162     /* standard button width */
+#define BTN2_W          (2 * BTN_W + BTN_GAP)  /* wide button: spans two columns */
 #define BTN_H           42      /* standard button height */
 #define BTN_GAP         10      /* gap between buttons */
 #define BTN_RADIUS      8       /* rounded corner radius */
@@ -201,9 +177,9 @@
 
 #define ROW1_Y          78      /* button row 1 y */
 #define ROW2_Y          130     /* button row 2 y */
-#define AUTO_Y          182     /* AUTO ALL button y */
-#define LOGLBL_Y        242     /* log label y */
-#define LOG_Y           268     /* log area y */
+#define CHK_Y           184     /* "broadcast minimize" checkbox y */
+#define LOGLBL_Y        222     /* log label y */
+#define LOG_Y           246     /* log area y */
 
 #define UI_BG           RGB(24, 26, 32)      /* window background */
 #define UI_TITLE_BG     RGB(18, 20, 26)      /* title bar background */
@@ -355,16 +331,10 @@ static DWORD g_uiThreadId = 0;
 static DWORD g_workingIoctl = 0;
 
 /* 监控线程 */
-static HANDLE g_hMonitorThread = NULL;
-static volatile BOOL g_monitorRunning = FALSE;
-static int g_monitorCount = 0;
 
 /* 广播窗口小窗化 */
 static volatile BOOL g_smallWinRun = FALSE;
 static HANDLE g_hSmallWinThread = NULL;
-
-/* 广播被小窗化之后自动解锁键盘 (0xB2008) 的节流时间戳 */
-static volatile LONG g_lastAutoUnlock = 0;
 
 /* ========== UI globals ========== */
 
@@ -377,7 +347,7 @@ static volatile LONG g_lastAutoUnlock = 0;
  *    desc : 一句话功能说明。鼠标停在按钮上时显示在界面右下角状态区
  *           (见 SetHoverHint / WM_PAINT), 是"这个按钮到底干什么"的权威来源。
  *    base/hv/dn : 正常 / 悬停 / 按下 三种底色
- *    bold : 是否用粗体字 (仅"一键全部执行")
+ *    bold : 是否用粗体字 (仅"退出")
  * ========================================================================== */
 typedef struct {
     int            id;
@@ -395,31 +365,21 @@ typedef struct {
     BOOL hover;
 } BTNSTATE;
 
-/* 按钮顺序 = 界面上的排列顺序。每行 4 个, 与 CreateControls 的布局一致。 */
+/* 按钮顺序 = 界面上的排列顺序。每行 2 个, 与 CreateControls 的布局一致。 */
 static const BTNDEF g_btnDefs[] = {
-    /* ---- 第 1 行: 即时响应 (每一次都会用到) ---- */
+    /* ---- 第 1 行: 即时响应 ---- */
     { ID_BTN_UNLOCK_KB,   L"解锁键盘", L"发解锁码 0xB2008, 解除 KbFilter 的键盘拦截",
-      UI_ACCENT,      UI_ACCENT_HV,  UI_ACCENT_DN,  0, L"Ctrl+Alt+K" },
-    { ID_BTN_RELEASE_BS,  L"解除黑屏", L"结束黑屏进程并切回 Default 桌面, 同时解锁键盘",
-      RGB(216,118,0), RGB(232,146,0), RGB(180,98,0), 0, L"Ctrl+Alt+B" },
+      UI_ACCENT,      UI_ACCENT_HV,  UI_ACCENT_DN,  0, NULL },
     { ID_BTN_KILL_PROC,   L"结束课堂进程", L"按住看守->主体顺序结束课堂各进程",
       UI_DANGER,      UI_DANGER_HV,  UI_DANGER_DN,  0, NULL },
-    { ID_BTN_MONITOR,     L"实时解锁监控", L"每 200ms 复查, 锁定/复活时自动解锁重杀 (开关)",
-      UI_GRAY_BTN,    UI_GRAY_HV,    UI_GRAY_DN,    0, L"Ctrl+Alt+M" },
 
     /* ---- 第 2 行: 持久化改动 + 投屏小窗化 ---- */
     { ID_BTN_UNINSTALL,   L"卸载过滤驱动", L"停删 KbFilter 等驱动服务并清键盘类 UpperFilters",
       RGB(150,30,60), RGB(180,50,80), RGB(118,20,46), 0, NULL },
-    { ID_BTN_MODIFY_CFG,  L"改写配置文件", L"把 core.conf 的 3 个控制键改为 0",
-      RGB(0,150,136), RGB(0,176,160), RGB(0,118,106), 0, NULL },
-    { ID_BTN_SMALLWIN,    L"小窗化/显示广播", L"小窗化广播窗口; 若已用最小化收起, 则恢复显示",
-      UI_ACCENT,  UI_ACCENT_HV,  UI_ACCENT_DN,  0, L"Ctrl+Alt+S" },
     { ID_BTN_SMALLSTICKY, L"持续保持小窗", L"开关: 开=注入并持续压制; 关=写 bypass_hook.off 全部放行",
       UI_GRAY_BTN,    UI_GRAY_HV,    UI_GRAY_DN,    0, L"Ctrl+Alt+T" },
 
-    /* ---- 底部整行按钮 (不参与网格布局) ---- */
-    { ID_BTN_AUTO_ALL,    L"一键全部执行", L"依次执行全部解除动作 (通常先点这个)",
-      UI_SUCCESS, UI_SUCCESS_HV, UI_SUCCESS_DN, 1, NULL },
+    /* ---- 底部按钮 (不参与网格布局) ---- */
     { ID_BTN_CHECK_STATUS,L"检查当前状态", L"只读诊断: 权限/驱动/进程/配置/当前桌面",
       UI_GRAY_BTN,    UI_GRAY_HV,    UI_GRAY_DN,    0, NULL },
     { ID_BTN_EXIT,        L"退出",     L"退出程序 (不会解除当前锁定状态)",
@@ -483,11 +443,8 @@ void UpdateStatus(HWND hwnd, const char* status);
 void SafeLog(const char* fmt, ...);
 
 BOOL UnlockKeyboard(HWND hwnd);
-BOOL ReleaseBlackScreen(HWND hwnd);
 BOOL KillControlProcesses(HWND hwnd);
 BOOL UninstallDriver(HWND hwnd);
-BOOL ModifyConfig(HWND hwnd);
-BOOL AutoAll(HWND hwnd);
 BOOL CheckStatus(HWND hwnd);
 
 BOOL KillProcessByName(const char* name);
@@ -495,9 +452,6 @@ BOOL IsProcessRunning(const char* name);
 BOOL IsDriverInstalled(void);
 BOOL IsUserAnAdmin(void);
 
-DWORD WINAPI MonitorThreadProc(LPVOID lpParam);
-void StartMonitor(HWND hwnd);
-void StopMonitor(HWND hwnd);
 static BOOL FindSoftwareFile(const char* relName, char* outPath, DWORD size);
 
 /* broadcast small-window */
@@ -505,9 +459,7 @@ static int SmallWindowBroadcastCore(HWND hwndLog, BOOL quiet);
 static int PresetFullscreenDowngrade(HWND hwndLog, BOOL quiet);
 void StartSmallWin(HWND hwnd);
 void StopSmallWin(HWND hwnd);
-void OnSmallWin(HWND hwnd);
 void OnSmallStickyToggle(HWND hwnd);
-void OnReleaseBlackScreen(HWND hwnd);
 
 /* UI helpers */
 static void CreateUIFonts(void);
@@ -528,6 +480,8 @@ static void StateInit(void);
 static HICON g_trayIcon;
 static BOOL  g_trayAdded;
 static BOOL  g_trayBalloonShown;
+static UINT  g_msgTaskbarCreated;   /* Explorer 重启广播 (RegisterWindowMessage) */
+static int   g_trayRetries;         /* NIM_ADD 失败次数 */
 static void TrayAdd(HWND hwnd);
 static void TrayRemove(HWND hwnd);
 static void TrayUpdateTip(HWND hwnd, const wchar_t* tip);
@@ -546,7 +500,7 @@ BOOL IsUserAnAdmin(void) {
     BOOL isAdmin = FALSE;
     PSID adminGroup = NULL;
     SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
-    
+
     if (AllocateAndInitializeSid(&ntAuth, 2,
         SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
         0, 0, 0, 0, 0, 0, &adminGroup)) {
@@ -631,7 +585,7 @@ void AppendLog(HWND hwnd, const char* fmt, ...) {
     if (hwnd == NULL) return;
 
     /* 工作线程不得直接 SendMessage 到 UI 控件: 若 UI 线程正阻塞在
-       StopMonitor/StopSmallWin 的 WaitForSingleObject 上, 双方会死锁。
+       StopSmallWin 的 WaitForSingleObject 上, 双方会死锁。
        非 UI 线程统一改走 PostMessage 队列 (由 WndProc 的 WM_APP+1 处理)。 */
     if (g_uiThreadId != 0 && GetCurrentThreadId() != g_uiThreadId) {
         char* copy = (char*)malloc(strlen(buffer) + 1);
@@ -774,66 +728,7 @@ BOOL KillProcessByName(const char* name) {
     return found;
 }
 
-/* 整条广播链的进程名 —— 监控线程每 200ms 要查一遍。
-   旧写法对每个名字各建一次进程快照 (10 个名字 = 每次 10 次快照),
-   在 200ms 轮询下开销很可观; 这里统一成"一次快照查全部"。 */
-static const char* kTeachingProcs[] = {
-    "BlackSlient.exe", "Student.exe", "MultiClient.exe", "ScreenRender.exe",
-    "MultiRender.exe", "AudioRender.exe", "AudioSender.exe",
-    "ScreenSender.exe", "SharedDesktop.exe", "StudentScreenHelper.exe",
-    NULL
-};
-
 /* 一次快照收集所有在跑的课堂进程, 返回数量 */
-static int CollectTeachingPids(DWORD* pids, int max) {
-    HANDLE snapshot;
-    PROCESSENTRY32 pe;
-    int n = 0, k;
-
-    if (!pids || max <= 0) return 0;
-
-    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return 0;
-
-    pe.dwSize = sizeof(pe);
-    if (Process32First(snapshot, &pe)) {
-        do {
-            for (k = 0; kTeachingProcs[k]; k++) {
-                if (_stricmp(pe.szExeFile, kTeachingProcs[k]) == 0) {
-                    if (n < max) pids[n++] = pe.th32ProcessID;
-                    break;
-                }
-            }
-        } while (Process32Next(snapshot, &pe));
-    }
-    CloseHandle(snapshot);
-    return n;
-}
-
-BOOL KillTeachingProcesses(void) {
-    DWORD pids[64];
-    int   npid, i;
-    BOOL  found = FALSE;
-
-    npid = CollectTeachingPids(pids, 64);
-
-    for (i = 0; i < npid; i++) {
-        HANDLE hProcess = OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
-            FALSE, pids[i]);
-        if (!hProcess) {
-            EnablePrivilege("SeDebugPrivilege");
-            hProcess = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pids[i]);
-        }
-        if (hProcess) {
-            if (TerminateProcess(hProcess, 0)) found = TRUE;
-            WaitForSingleObject(hProcess, 3000);
-            CloseHandle(hProcess);
-        }
-    }
-    return found;
-}
-
 /* 检查进程是否存在 */
 BOOL IsProcessRunning(const char* name) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1073,32 +968,6 @@ static BOOL UnlockKeyboardByIoctl(HWND hwnd) {
     return okd;
 }
 
-/* 监控循环专用: 只发实证解锁码, 不产生日志/不启动 rundll32 (避免每秒拉一个进程) */
-BOOL UnlockKeyboardQuiet(void) {
-    BOOL ok0 = SendKeyboardIoctl(L"\\Device\\KeyboardClass0", IOCTL_KEYBOARD_ALL_RELEASE, NULL);
-    BOOL ok1 = SendKeyboardIoctl(L"\\Device\\KeyboardClass1", IOCTL_KEYBOARD_ALL_RELEASE, NULL);
-    BOOL ok  = ok0 || ok1;
-    DWORD e  = 0;
-    if (!ok) ok = SendKeyboardIoctl(NULL, IOCTL_KEYBOARD_ALL_RELEASE, &e);
-    CleanupKbdDosDevice();
-    if (ok) g_workingIoctl = IOCTL_KEYBOARD_ALL_RELEASE;
-    return ok;
-}
-
-/* 广播被小窗化之后自动解锁键盘。
-   课堂软件在广播开始时经常顺手锁键盘/键鼠, 用户此时点按钮也不方便。
-   "全屏广播已经变成我们的小窗" 是明确的接管信号, 这时补发一次 0xB2008。
-   IOCTL 是幂等的, 但为了不反复 DefineDosDevice / 刷日志, 3 秒内最多一次。
-   返回值: 1=本次发送成功, 0=本次发送失败, -1=3 秒内已发过(本次跳过)。 */
-int AutoUnlockAfterSmallWin(void) {
-    DWORD now  = GetTickCount();
-    DWORD last = (DWORD)InterlockedCompareExchange(&g_lastAutoUnlock, 0, 0);
-
-    if (last && (DWORD)(now - last) < 3000) return -1;
-    InterlockedExchange(&g_lastAutoUnlock, (LONG)now);
-    return UnlockKeyboardQuiet() ? 1 : 0;
-}
-
 /* 解锁键盘 - 主函数
    顺序已调整: 先走"实证 IOCTL"(x64 原生, 无外部依赖, 也不会拉起 rundll32),
    失败后才退回厂商 LockKeyboard.dll / 32 位 rundll32 代理。 */
@@ -1152,125 +1021,6 @@ static BOOL IsLockDesktopActive(void) {
     char name[128];
     if (!GetInputDesktopName(name, sizeof(name))) return FALSE;
     return (_stricmp(name, LOCK_DESKTOP_NAME) == 0);
-}
-
-static BOOL SwitchToDefaultDesktop(HWND hwnd) {
-    /* 实证: 锁定桌面 "MCLOCK Desktop" 与 "Default" 同属窗口站 WinSta0,
-       所以本进程直接 SwitchDesktop 回 Default 是可行的 (无需被锁进程配合)。 */
-    const char* desktopNames[] = {
-        DEFAULT_DESKTOP_NAME,
-        "Winlogon",
-        NULL
-    };
-
-    for (int i = 0; desktopNames[i]; i++) {
-        HDESK hDesk = OpenDesktop(desktopNames[i], 0, FALSE,
-            DESKTOP_SWITCHDESKTOP | DESKTOP_READOBJECTS);
-        if (hDesk) {
-            BOOL result = SwitchDesktop(hDesk);
-            CloseDesktop(hDesk);
-            if (result) {
-                char cur[128];
-                GetInputDesktopName(cur, sizeof(cur));
-                AppendLog(hwnd, "[BlackScreen] Switched to '%s' (input desktop now '%s')\r\n",
-                          desktopNames[i], cur);
-                return TRUE;
-            }
-            AppendLog(hwnd, "[BlackScreen] SwitchDesktop('%s') failed (err=%lu)\r\n",
-                      desktopNames[i], GetLastError());
-        }
-    }
-    return FALSE;
-}
-
-/* 关闭残留的锁定桌面句柄 (实证名: MCLOCK Desktop) */
-static void CloseLockDesktops(HWND hwnd) {
-    const char* lockDesktops[] = {
-        LOCK_DESKTOP_NAME,
-        "FarLock",
-        NULL
-    };
-
-    for (int i = 0; lockDesktops[i]; i++) {
-        HDESK hDesk = OpenDesktop(lockDesktops[i], 0, FALSE, DESKTOP_READOBJECTS);
-        if (hDesk) {
-            AppendLog(hwnd, "[BlackScreen] Found lock desktop '%s'\r\n", lockDesktops[i]);
-            CloseDesktop(hDesk);
-        }
-    }
-}
-
-/* 监控循环专用: 只在检测到锁定桌面/键盘被锁时做最小动作, 做完即返回是否干预过 */
-BOOL EnforceUnlockQuiet(void) {
-    BOOL acted = FALSE;
-
-    if (IsLockDesktopActive()) {
-        HDESK hDesk = OpenDesktopA(DEFAULT_DESKTOP_NAME, 0, FALSE,
-                                   DESKTOP_SWITCHDESKTOP | DESKTOP_READOBJECTS);
-        if (hDesk) {
-            if (SwitchDesktop(hDesk)) acted = TRUE;
-            CloseDesktop(hDesk);
-        }
-    }
-
-    /* 键盘解锁码是幂等的: 重复发送 0xB2008 无副作用, 但能盖掉对方刚发的锁码 */
-    if (UnlockKeyboardQuiet()) acted = TRUE;
-
-    return acted;
-}
-
-BOOL ReleaseBlackScreen(HWND hwnd) {
-    AppendLog(hwnd, "\r\n[BlackScreen] Releasing black screen...\r\n");
-    UpdateStatus(hwnd, "Status: Releasing black screen...");
-
-    BOOL success = FALSE;
-
-    /* 终止 BlackSlient.exe (实测它是黑屏表现层) */
-    AppendLog(hwnd, "[BlackScreen] Terminating BlackSlient.exe...\r\n");
-    if (KillProcessByName("BlackSlient.exe")) {
-        AppendLog(hwnd, "[BlackScreen] BlackSlient.exe terminated\r\n");
-        success = TRUE;
-    } else {
-        AppendLog(hwnd, "[BlackScreen] BlackSlient.exe not found or already terminated\r\n");
-    }
-
-    /* 终止其他可能的锁定进程 */
-    KillProcessByName("ScreenRender.exe");
-    KillProcessByName("MultiRender.exe");
-
-    /* 关闭锁定桌面 */
-    CloseLockDesktops(hwnd);
-
-    /* 切回默认桌面 (锁定桌面与 Default 同窗口站, 直接切即可) */
-    AppendLog(hwnd, "[BlackScreen] Switching to default desktop...\r\n");
-    if (SwitchToDefaultDesktop(hwnd)) {
-        AppendLog(hwnd, "[BlackScreen] Desktop switched successfully\r\n");
-        success = TRUE;
-    } else if (!IsLockDesktopActive()) {
-        AppendLog(hwnd, "[BlackScreen] No lock desktop active (already released)\r\n");
-        success = TRUE;
-    } else {
-        AppendLog(hwnd, "[BlackScreen] SwitchDesktop failed, trying Win+D...\r\n");
-        keybd_event(VK_LWIN, 0, 0, 0);
-        keybd_event('D', 0, 0, 0);
-        keybd_event('D', 0, KEYEVENTF_KEYUP, 0);
-        keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
-        Sleep(500);
-    }
-
-    /* 解锁键盘: 直接发实证解锁码 0xB2008 */
-    AppendLog(hwnd, "[BlackScreen] Unlocking keyboard...\r\n");
-    UnlockKeyboard(hwnd);
-
-    if (success) {
-        AppendLog(hwnd, "[BlackScreen] Black screen released successfully!\r\n");
-        UpdateStatus(hwnd, "Status: Black screen released");
-    } else {
-        AppendLog(hwnd, "[BlackScreen] Black screen release completed (partial)\r\n");
-        UpdateStatus(hwnd, "Status: Black screen release completed");
-    }
-
-    return success;
 }
 
 /* ========== 进程终止函数 ========== */
@@ -1600,7 +1350,7 @@ static BOOL GetProcessPath(DWORD pid, char* outPath, DWORD size) {
 /* 从运行中的控制进程反推软件安装目录 */
 static BOOL FindDirFromProcesses(char* outDir, DWORD size) {
     static const char* procNames[] = {
-        "Student.exe", "Teacher.exe", "BlackSlient.exe",
+        "Student.exe", "MmcStudent.exe", "Teacher.exe", "BlackSlient.exe",
         "MultiClient.exe", "ScreenSender.exe", "ScreenRender.exe",
         "DriverInstall.exe", "Ctsc_Multi.exe", NULL
     };
@@ -1905,160 +1655,6 @@ static const char* CONFIG_KEYS_TO_ZERO[] = {
     NULL
 };
 
-BOOL ModifyConfig(HWND hwnd) {
-    AppendLog(hwnd, "\r\n[Config] Modifying configuration...\r\n");
-    UpdateStatus(hwnd, "Status: Modifying config...");
-    
-    /* 查找配置文件 */
-    char configPath[MAX_PATH];
-    if (!FindSoftwareFile("skin\\core.conf", configPath, sizeof(configPath))) {
-        AppendLog(hwnd, "[Config] ERROR: Config file not found\r\n");
-        UpdateStatus(hwnd, "Status: Config file not found");
-        return FALSE;
-    }
-    
-    AppendLog(hwnd, "[Config] Config path: %s\r\n", configPath);
-    
-    /* 二进制方式读取: 用文本模式会把 CRLF 折叠成 LF, 写回时再统一展开,
-       从而破坏原文件的换行风格。 */
-    FILE* file = fopen(configPath, "rb");
-    if (!file) {
-        AppendLog(hwnd, "[Config] ERROR: Cannot open config file (err=%lu)\r\n", GetLastError());
-        UpdateStatus(hwnd, "Status: Cannot open config file");
-        return FALSE;
-    }
-    
-    fseek(file, 0, SEEK_END);
-    long fileSize = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    if (fileSize <= 0 || fileSize > 8 * 1024 * 1024) {
-        fclose(file);
-        AppendLog(hwnd, "[Config] ERROR: Unexpected config size (%ld)\r\n", fileSize);
-        return FALSE;
-    }
-
-    char* content = (char*)malloc((size_t)fileSize + 1);
-    if (!content) {
-        fclose(file);
-        AppendLog(hwnd, "[Config] ERROR: Memory allocation failed\r\n");
-        return FALSE;
-    }
-    size_t got = fread(content, 1, (size_t)fileSize, file);
-    content[got] = '\0';
-    fclose(file);
-
-    /* 输出缓冲区: 改写只会把值替换成 "0", 不会变长很多, 2 倍余量足够 */
-    size_t need = got * 2 + 64;
-    char* out = (char*)malloc(need);
-    if (!out) {
-        free(content);
-        AppendLog(hwnd, "[Config] ERROR: Memory allocation failed\r\n");
-        return FALSE;
-    }
-    out[0] = '\0';
-
-    size_t outLen = 0;
-    int    changed = 0;
-    const char* p = content;
-
-    while (*p) {
-        const char* nl = strchr(p, '\n');
-        size_t lineLen = nl ? (size_t)(nl - p) + 1 : strlen(p);
-        BOOL replaced = FALSE;
-
-        for (int k = 0; CONFIG_KEYS_TO_ZERO[k] && !replaced; k++) {
-            const char* key  = CONFIG_KEYS_TO_ZERO[k];
-            size_t      klen = strlen(key);
-            const char* vstart;
-            const char* vend;
-            size_t      remLen;
-
-            if (lineLen < klen + 3) continue;
-            if (p[0] != '/' || _strnicmp(p + 1, key, klen) != 0) continue;
-
-            vstart = p + 1 + klen;
-            if (*vstart != '/') continue;      /* 必须是完整键名, 不能是前缀 */
-            vstart++;
-
-            vend = NULL;
-            for (const char* q = vstart; q < p + lineLen; q++) {
-                if (*q == '/') { vend = q; break; }
-            }
-            if (!vend) continue;
-
-            if (outLen + lineLen + 16 >= need) break;   /* 异常文件, 保守退出 */
-
-            remLen = (size_t)((p + lineLen) - (vend + 1));
-            outLen += (size_t)snprintf(out + outLen, need - outLen, "/%s/0/", key);
-            memcpy(out + outLen, vend + 1, remLen);     /* 原样保留行尾 (CRLF) */
-            outLen += remLen;
-            out[outLen] = '\0';
-
-            AppendLog(hwnd, "[Config] %s -> 0\r\n", key);
-            changed++;
-            replaced = TRUE;
-            p += lineLen;
-        }
-
-        if (!replaced) {
-            if (outLen + lineLen + 1 >= need) break;
-            memcpy(out + outLen, p, lineLen);
-            outLen += lineLen;
-            out[outLen] = '\0';
-            p += lineLen;
-        }
-    }
-
-    free(content);
-
-    if (changed == 0) {
-        free(out);
-        AppendLog(hwnd, "[Config] Nothing to change (keys already 0 or not present)\r\n");
-        UpdateStatus(hwnd, "Status: Config already clean");
-        return TRUE;
-    }
-
-    /* 备份: 只在不存在备份时创建, 避免用已被改过的内容覆盖最初的原始文件 */
-    char backupPath[MAX_PATH];
-    snprintf(backupPath, sizeof(backupPath), "%s.bak", configPath);
-    if (GetFileAttributes(backupPath) == INVALID_FILE_ATTRIBUTES) {
-        if (CopyFileA(configPath, backupPath, FALSE)) {
-            AppendLog(hwnd, "[Config] Backup created: %s\r\n", backupPath);
-        } else {
-            AppendLog(hwnd, "[Config] WARNING: backup failed (err=%lu)\r\n", GetLastError());
-        }
-    } else {
-        AppendLog(hwnd, "[Config] Backup already exists (original kept): %s\r\n", backupPath);
-    }
-
-    /* 原子写回: 先写临时文件, 再替换, 避免写一半时文件损坏 */
-    char tmpPath[MAX_PATH];
-    snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", configPath);
-
-    file = fopen(tmpPath, "wb");
-    if (!file) {
-        free(out);
-        AppendLog(hwnd, "[Config] ERROR: Cannot write temp file (err=%lu)\r\n", GetLastError());
-        UpdateStatus(hwnd, "Status: Cannot write config file");
-        return FALSE;
-    }
-    fwrite(out, 1, outLen, file);
-    fclose(file);
-    free(out);
-
-    if (!MoveFileExA(tmpPath, configPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        AppendLog(hwnd, "[Config] ERROR: replace failed (err=%lu)\r\n", GetLastError());
-        DeleteFileA(tmpPath);
-        UpdateStatus(hwnd, "Status: Config replace failed");
-        return FALSE;
-    }
-
-    AppendLog(hwnd, "[Config] Configuration modified successfully (%d key(s))\r\n", changed);
-    UpdateStatus(hwnd, "Status: Config modified");
-    
-    return TRUE;
-}
-
 /* ========== 状态检查函数 ========== */
 
 BOOL CheckStatus(HWND hwnd) {
@@ -2124,7 +1720,7 @@ BOOL CheckStatus(HWND hwnd) {
 /* 一键绕过核心 (不含弹窗, 可被线程调用) */
 static BOOL AutoAllCore(HWND hwnd) {
     AppendLog(hwnd, "\r\n========================================\r\n");
-    AppendLog(hwnd, "  AUTO ALL: Starting complete bypass...\r\n");
+    AppendLog(hwnd, "  AUTO BYPASS: Starting...\r\n");
     AppendLog(hwnd, "========================================\r\n");
 
     UpdateStatus(hwnd, "Status: Auto bypass in progress...");
@@ -2140,51 +1736,26 @@ static BOOL AutoAllCore(HWND hwnd) {
     KillControlProcesses(hwnd);
     Sleep(500);
 
-    /* 3. 解除黑屏 + 解锁键盘 (实证: 桌面 MCLOCK Desktop + IOCTL 0xB2008) */
-    ReleaseBlackScreen(hwnd);
-    Sleep(500);
-
-    /* 4. 修改配置 (LockedAfterNetBroken / LockSeat / Limit -> 0) */
-    ModifyConfig(hwnd);
-
-    /* 5. 卸载驱动 (含键盘类 UpperFilters 清理) */
+    /* 3. 卸载驱动 (含键盘类 UpperFilters 清理) */
     UninstallDriver(hwnd);
     Sleep(500);
 
-    /* 6. 广播窗口小窗化 (静默) —— 先预设 T1.5 禁用全屏优化, 再做窗口层降级 */
+    /* 4. 广播窗口小窗化 (静默) —— 先预设 T1.5 禁用全屏优化, 再做窗口层降级 */
     PresetFullscreenDowngrade(hwnd, TRUE);
     SmallWindowBroadcastCore(hwnd, TRUE);
 
-    /* 7. 收尾: 再看一眼是否被看守进程拉回来 / 被重新锁屏 */
+    /* 5. 收尾: 再看一眼是否被看守进程拉回来 */
     Sleep(300);
     if (IsProcessRunning("Student.exe") || IsProcessRunning("BlackSlient.exe")) {
         AppendLog(hwnd, "[Auto] watchdog relaunched something, re-killing...\r\n");
         KillControlProcesses(hwnd);
     }
-    if (IsLockDesktopActive()) {
-        AppendLog(hwnd, "[Auto] desktop still locked, re-switching...\r\n");
-        ReleaseBlackScreen(hwnd);
-    }
 
     AppendLog(hwnd, "\r\n========================================\r\n");
-    AppendLog(hwnd, "  AUTO ALL: Bypass completed!\r\n");
+    AppendLog(hwnd, "  AUTO BYPASS: Done!\r\n");
     AppendLog(hwnd, "========================================\r\n");
 
     UpdateStatus(hwnd, "Status: Bypass completed!");
-    return TRUE;
-}
-
-BOOL AutoAll(HWND hwnd) {
-    AutoAllCore(hwnd);
-
-    MessageBoxW(hwnd,
-        L"绕过完成!\n\n"
-        L"请注意:\n"
-        L"- 部分更改可能需要重启系统\n"
-        L"- 若驱动仍在运行, 键盘可能需要手动解锁\n"
-        L"- 如有需要可再次运行本工具",
-        L"绕过完成", MB_ICONINFORMATION | MB_OK);
-
     return TRUE;
 }
 
@@ -2391,35 +1962,10 @@ static BOOL IsPlainWindow(HWND hwnd, int screenW, int screenH) {
 
 /* 若输入桌面不是 Default, 切回 Default。
    实证: 投屏会话会新建 "NetTeachingDesktop" 并 SwitchDesktop 过去。
-   ⚠ 只允许在"用户主动点击"的路径调用 (OnSmallWin / 解除黑屏)。
+   ⚠ 只允许在"用户主动点击"的路径调用 (持续保持小窗)。
    轮询线程里绝不能调: 那会与 MultiClient 的 SwitchDesktop 互相抢, 每次切换
    都是整屏重绘, 用户看到的就是"黑屏闪动"。
    返回 TRUE = 确实执行了切换。 */
-static BOOL EnsureUserDesktop(HWND hwndLog, BOOL quiet) {
-    char  cur[128];
-    HDESK hDesk;
-    BOOL  ok;
-
-    if (!GetInputDesktopName(cur, sizeof(cur))) return FALSE;
-    if (cur[0] == '\0') return FALSE;
-    if (_stricmp(cur, DEFAULT_DESKTOP_NAME) == 0) return FALSE;
-    if (_stricmp(cur, LOCK_DESKTOP_NAME) == 0) return FALSE;   /* 锁定桌面交给「解除黑屏」 */
-
-    hDesk = OpenDesktop(DEFAULT_DESKTOP_NAME, 0, FALSE,
-                        DESKTOP_SWITCHDESKTOP | DESKTOP_READOBJECTS);
-    if (!hDesk) return FALSE;
-
-    ok = SwitchDesktop(hDesk);
-    CloseDesktop(hDesk);
-
-    if (ok && !quiet && hwndLog) {
-        AppendLog(hwndLog,
-            "[SmallWin] private desktop '%s' detected -> switched back to '%s'\r\n",
-            cur, DEFAULT_DESKTOP_NAME);
-    }
-    return ok;
-}
-
 /* ============================================================================
  *  Tier 1.5: 预设"禁用全屏优化"兼容性标志
  *
@@ -2833,13 +2379,11 @@ static int DemoteWindowTiered(HWND hwnd, int screenW, int screenH) {
     if (!WindowResponds(hwnd)) return 0;     /* 目标无响应: 别把界面拖死 */
     DemoteWindowBase(hwnd, screenW, screenH);
     if (VerifyDemoted(hwnd, screenW, screenH)) {
-        AutoUnlockAfterSmallWin();           /* 小窗化成功 -> 顺手解锁键盘 */
         return 1;
     }
 
     DemoteWindowHard(hwnd, screenW, screenH);
     if (VerifyDemoted(hwnd, screenW, screenH)) {
-        AutoUnlockAfterSmallWin();
         return 2;
     }
 
@@ -3291,6 +2835,7 @@ static DWORD TargetPidHash(void)
     static const char* names[] = {
         "ScreenRender.exe", "MultiRender.exe", "MultiClient.exe",
         "AudioRender.exe", "AudioSender.exe", "Student.exe",
+        "MmcStudent.exe",
         "SharedDesktop.exe", "StudentScreenHelper.exe", "ScreenSender.exe",
         "hooktest32.exe", NULL
     };
@@ -3525,7 +3070,7 @@ void RunInjector(HWND hwndLog, BOOL verbose) {
    ⚠ 实测 (2026-10-22): 这里绝对不能主动 SwitchDesktop。
    MultiClient.exe 自己会 SwitchDesktop("NetTeachingDesktop"), 我们再切回
    "Default", 两边互相打架, 每次切换都是一次整屏重绘 —— 用户看到的就是
-   "黑屏闪动"。回到用户桌面改为只提示, 由用户按「解除黑屏」或热键决定时机。 */
+   "黑屏闪动"。回到用户桌面改为只提示, 由用户按 Ctrl+Alt+D 决定时机。 */
 DWORD WINAPI SmallWinThreadProc(LPVOID lp) {
     (void)lp;
     DWORD lastDesktopWarn = 0;
@@ -3596,29 +3141,6 @@ DWORD WINAPI SmallWinThreadProc(LPVOID lp) {
             }
         }
 
-        /* ★ 全屏广播已经变成小窗 → 自动补一次键盘解锁 (0xB2008)。
-           课堂软件常常在广播开始时锁键盘; 小窗化成功说明已经接管, 这时
-           直接替用户发解锁码。只在"从无到有"的那一次发 (节流 3 秒),
-           之后不再抢 —— 需要持续解锁的用户可以另开「实时解锁监控」。 */
-        {
-            static BOOL wasSmall;
-            BOOL nowSmall = (ctx.small > 0) ? TRUE : FALSE;
-
-            if (nowSmall) {
-                if (!wasSmall) {
-                    int res = AutoUnlockAfterSmallWin();
-                    wasSmall = TRUE;
-                    SafeLog("[Keyboard] broadcast is now a small window -> "
-                            "auto unlock %s (0xB2008)\r\n",
-                            res > 0 ? "sent"
-                                    : (res == 0 ? "FAILED (driver not loaded?)"
-                                                : "already sent just now"));
-                }
-            } else {
-                wasSmall = FALSE;
-            }
-        }
-
         /* 私有桌面: 只提示, 不切换 (切换会和 MultiClient 打架 -> 黑屏闪动) */
         if (GetInputDesktopName(dname, sizeof(dname)) && dname[0] &&
             _stricmp(dname, DEFAULT_DESKTOP_NAME) != 0 &&
@@ -3626,8 +3148,8 @@ DWORD WINAPI SmallWinThreadProc(LPVOID lp) {
             if (now - lastDesktopWarn > 10000) {
                 lastDesktopWarn = now;
                 SafeLog("[SmallWin] NOTE: input desktop is '%s'; the broadcast "
-                        "window lives on another desktop. Use 'ReleaseBlackScreen' "
-                        "or Ctrl+Alt+X to return (no auto-switching: it fights "
+                        "window lives on another desktop. Ctrl+Alt+X sends an "
+                        "emergency click (no auto-switching: it fights "
                         "MultiClient and flashes)\r\n", dname);
             }
         }
@@ -3690,101 +3212,7 @@ void StopSmallWin(HWND hwnd) {
 
 /* ========== 实时监控 / 自保护线程 ========== */
 
-/* 配置接管: 教师在课堂里改了"限制"开关时, 把 core.conf 的三个键重新压回 0。
-   只在「实时解锁监控」开启时执行 (用户显式 opt-in), 每 10 秒最多一次。
-   ⚠ 只处理"键存在且非 0"的情况: 键不存在时绝不能当成"需要改写", 否则会无限重写。 */
-static void EnforceConfigQuiet(void)
-{
-    char path[MAX_PATH];
-    char v[64];
-    BOOL bad = FALSE;
 
-    if (!FindSoftwareFile("skin\\core.conf", path, sizeof(path))) return;
-
-    if (ReadConfigValue(path, "Limit", v, sizeof(v)) && atoi(v) != 0) bad = TRUE;
-    if (ReadConfigValue(path, "LockSeat", v, sizeof(v)) && atoi(v) != 0) bad = TRUE;
-    if (ReadConfigValue(path, "LockedAfterNetBroken", v, sizeof(v)) && atoi(v) != 0) bad = TRUE;
-    if (!bad) return;
-
-    ModifyConfig(NULL);
-    SafeLog("[Config] limiter keys were set again by the classroom tool -> reset to 0\r\n");
-}
-
-DWORD WINAPI MonitorThreadProc(LPVOID lpParam) {
-    HWND hwnd = (HWND)lpParam;
-    int  reported = -1;
-    DWORD lastCfg = 0;
-	(void)hwnd;
-
-    SafeLog("[Monitor] real-time protection started (200 ms poll)\r\n");
-
-    while (g_monitorRunning) {
-        DWORD one[1];
-        DWORD nowTick = GetTickCount();
-        BOOL lockDesktop = IsLockDesktopActive();
-        /* 一次快照查完整条广播链 (旧写法 8 个名字 = 每 200ms 8 次快照) */
-        BOOL badProc = CollectTeachingPids(one, 1) > 0;
-
-        /* 配置接管: 每 10 秒检查一次三个限制键是否被改回去 */
-        if (nowTick - lastCfg > 10000) {
-            lastCfg = nowTick;
-            EnforceConfigQuiet();
-        }
-
-        if (lockDesktop || badProc) {
-            g_monitorCount++;
-            if (g_monitorCount != reported) {
-                SafeLog("[Monitor] lock detected (event #%d): desktop=%s proc=%s\r\n",
-                        g_monitorCount,
-                        lockDesktop ? "locked" : "ok",
-                        badProc ? "running" : "gone");
-                reported = g_monitorCount;
-            }
-
-            if (badProc) {
-                /* 名单统一在 kTeachingProcs[] 里 */
-                KillTeachingProcesses();
-            }
-
-            /* 桌面 + 键盘一次搞定: 0xB2008 是幂等的, 重复发送无副作用。
-               不再调用 UnlockKeyboardViaRundll —— 那会每轮拉一个 rundll32.exe。 */
-            EnforceUnlockQuiet();
-        }
-
-        /* 200ms 轮询: 对方的锁定定时器在 300ms 量级 */
-        for (int i = 0; i < 2 && g_monitorRunning; i++) {
-            Sleep(100);
-        }
-    }
-
-    SafeLog("[Monitor] real-time protection stopped\r\n");
-    return 0;
-}
-
-void StartMonitor(HWND hwnd) {
-    if (g_monitorRunning) return;
-
-    g_monitorRunning = TRUE;
-    g_monitorCount = 0;
-    g_hMonitorThread = CreateThread(NULL, 0, MonitorThreadProc, hwnd, 0, NULL);
-
-    AppendLog(hwnd, "\r\n[Monitor] Real-time protection ENABLED\r\n");
-    UpdateStatus(hwnd, "Status: Real-time protection ON");
-}
-
-void StopMonitor(HWND hwnd) {
-    if (!g_monitorRunning) return;
-
-    g_monitorRunning = FALSE;
-    if (g_hMonitorThread) {
-        WaitForSingleObject(g_hMonitorThread, 3000);
-        CloseHandle(g_hMonitorThread);
-        g_hMonitorThread = NULL;
-    }
-
-    AppendLog(hwnd, "\r\n[Monitor] Real-time protection DISABLED\r\n");
-    UpdateStatus(hwnd, "Status: Real-time protection OFF");
-}
 
 /* ========== UI drawing helpers ========== */
 
@@ -3877,7 +3305,7 @@ static BTNSTATE* GetBtnState(int id) {
 
 /* ---- 悬停说明: 把按钮的一句话说明放进右下角状态区 --------------------------
  * 说明直接取自 BTNDEF.desc, 因此"按钮名称/说明/行为"三者在源码里是同一处定义。
- * 带全局快捷键的按钮, 说明后面会自动附上 "Ctrl+Alt+K" 这类提示 —— 不用去翻文档。
+ * 带全局快捷键的按钮, 说明后面会自动附上 "Ctrl+Alt+X" 这类提示 —— 不用去翻文档。
  * 用 g_hoverHintId 记录当前归属, 避免鼠标在两个相邻按钮间移动时,
  * 旧按钮的 WM_MOUSELEAVE 晚于新按钮的 WM_MOUSEMOVE 到达而误清说明。 */
 static void RepaintStatusArea(void) {
@@ -3955,10 +3383,7 @@ static void DrawCustomButton(const DRAWITEMSTRUCT* dis) {
     font = def->bold ? g_hFontBtnBold : g_hFontBtn;
     fill = def->base;
 
-    if (dis->CtlID == ID_BTN_MONITOR) {
-        text = g_monitorRunning ? L"实时解锁监控: 开" : L"实时解锁监控: 关";
-        fill = g_monitorRunning ? UI_SUCCESS : UI_GRAY_BTN;
-    } else if (dis->CtlID == ID_BTN_SMALLSTICKY) {
+    if (dis->CtlID == ID_BTN_SMALLSTICKY) {
         text = g_smallWinRun ? L"持续保持小窗: 开" : L"持续保持小窗: 关";
         fill = g_smallWinRun ? UI_SUCCESS : UI_GRAY_BTN;
     } else {
@@ -4068,66 +3493,54 @@ static void LayoutControls(HWND hwnd) {
 
 void CreateControls(HWND hwnd) {
     HINSTANCE hInstance = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
-    int colX[4];
-    int ids1[4], ids2[4];
+    int colX[2];
+    int ids1[2], ids2[2];
     int i, y;
     HWND hBtn;
     HWND hChk;
 
     CreateUIFonts();
 
-    for (i = 0; i < 4; i++) {
-        colX[i] = S(UI_PAD) + i * (S(BTN_W) + S(BTN_GAP));
-    }
+    /* 两个宽按钮一列: 4 个功能按钮排成 2x2, 宽度占满整行 */
+    colX[0] = S(UI_PAD);
+    colX[1] = S(UI_PAD) + S(BTN2_W) + S(BTN_GAP);
 
-    /* row 1: 即时响应 (解锁键盘 / 解除黑屏 / 结束进程 / 实时监控) */
+    /* row 1: 即时响应 (解锁键盘 / 结束进程) */
     ids1[0] = ID_BTN_UNLOCK_KB;
-    ids1[1] = ID_BTN_RELEASE_BS;
-    ids1[2] = ID_BTN_KILL_PROC;
-    ids1[3] = ID_BTN_MONITOR;
+    ids1[1] = ID_BTN_KILL_PROC;
     y = S(ROW1_Y);
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 2; i++) {
         hBtn = CreateWindowW(L"BUTTON", L"",
             WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
-            colX[i], y, S(BTN_W), S(BTN_H),
+            colX[i], y, S(BTN2_W), S(BTN_H),
             hwnd, (HMENU)(INT_PTR)ids1[i], hInstance, NULL);
         SetWindowSubclass(hBtn, BtnProc, (UINT_PTR)ids1[i], 0);
     }
 
-    /* row 2: 持久化改动 + 投屏小窗化 */
+    /* row 2: 持久化改动 / 小窗主开关 (持续保持小窗) */
     ids2[0] = ID_BTN_UNINSTALL;
-    ids2[1] = ID_BTN_MODIFY_CFG;
-    ids2[2] = ID_BTN_SMALLWIN;
-    ids2[3] = ID_BTN_SMALLSTICKY;
+    ids2[1] = ID_BTN_SMALLSTICKY;
     y = S(ROW2_Y);
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 2; i++) {
         hBtn = CreateWindowW(L"BUTTON", L"",
             WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
-            colX[i], y, S(BTN_W), S(BTN_H),
+            colX[i], y, S(BTN2_W), S(BTN_H),
             hwnd, (HMENU)(INT_PTR)ids2[i], hInstance, NULL);
         SetWindowSubclass(hBtn, BtnProc, (UINT_PTR)ids2[i], 0);
     }
-
-    /* AUTO ALL: full-width accent button */
-    y = S(AUTO_Y);
-    hBtn = CreateWindowW(L"BUTTON", L"",
-        WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
-        S(UI_PAD), y, 4 * S(BTN_W) + 3 * S(BTN_GAP), S(46),
-        hwnd, (HMENU)(INT_PTR)ID_BTN_AUTO_ALL, hInstance, NULL);
-    SetWindowSubclass(hBtn, BtnProc, (UINT_PTR)ID_BTN_AUTO_ALL, 0);
 
     /* log output (border painted by WM_PAINT) */
     g_hwndLog = CreateWindowW(L"EDIT", L"",
         WS_VISIBLE | WS_CHILD | WS_VSCROLL | WS_HSCROLL |
         ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
-        S(UI_PAD + 2), S(LOG_Y), 4 * S(BTN_W) + 3 * S(BTN_GAP) - S(4), S(326),
+        S(UI_PAD + 2), S(LOG_Y), S(BTN2_W) * 2 + S(BTN_GAP) - S(4), S(326),
         hwnd, (HMENU)(INT_PTR)ID_LOG_OUTPUT, hInstance, NULL);
     SendMessageW(g_hwndLog, WM_SETFONT, (WPARAM)g_hFontLog, TRUE);
 
     /* 广播窗最小化行为: 任务栏(真最小化) / 收起(托盘) */
     hChk = CreateWindowW(L"BUTTON", L"广播窗最小化到任务栏",
         WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-        S(430), S(238), S(240), S(24),
+        S(UI_PAD), S(CHK_Y), S(300), S(24),
         hwnd, (HMENU)(INT_PTR)ID_CHK_TRAY, hInstance, NULL);
     SendMessageW(hChk, WM_SETFONT, (WPARAM)g_hFontHint, TRUE);
     CheckDlgButton(hwnd, ID_CHK_TRAY,
@@ -4155,15 +3568,10 @@ void CreateControls(HWND hwnd) {
  *  这一节的每个 On* 函数 = g_btnDefs[] 里的一个按钮 = WM_COMMAND 里的一个分支。
  *  命名对照:
  *    解锁键盘          -> OnUnlockKeyboard
- *    解除黑屏          -> OnReleaseBlackScreen
  *    结束课堂进程      -> OnKillProcesses
  *    卸载过滤驱动      -> OnUninstallDriver
- *    改写配置文件      -> OnModifyConfig
- *    一键全部执行      -> OnAutoAll
- *    实时解锁监控      -> OnMonitorToggle   (开关)
  *    检查当前状态      -> OnCheckStatus
  *    退出              -> SC_CLOSE
- *    小窗化广播窗口    -> OnSmallWin
  *    持续保持小窗      -> OnSmallStickyToggle (开关)
  * ========================================================================== */
 
@@ -4172,10 +3580,6 @@ void OnUnlockKeyboard(HWND hwnd) {
     UnlockKeyboard(hwnd);
 }
 
-/* 「解除黑屏」: 结束黑屏进程 + 切回 Default 桌面 + 解锁键盘 */
-void OnReleaseBlackScreen(HWND hwnd) {
-    ReleaseBlackScreen(hwnd);
-}
 
 /* 「结束课堂进程」: 看守进程优先, 再杀主体与广播链 */
 void OnKillProcesses(HWND hwnd) {
@@ -4187,29 +3591,11 @@ void OnUninstallDriver(HWND hwnd) {
     UninstallDriver(hwnd);
 }
 
-/* 「改写配置文件」: core.conf 三个控制键清零 (二进制安全改写) */
-void OnModifyConfig(HWND hwnd) {
-    ModifyConfig(hwnd);
-}
-
-/* 「一键全部执行」: 上锁相关动作按依赖顺序全部走一遍 */
-void OnAutoAll(HWND hwnd) {
-    AutoAll(hwnd);
-}
 
 /* 「检查当前状态」: 清日志后做一次完整只读诊断 */
 void OnCheckStatus(HWND hwnd) {
     ClearLog(hwnd);
     CheckStatus(hwnd);
-}
-
-/* 「实时解锁监控」开关: 开 = 200ms 轮询自动解锁; 关 = 停止线程 */
-void OnMonitorToggle(HWND hwnd) {
-    if (g_monitorRunning) {
-        StopMonitor(hwnd);
-    } else {
-        StartMonitor(hwnd);
-    }
 }
 
 /* ================= 配置 + 共享状态 =================
@@ -4422,22 +3808,6 @@ static void StatePublishLocked(void)
     if (g_stateEvent) SetEvent(g_stateEvent);
 }
 
-static void StateBumpShow(void)
-{
-    StateLock();
-    g_state.show_seq++;
-    StatePublishLocked();
-    StateUnlock();
-}
-
-static void StateBumpSmall(void)
-{
-    StateLock();
-    g_state.small_seq++;
-    StatePublishLocked();
-    StateUnlock();
-}
-
 static BOOL StateMinimizeTaskbar(void)
 {
     return g_state.minimize_tray ? FALSE : TRUE;
@@ -4542,53 +3912,6 @@ static void WriteMinimizeMode(BOOL taskbar)
     StateSetMinimizeTaskbar(taskbar);
 }
 
-static void TouchForceSmall(void)
-{
-    StateBumpSmall();
-}
-
-static void TouchShowNow(void)
-{
-    StateBumpShow();
-}
-
-/* 「小窗化广播窗口」: 立即小窗化 + 转入"满屏即缩小"自动监视   反制对象 (REA 实证):
-     MultiRender/ScreenRender 的 HWND_TOPMOST + WS_POPUP 全屏
-     MultiClient 的 NetTeachingDesktop 私有桌面 */
-void OnSmallWin(HWND hwnd) {
-    AppendLog(hwnd, "\r\n[SmallWin] ==== demote + auto-watch ====\r\n");
-
-    /* 如果广播窗是用最小化按钮"收起"的, 先请求 DLL 把它恢复出来。
-       恢复后如果还是小窗, 下面的 rescan 不会再动它 (已是目标形态)。 */
-    TouchShowNow();
-
-    /* 0) 私有桌面上枚举不到广播窗口 -> 先切回用户桌面 */
-    EnsureUserDesktop(hwnd, FALSE);
-
-    if (!g_smallWinRun) {
-        /* StartSmallWin 内部: T1.5 预设 -> 装 WinEvent 钩子
-                            -> 全量扫描 -> 起自适应监视线程 */
-        StartSmallWin(hwnd);
-        AppendLog(hwnd,
-            "[SmallWin] auto-watch ON: any fullscreen/topmost broadcast window "
-            "is demoted within ~200 ms.\r\n");
-        AppendLog(hwnd,
-            "[SmallWin] note: MultiClient.exe freezes the real mouse with a "
-            "global WH_MOUSE_LL hook; only terminating that process removes it.\r\n");
-    } else {
-        int n = SmallWindowBroadcastCore(hwnd, FALSE);   /* 手动催一次 */
-        AppendLog(hwnd, "[SmallWin] rescan: %d window(s) demoted\r\n", n);
-    }
-
-    /* 通知注入的 DLL 立刻强制降级一次 (不依赖它的各种判断) */
-    TouchForceSmall();
-    AppendLog(hwnd, "[SmallWin] forced DLL demote requested\r\n");
-
-    UpdateStatus(hwnd, "Status: auto-demote ON (fullscreen -> small window)");
-
-    OnUnlockKeyboard(hwnd);
-}
-
 /* 「持续保持小窗」开关: 开 = WinEvent 钩子即时小窗化 + 轮询兜底; 关 = 卸载钩子 */
 void OnSmallStickyToggle(HWND hwnd) {
     if (g_smallWinRun) {
@@ -4598,7 +3921,7 @@ void OnSmallStickyToggle(HWND hwnd) {
         SetHookOffFlag(TRUE);
         AppendLog(hwnd,
             "[Hook] 已写 bypass_hook.off: 已注入的 DLL 停止干预窗口 "
-            "(渲染进程不用重启; 想重新接管请点「小窗化广播窗口」)\r\n");
+            "(渲染进程不用重启; 想重新接管请再点一次「持续保持小窗」)\r\n");
     } else {
         StartSmallWin(hwnd);
     }
@@ -4606,13 +3929,119 @@ void OnSmallStickyToggle(HWND hwnd) {
 
 /* ========== 托盘 (notification area) ==========
    设计目标:
-     - 不在任务栏占位置 (窗口带 WS_EX_TOOLWINDOW, 关闭 = 收到托盘);
-     - 托盘图标是唯一入口: 左键单击/双击 = 显示/隐藏主界面, 右键 = 菜单;
-     - 菜单里保留最常用的三个动作 (小窗化 / 解除黑屏 / 解锁键盘), 不用先开窗口.
+     - 窗口可见时任务栏有按钮 (WS_EX_APPWINDOW), 收进托盘后按钮随 SW_HIDE 消失;
+     - 托盘图标是最快入口: 左键单击/双击 = 显示/隐藏主界面, 右键 = 菜单;
+     - 菜单里保留最常用的三个动作 (解锁键盘 / 恢复全屏 / 应急点击), 不用先开窗口.
    ⚠ Shell_NotifyIcon 需要窗口仍然存在 —— 关闭窗口时只 Hide, 不 Destroy. */
+
+/* ---- 单一日志文件 (bin\bypass_hook.log) 的独立写入器 ------------------------
+   GUI 模式下 AppendLog 只写编辑框 (g_logFile 仅静默模式打开), 但托盘这种
+   "看不到就找不回来"的事件必须能从 bin\bypass_hook.log 里查到。这里用
+   FILE_APPEND_DATA 追加, 与 elevate.c 的 ELog、注入 DLL 共用同一个文件,
+   多进程并发写不会互相覆盖。写进去的内容保持纯 ASCII。 */
+static void FileLog(const char* fmt, ...)
+{
+    char       line[1024];
+    char       dir[MAX_PATH], path[MAX_PATH];
+    char*      p;
+    SYSTEMTIME st;
+    va_list    ap;
+    int        n;
+    HANDLE     h;
+    DWORD      written = 0;
+
+    if (!GetModuleFileNameA(NULL, dir, sizeof(dir))) return;
+    p = strrchr(dir, '\\');
+    if (!p) return;
+    *(p + 1) = '\0';
+    _snprintf(path, sizeof(path) - 1, "%sbypass_hook.log", dir);
+    path[sizeof(path) - 1] = '\0';
+
+    GetLocalTime(&st);
+    n = _snprintf(line, sizeof(line) - 3, "[%02d:%02d:%02d.%03d] [pid %lu] ",
+                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                  (unsigned long)GetCurrentProcessId());
+    if (n < 0) return;
+    va_start(ap, fmt);
+    _vsnprintf(line + n, sizeof(line) - n - 3, fmt, ap);
+    va_end(ap);
+    line[sizeof(line) - 3] = '\0';
+    n = (int)strlen(line);
+    line[n++] = '\r';
+    line[n++] = '\n';
+
+    h = CreateFileA(path, FILE_APPEND_DATA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    WriteFile(h, line, (DWORD)n, &written, NULL);
+    CloseHandle(h);
+}
+
+/* 托盘故障现场: 进程在哪个会话/窗口站/桌面、什么完整性级别、能不能看到
+   shell 的 Shell_TrayWnd。运行在别的桌面/会话里时 Shell_NotifyIcon 会
+   返回成功, 但图标永远不会出现在用户的托盘上 —— 这行日志能直接区分
+   "图标创造失败" 和 "图标不存在于用户桌面"。 */
+static void LogTrayEnvironment(HWND hwnd)
+{
+    DWORD   session = 0;
+    DWORD   il = 0;
+    HANDLE  tok = NULL;
+    HWND    tray;
+    HWINSTA wsH = GetProcessWindowStation();
+    HDESK   deskH = GetThreadDesktop(GetCurrentThreadId());
+    wchar_t userW[128] = L"?";
+    wchar_t wsW[64] = L"?";
+    wchar_t deskW[64] = L"?";
+    char    user[128] = "?", ws[64] = "?", desk[64] = "?";
+    DWORD   len;
+
+    len = 128;
+    GetUserNameW(userW, &len);
+    WideCharToMultiByte(CP_ACP, 0, userW, -1, user, sizeof(user), NULL, NULL);
+
+    len = 0;
+    if (wsH)
+        GetUserObjectInformationW(wsH, UOI_NAME, wsW, sizeof(wsW), &len);
+    len = 0;
+    if (deskH)
+        GetUserObjectInformationW(deskH, UOI_NAME, deskW, sizeof(deskW), &len);
+    WideCharToMultiByte(CP_ACP, 0, wsW, -1, ws, sizeof(ws), NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, deskW, -1, desk, sizeof(desk), NULL, NULL);
+
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        DWORD cb = 0;
+        if (!GetTokenInformation(tok, TokenIntegrityLevel, NULL, 0, &cb) &&
+            GetLastError() == ERROR_INSUFFICIENT_BUFFER && cb) {
+            TOKEN_MANDATORY_LABEL* tml = (TOKEN_MANDATORY_LABEL*)malloc(cb);
+            if (tml) {
+                if (GetTokenInformation(tok, TokenIntegrityLevel, tml, cb, &cb) &&
+                    tml->Label.Sid) {
+                    BYTE* cnt = GetSidSubAuthorityCount(tml->Label.Sid);
+                    if (cnt && *cnt) {
+                        DWORD* rid = GetSidSubAuthority(tml->Label.Sid,
+                                                        (DWORD)(*cnt - 1));
+                        if (rid) il = *rid;
+                    }
+                }
+                free(tml);
+            }
+        }
+        CloseHandle(tok);
+    }
+
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session)) session = 0;
+    tray = FindWindowW(L"Shell_TrayWnd", NULL);
+
+    FileLog("[Tray] env hwnd=%p session=%lu user=%s wsp=%s desktop=%s il=0x%lx "
+            "tray_hwnd=%p",
+            (void*)hwnd, (unsigned long)session, user, ws, desk,
+            (unsigned long)il, (void*)tray);
+}
 
 static void TrayAdd(HWND hwnd) {
     NOTIFYICONDATAW nid;
+    DWORD           err;
 
     if (g_trayAdded) return;
     memset(&nid, 0, sizeof(nid));
@@ -4624,12 +4053,32 @@ static void TrayAdd(HWND hwnd) {
     nid.hIcon = g_trayIcon;
     wcscpy(nid.szTip, L"教学控制解除工具 —— 双击打开");
 
+    SetLastError(0);
     if (Shell_NotifyIconW(NIM_ADD, &nid)) {
         g_trayAdded = TRUE;
+        g_trayRetries = 0;
         /* Win7+ 才支持 NIM_SETVERSION, 失败也无所谓 */
         nid.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        if (!Shell_NotifyIconW(NIM_SETVERSION, &nid))
+            FileLog("[Tray] NIM_SETVERSION failed err=%lu (cosmetic)",
+                    (unsigned long)GetLastError());
+        FileLog("[Tray] icon added (icon=%p)", (void*)g_trayIcon);
+        return;
     }
+
+    /* 失败不要静默: 一次性重试 + 写日志, 否则表现就是"窗口不见了,
+       托盘里也没有图标", 完全没有线索。 */
+    err = GetLastError();
+    g_trayRetries++;
+    FileLog("[Tray] NIM_ADD failed err=%lu (attempt %d/%d, icon=%p)",
+            (unsigned long)err, g_trayRetries, TRAY_RETRY_MAX,
+            (void*)g_trayIcon);
+    AppendLog(hwnd, "[Tray] 托盘图标创建失败 (err=%lu)，正在重试…\r\n",
+              (unsigned long)err);
+
+    /* 登录后立即启动 / Explorer 正在重启时, shell 的托盘可能还没准备好 */
+    if (g_trayRetries <= TRAY_RETRY_MAX)
+        SetTimer(hwnd, IDT_TRAY_RETRY, TRAY_RETRY_MS, NULL);
 }
 
 static void TrayRemove(HWND hwnd) {
@@ -4642,6 +4091,7 @@ static void TrayRemove(HWND hwnd) {
     nid.uID = TRAY_ICON_ID;
     Shell_NotifyIconW(NIM_DELETE, &nid);
     g_trayAdded = FALSE;
+    FileLog("[Tray] icon removed");
 }
 
 static void TrayUpdateTip(HWND hwnd, const wchar_t* tip) {
@@ -4701,7 +4151,18 @@ static void ShowMainWindow(HWND hwnd) {
 static void HideToTray(HWND hwnd) {
     NOTIFYICONDATAW nid;
 
+    /* 没有托盘图标就绝不隐藏窗口: SW_HIDE 之后任务栏按钮也会跟着消失,
+       Windows 又可能把图标折叠在 "^" 里, 用户就没有任何可见入口了
+       (只剩 Ctrl+Alt+H 和再双击一次 exe)。宁可留在屏幕上。 */
+    if (!g_trayAdded) TrayAdd(hwnd);
+    if (!g_trayAdded) {
+        FileLog("[Tray] hide refused: no tray icon, window stays visible");
+        AppendLog(hwnd, "[Tray] 没有托盘图标，窗口保持显示（不隐藏）\r\n");
+        return;
+    }
+
     ShowWindow(hwnd, SW_HIDE);
+    FileLog("[Tray] window hidden to tray");
 
     if (g_trayAdded && !g_trayBalloonShown) {
         g_trayBalloonShown = TRUE;
@@ -4730,10 +4191,7 @@ static void TrayShowMenu(HWND hwnd) {
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 
     /* 高频动作: 不打开窗口也能点。菜单里带上全局快捷键，省得记。 */
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_SMALLWIN,
-                L"小窗化 / 显示广播窗口(&S)\tCtrl+Alt+S");
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_RELEASE_BS, L"解除黑屏(&B)\tCtrl+Alt+B");
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_UNLOCK,     L"解锁键盘(&K)\tCtrl+Alt+K");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_UNLOCK,     L"解锁键盘(&K)");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_DESKTOP,    L"立即切回桌面(&D)\tCtrl+Alt+D");
     AppendMenuW(menu, MF_STRING, IDM_TRAY_CLICK,      L"应急点击(&E)\tCtrl+Alt+E");
@@ -4760,12 +4218,6 @@ static void TrayShowMenu(HWND hwnd) {
     switch (cmd) {
     case IDM_TRAY_SHOW:
         ShowMainWindow(hwnd);
-        break;
-    case IDM_TRAY_SMALLWIN:
-        OnSmallWin(hwnd);
-        break;
-    case IDM_TRAY_RELEASE_BS:
-        OnReleaseBlackScreen(hwnd);
         break;
     case IDM_TRAY_UNLOCK:
         UnlockKeyboard(hwnd);
@@ -4794,7 +4246,7 @@ static void TrayShowMenu(HWND hwnd) {
         SetHookOffFlag(TRUE);
         AppendLog(hwnd,
             "\r\n[Hook] released: bypass_hook.off written, injected DLLs stand down\r\n"
-            "[Hook] 教师端重新发起广播后即为全屏; 想再次小窗化请点「小窗化广播窗口」\r\n");
+            "[Hook] 教师端重新发起广播后即为全屏; 想再次小窗化请再点一次「持续保持小窗」\r\n");
         UpdateStatus(hwnd, "Status: released (fullscreen allowed)");
         break;
     case IDM_TRAY_ABOUT:
@@ -4906,24 +4358,11 @@ static DWORD WINAPI DesktopGuardProc(LPVOID lp)
             ShouldRestoreDesktop(name) &&
             (now - g_deskGuardLastAct) > 3000) {
 
-            BOOL wasLock  = (_stricmp(name, "MCLOCK Desktop") == 0);
             BOOL switched = SwitchToDesktop("Default");
 
             if (switched) g_deskGuardLastAct = now;
 
-            /* 锁屏桌面 = 黑屏 + 键盘锁。只把桌面切回来, 键盘还是锁的 ——
-               用户会看到自己的桌面却打不了字。所以这里顺手发一次解锁码。 */
-            if (wasLock && (now - g_deskGuardLastUnlock) > 3000) {
-                BOOL unlocked;
-                g_deskGuardLastUnlock = now;
-                unlocked = UnlockKeyboardQuiet();
-                if (g_deskGuardLogs < 20) {
-                    g_deskGuardLogs++;
-                    SafeLog("[DesktopGuard] input='%s' -> %s, keyboard unlock %s\r\n",
-                            name, switched ? "switched to Default" : "switch FAILED",
-                            unlocked ? "sent (0xB2008)" : "FAILED");
-                }
-            } else if (switched && (now - g_deskGuardLastUnlock) > 3000) {
+            if (switched && (now - g_deskGuardLastUnlock) > 3000) {
                 g_deskGuardLastUnlock = now;
                 if (g_deskGuardLogs < 20) {
                     g_deskGuardLogs++;
@@ -4958,6 +4397,10 @@ static void StartDesktopGuard(HWND hwnd)
    它的事件投递到"安装钩子的那个线程"的消息队列 —— 放到工作线程会收不到事件。
    代价: RunInjector 最长阻塞 8 秒 (通常 <1s), 启动瞬间界面可能短暂无响应。 */
 #define WM_APP_AUTOSTART (WM_APP + 3)
+/* "把自己叫到前台"：第二次双击 bypass.exe 时, 新实例（往往不是管理员）会找到
+   本窗口并 PostMessage 这条消息。已提权的窗口默认拒收低完整性进程的消息,
+   所以窗口创建后要用 ChangeWindowMessageFilterEx 明确放行。 */
+#define WM_BYPASS_SHOW   (WM_APP + 4)
 
 /* 应急点击: MultiClient 的 WH_MOUSE_LL 只放行 dwExtraInfo==0x12452 的事件,
    这里直接借用它自己的通行证 —— 鼠标被"冻结"时还能点一下。 */
@@ -5041,6 +4484,16 @@ static void LogNetStatus(HWND hwnd)
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    /* Explorer 重启 (或登录时 shell 尚未就绪) 会广播 TaskbarCreated:
+       旧图标已经失效, 必须重新 NIM_ADD, 否则窗口一收进托盘就再也叫不出来 */
+    if (g_msgTaskbarCreated && msg == g_msgTaskbarCreated) {
+        FileLog("[Tray] TaskbarCreated -> re-adding icon");
+        g_trayAdded = FALSE;
+        g_trayRetries = 0;
+        TrayAdd(hwnd);
+        return 0;
+    }
+
     switch (msg) {
         case WM_CREATE:
             g_hwndMain = hwnd;
@@ -5052,13 +4505,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                另外给常用动作都配了 Ctrl+Alt+字母, 鼠标冻结时也能用。 */
             {
                 struct { int id; UINT vk; const char* name; } hk[] = {
-                    { ID_HOTKEY_ESCAPE,   'X', "Ctrl+Alt+X 应急 (结束进程+解除黑屏+解锁)" },
+                    { ID_HOTKEY_ESCAPE,   'X', "Ctrl+Alt+X 应急 (结束课堂进程)" },
                     { ID_HOTKEY_PANEL,    'H', "Ctrl+Alt+H 显示/隐藏面板" },
-                    { ID_HOTKEY_UNLOCK,   'K', "Ctrl+Alt+K 解锁键盘" },
-                    { ID_HOTKEY_BLACKSCR, 'B', "Ctrl+Alt+B 解除黑屏" },
-                    { ID_HOTKEY_SMALLWIN, 'S', "Ctrl+Alt+S 小窗化广播窗口" },
                     { ID_HOTKEY_STICKY,   'T', "Ctrl+Alt+T 持续保持小窗" },
-                    { ID_HOTKEY_MONITOR,  'M', "Ctrl+Alt+M 实时解锁监控" },
                     { ID_HOTKEY_DESKTOP,  'D', "Ctrl+Alt+D 立即切回桌面" },
                     { ID_HOTKEY_CLICK,    'E', "Ctrl+Alt+E 应急点击" },
                     { ID_HOTKEY_QUIT,     'Q', "Ctrl+Alt+Q 退出" },
@@ -5076,23 +4525,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             AppendLog(hwnd, "Hint: hover any button to see what it does (bottom-right).\r\n");
             AppendLog(hwnd, "Hotkeys (global, work even when the classroom tool grabs the mouse):\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+H  show / hide this panel\r\n");
-            AppendLog(hwnd, "  Ctrl+Alt+K  unlock keyboard\r\n");
-            AppendLog(hwnd, "  Ctrl+Alt+B  release black screen\r\n");
-            AppendLog(hwnd, "  Ctrl+Alt+S  small window (broadcast)\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+T  sticky small window (toggle)\r\n");
-            AppendLog(hwnd, "  Ctrl+Alt+M  realtime unlock monitor (toggle)\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+D  restore desktop (if trapped on NetTeachingDesktop)\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+E  emergency click (passes MultiClient's mouse hook)\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+Q  quit\r\n");
-            AppendLog(hwnd, "  Ctrl+Alt+X  EMERGENCY: kill classroom processes + release\r\n");
+            AppendLog(hwnd, "  Ctrl+Alt+X  EMERGENCY: kill classroom processes\r\n");
             AppendLog(hwnd, "Click 'Check Status' for a read-only scan.\r\n");
-            AppendLog(hwnd, "Click 'Auto All' for a complete bypass.\r\n");
-            AppendLog(hwnd, "Use 'Monitor' for real-time protection.\r\n\r\n");
 
             /* 托盘: 关闭窗口只收进托盘, 不退出 */
             g_trayIcon = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1),
                                            IMAGE_ICON, 16, 16, LR_SHARED);
             if (!g_trayIcon) g_trayIcon = LoadIconW(NULL, (LPCWSTR)IDI_SHIELD);
+            /* Explorer 重启后会广播这条消息, 收到就得重新 NIM_ADD */
+            g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+            LogTrayEnvironment(hwnd);
             TrayAdd(hwnd);
 
             /* 桌面看门狗: 教师端异常断线时, 学生端会永远留在教学桌面。
@@ -5158,6 +4604,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
+        /* 第二个实例请求把自己显示出来（见 WinMain 里的早期单实例检查） */
+        case WM_BYPASS_SHOW:
+            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+            return 0;
+
         /* full custom painting (dark theme) */
         case WM_PAINT: {
             PAINTSTRUCT ps;
@@ -5189,6 +4642,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             r.left = S(UI_PAD); r.top = S(LOGLBL_Y);
             r.right = S(400); r.bottom = S(LOGLBL_Y + 20);
             DrawTextW(hdc, L"运行日志", -1, &r,
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+            /* hint right of the "minimize" checkbox */
+            SelectObject(hdc, g_hFontHint);
+            SetTextColor(hdc, UI_TEXT_DIM);
+            r.left = S(UI_PAD + 312); r.top = S(CHK_Y);
+            r.right = S(BTN2_W) * 2 + S(UI_PAD); r.bottom = S(CHK_Y + 24);
+            DrawTextW(hdc, L"取消勾选 = 收起到托盘 (不占任务栏)", -1, &r,
                       DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
             /* rounded border around log area */
@@ -5389,12 +4850,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             case ID_HOTKEY_ESCAPE:
                 AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+X -> emergency escape\r\n");
                 OnKillProcesses(hwnd);
-                OnReleaseBlackScreen(hwnd);
                 UpdateStatus(hwnd, "Status: emergency escape done");
-                return 0;
-            case ID_HOTKEY_UNLOCK:
-                AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+K -> unlock keyboard\r\n");
-                OnUnlockKeyboard(hwnd);
                 return 0;
             case ID_HOTKEY_PANEL:
                 /* 显示/隐藏主面板: 面板收起时也能用, 所以必须是全局热键 */
@@ -5405,21 +4861,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+H -> panel shown\r\n");
                 }
                 return 0;
-            case ID_HOTKEY_BLACKSCR:
-                AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+B -> release black screen\r\n");
-                OnReleaseBlackScreen(hwnd);
-                return 0;
-            case ID_HOTKEY_SMALLWIN:
-                AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+S -> small window\r\n");
-                OnSmallWin(hwnd);
-                return 0;
             case ID_HOTKEY_STICKY:
                 AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+T -> sticky small window toggle\r\n");
                 OnSmallStickyToggle(hwnd);
-                return 0;
-            case ID_HOTKEY_MONITOR:
-                AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+M -> monitor toggle\r\n");
-                OnMonitorToggle(hwnd);
                 return 0;
             case ID_HOTKEY_DESKTOP: {
                 char from[128] = "";
@@ -5451,26 +4895,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_BTN_UNLOCK_KB:
                     OnUnlockKeyboard(hwnd);
                     break;
-                case ID_BTN_RELEASE_BS:
-                    OnReleaseBlackScreen(hwnd);
-                    break;
                 case ID_BTN_KILL_PROC:
                     OnKillProcesses(hwnd);
                     break;
                 case ID_BTN_UNINSTALL:
                     OnUninstallDriver(hwnd);
-                    break;
-                case ID_BTN_MODIFY_CFG:
-                    OnModifyConfig(hwnd);
-                    break;
-                case ID_BTN_AUTO_ALL:
-                    OnAutoAll(hwnd);
-                    break;
-                case ID_BTN_MONITOR:
-                    OnMonitorToggle(hwnd);
-                    break;
-                case ID_BTN_SMALLWIN:
-                    OnSmallWin(hwnd);
                     break;
                 case ID_BTN_SMALLSTICKY:
                     OnSmallStickyToggle(hwnd);
@@ -5480,7 +4909,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     WriteMinimizeMode(tb);
                     AppendLog(hwnd, "[UI] broadcast minimize -> %s\r\n",
                               tb ? "taskbar (real minimize)"
-                                 : "tray (hidden; Ctrl+Alt+S to restore)");
+                                 : "tray (hidden; toggle sticky off to restore)");
                     break;
                 }
                 case ID_BTN_CHECK_STATUS:
@@ -5494,9 +4923,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             /* refresh toggle button labels + status area */
             {
-                HWND hM = GetDlgItem(hwnd, ID_BTN_MONITOR);
                 HWND hS = GetDlgItem(hwnd, ID_BTN_SMALLSTICKY);
-                if (hM) InvalidateRect(hM, NULL, TRUE);
                 if (hS) InvalidateRect(hS, NULL, TRUE);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -5505,6 +4932,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_SIZE:
             if (wParam == SIZE_MINIMIZED) {
                 AppendLog(hwnd, "[UI] WM_SIZE(SIZE_MINIMIZED) -> hide to tray\r\n");
+                FileLog("[UI] minimize -> hide to tray");
                 HideToTray(hwnd);
                 return 0;
             }
@@ -5546,6 +4974,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 FlushPendingDemote();
                 return 0;
             }
+            if (wParam == IDT_TRAY_RETRY) {
+                KillTimer(hwnd, IDT_TRAY_RETRY);
+                TrayAdd(hwnd);
+                return 0;
+            }
             break;
 
         case WM_DESTROY:
@@ -5557,7 +4990,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             TrayRemove(hwnd);
             InterlockedExchange(&g_deskGuardStop, 1);
-            StopMonitor(hwnd);
             StopSmallWin(hwnd);
             DestroyUIFonts();
             PostQuitMessage(0);
@@ -5634,36 +5066,68 @@ static int RunSilentMode(void) {
     return 0;
 }
 
+/* Log is overwritten on every run: truncate the previous bypass_hook.log here.
+   The file itself is written by the injected DLL with FILE_APPEND_DATA (3~4
+   processes append concurrently), so use CREATE_ALWAYS rather than DeleteFile:
+   processes left over from the previous run still hold the handle, deleting the
+   file would make them write into an orphaned inode and this run's log would
+   lose those lines. */
+static void TruncateHookLog(void) {
+    char   dir[MAX_PATH];
+    char   logPath[MAX_PATH];
+    char*  p;
+    HANDLE h;
+
+    if (!GetModuleFileNameA(NULL, dir, sizeof(dir))) return;
+    p = strrchr(dir, '\\');
+    if (!p) return;
+    *(p + 1) = '\0';
+    _snprintf(logPath, sizeof(logPath) - 1, "%sbypass_hook.log", dir);
+    logPath[sizeof(logPath) - 1] = '\0';
+
+    h = CreateFileA(logPath, GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
     ParseCommandLine(lpCmdLine);
 
-    /* 检查管理员权限 */
-    if (!IsUserAnAdmin()) {
-        /* 尝试以管理员权限重新启动 (保留参数) */
-        char exePath[MAX_PATH];
-        GetModuleFileName(NULL, exePath, MAX_PATH);
-
-        SHELLEXECUTEINFO sei = {0};
-        sei.cbSize = sizeof(sei);
-        sei.lpVerb = "runas";
-        sei.lpFile = exePath;
-        sei.lpParameters = lpCmdLine;
-        sei.nShow = g_silentMode ? SW_HIDE : SW_SHOWNORMAL;
-
-        if (ShellExecuteEx(&sei)) {
+    /* ★ 早期单实例检查：必须在提权之前做，否则第二次双击 bypass.exe 会把
+       LPE / UAC 整条链路跑完，最后才发现工具已经在运行。
+       这里只是"探测"（查完就关句柄）：真正持有互斥体的是后面提权成功的那
+       个实例。提权链路自己拉起的实例（命令行带 --elevate=uac）跳过探测。
+       --silent 保持老行为（允许多个静默实例）。 */
+    if (!g_silentMode && !Elevate_IsSpawnedChildCmd(lpCmdLine)) {
+        HANDLE hMutex = CreateMutexW(NULL, FALSE, L"ClassroomBypassTool_SingleInstance");
+        if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+            HWND hOld = FindWindowW(WINDOW_CLASS, NULL);
+            CloseHandle(hMutex);
+            if (hOld) {
+                ShowWindow(hOld, SW_SHOW);
+                ShowWindow(hOld, SW_RESTORE);
+                /* 已提权窗口可能拒收普通权限进程的 SetForegroundWindow，
+                   所以优先走放行过的消息让老实例自己到前台。 */
+                if (!PostMessageW(hOld, WM_BYPASS_SHOW, 0, 0))
+                    SetForegroundWindow(hOld);
+            }
             return 0;
         }
-        
-        if (!g_silentMode) {
-            MessageBox(NULL, 
-                "This application requires Administrator privileges.\n"
-                "Please run as Administrator.",
-                "Error", MB_ICONERROR | MB_OK);
-        }
-        return -1;
+        if (hMutex) CloseHandle(hMutex);
     }
+
+    /* Elevation (src\elevate.c): mode=uac/lpe/manual/off from
+       bin\bypass_elevate.ini (--elevate= overrides).  "lpe" tries the
+       WalletService payload in bin\lpe\ first and falls back to the UAC
+       prompt and finally to the manual "run as administrator" instructions. */
+    if (!IsUserAnAdmin()) {
+        Elevate_Boot(NULL, lpCmdLine, g_silentMode);
+        return 0;
+    }
+    Elevate_NoteElevated();
 
     /* 记录 UI 线程 (供 AppendLog 判断是否需要 PostMessage), 并打开所需特权 */
     g_uiThreadId = GetCurrentThreadId();
@@ -5687,6 +5151,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* 配置 + 共享状态（必须在注入 DLL 之前） */
     StateInit();
+
+    /* this run only: truncate before any DLL starts appending.
+       An instance spawned by the elevation chain must NOT truncate - the
+       launcher's elevation history and the handshake line live in the same
+       file until the launcher has read them. */
+    if (!Elevate_IsSpawnedChildCmd(lpCmdLine))
+        TruncateHookLog();
 
     /* 静默模式: 直接执行, 不创建窗口 */
     if (g_silentMode) {
@@ -5746,9 +5217,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
     
     /* 创建窗口 (无边框 + 自绘标题栏)
-       WS_EX_TOOLWINDOW: 不出现在任务栏, 也不进 Alt+Tab —— 托盘图标才是入口. */
+       WS_EX_APPWINDOW: 窗口可见时任务栏上有按钮 (托盘图标被 Windows 折叠进
+       "^" 里也找得回来); 最小化/关闭时 HideToTray 会 SW_HIDE, 按钮随之消失,
+       真正干活的还是托盘图标. */
     HWND hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW,
+        WS_EX_APPWINDOW,
         WINDOW_CLASS,
         WINDOW_TITLE,
         WS_POPUP | WS_THICKFRAME | WS_CAPTION | WS_SYSMENU |
@@ -5760,6 +5233,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         MessageBoxW(NULL, L"窗口创建失败!", L"错误", MB_ICONERROR);
         return -1;
     }
+
+    /* 放行低完整性进程发来的 WM_BYPASS_SHOW：第二次双击 bypass.exe 的新实例
+       (通常是普通权限) 要能唤醒已提权的本窗口（UIPI 默认拒收）。 */
+    ChangeWindowMessageFilterEx(hwnd, WM_BYPASS_SHOW, MSGFLT_ALLOW, NULL);
 
     /* Windows 11: rounded window corners (optional, dynamic load) */
     {
