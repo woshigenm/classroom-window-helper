@@ -131,7 +131,7 @@ try {
     }
     if (Test-Path $save) {
         Copy-Item $save $core -Force
-        Remove-Item $save -Force -ErrorAction SilentlyContinue
+        # keep $save: later blocks (retry/UEF) need the real Core as the source
     }
     Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
 }
@@ -193,6 +193,44 @@ try {
     Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
 }
 
+# Initial load failed (fake return-0) -> the control pipe must still be able to
+# load a good Core later ("reload" with no active core = fresh load).
+$host4 = $null
+$pid4 = 0
+$realBak = Join-Path $env:TEMP 'bypass_core_real_retry.dll'
+try {
+    Copy-Item $core $realBak -Force
+    Copy-Item (Join-Path $bin 'fake_core_return0.dll') $core -Force
+    Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
+    $host4 = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
+        -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll', '--seconds', '15')
+    for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    if (!(Test-Path $pidfile)) { throw "retry host did not write its pidfile" }
+    $pid4 = [int](Get-Content $pidfile -Raw).Trim()
+    Start-Sleep -Milliseconds 1500
+    "--- initial load failure -> reload ---"
+    $st = Send-Ctl $pid4 'status'
+    "  status   : $st"
+    $r = Send-Ctl $pid4 'reload'
+    "  reload   : $r"
+    if ($r -notmatch '^err load-failed') { $pass = $false }
+    Copy-Item $realBak $core -Force
+    $r = Send-Ctl $pid4 'reload'
+    "  retry    : $r"
+    if ($r -notmatch '^ok seq=') { $pass = $false }
+} finally {
+    if ($host4 -and !$host4.HasExited) { Stop-Process -Id $host4.Id -Force -ErrorAction SilentlyContinue }
+    if ($pid4 -gt 0) {
+        $hp = Get-Process -Id $pid4 -ErrorAction SilentlyContinue
+        if ($hp) { Stop-Process -Id $hp.Id -Force -ErrorAction SilentlyContinue }
+    }
+    if (Test-Path $realBak) {
+        Copy-Item $realBak $core -Force
+        Remove-Item $realBak -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
+}
+
 # P2b-2: the UEF chain must call the NEW Core after a reload.  The host raises
 # an unhandled exception 6 s in (after a reload at ~1.5 s); the new Core's
 # CrashFilter must log "!! crash" for that pid.  A dangling chain would crash
@@ -233,6 +271,11 @@ try {
         if ($hp) { Stop-Process -Id $hp.Id -Force -ErrorAction SilentlyContinue }
     }
     Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
+}
+
+if (Test-Path $save) {
+    Copy-Item $save $core -Force
+    Remove-Item $save -Force -ErrorAction SilentlyContinue
 }
 
 "VERDICT " + $(if ($pass) { 'PASS (cache/reload/rollback/still-mapped/uef)' } else { 'FAIL' })

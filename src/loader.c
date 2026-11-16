@@ -1066,7 +1066,7 @@ static int InstallInlineHooks(void)
         n++; if (InstallInlineHook((void*)real_ShellExecuteW, (void*)L_ShellExecuteW,
                                    (void**)&real_ShellExecuteW)) ok++;
     }
-    return (n == ok) ? n : -ok;
+    return (n > 0 && n == ok) ? n : (ok - n);   /* 0 = no targets, <0 = partial */
 }
 
 /* ---------------- blob store (P2: Core state across reloads) ---------------- */
@@ -1342,12 +1342,16 @@ static BOOL LoadCoreFrom(const char* src, char* outPath, size_t outCap,
 
     /* Core is initialized now: never FreeLibrary on these two paths */
     if (api.abi_version != HR_ABI_VERSION || api.size < sizeof(HrCoreApi)) {
+        /* 这个 Core 可能已经 uef_push 过: 它不发布, 把它的过滤器摘掉,
+           避免重载失败几次把 UEF 栈占满。 */
+        if (g_hostCfg.uef_pop) g_hostCfg.uef_pop();
         HookLog("[Loader] %s: bad ABI (abi=%u size=%u) - leaving it mapped",
                 cachePath, api.abi_version, api.size);
         if (err) _snprintf(err, errCap - 1, "bad ABI (left mapped)");
         return FALSE;
     }
     if (!HooksComplete(&api.hooks)) {
+        if (g_hostCfg.uef_pop) g_hostCfg.uef_pop();
         HookLog("[Loader] %s: hook table incomplete - leaving it mapped", cachePath);
         if (err) _snprintf(err, errCap - 1, "hook table incomplete (left mapped)");
         return FALSE;
@@ -1383,7 +1387,18 @@ static int DoReload(int noRollback, char* resp, size_t cap)
         return 0;
     }
     if (!g_cur.valid) {
-        _snprintf(resp, cap - 1, "err no-active-core\n");
+        /* 初始加载失败 (或上次卸载后没有活动 Core): 允许 reload 直接做一次
+           全新的加载 —— Manager 的日志里承诺过"control pipe 留着可以重试"。
+           这里没有旧 Core 要 drain, 也不需要 before_unload。 */
+        _snprintf(src, sizeof(src) - 1, "%s" HR_CORE_NAME, g_baseDir);
+        src[sizeof(src) - 1] = '\0';
+        if (LoadCoreFrom(src, cache, sizeof(cache), err, sizeof(err))) {
+            InterlockedExchange(&g_unloading, 0);
+            _snprintf(resp, cap - 1, "ok seq=%lu cache=%s\n",
+                      (unsigned long)g_cur.seq, cache);
+            return 1;
+        }
+        _snprintf(resp, cap - 1, "err load-failed: %s\n", err);
         return 0;
     }
     if (!g_core.before_unload) {
@@ -1415,10 +1430,15 @@ static int DoReload(int noRollback, char* resp, size_t cap)
         for (i = 0; i < 3000 && InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0; i++)
             Sleep(1);
         if (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0) {
-            InterlockedExchange(&g_unloading, 0);
-            HookLog("[Loader] reload refused: %ld hooks still executing",
+            /* ★ before_unload 已经执行: Worker 停了、g_coreDisabled=1、
+               UEF 也 pop 了 —— 这个 Core 不可逆。绝不能把 g_unloading 恢复
+               成 0 让它重新接收调用 (那只会在半卸载的 Core 上跑业务逻辑)。
+               保持直通, 标记 coreDead, 后续 reload 一律拒绝, 直到重新注入。 */
+            InterlockedExchange(&g_coreDead, 1);
+            HookLog("[Loader] reload aborted: %ld hooks still executing; "
+                    "core disabled (reinject/restart needed)",
                     (long)InterlockedCompareExchange(&g_inHookCount, 0, 0));
-            _snprintf(resp, cap - 1, "err hooks-busy\n");
+            _snprintf(resp, cap - 1, "err hooks-busy (core disabled)\n");
             return 0;
         }
     }
@@ -1549,7 +1569,9 @@ static DWORD WINAPI Manager(LPVOID p)
 
     ResolveReals();
     inlineOk = InstallInlineHooks();
-    HookLog("[Loader] inline hooks: %s", inlineOk < 0 ? "PARTIAL" : "all installed");
+    HookLog("[Loader] inline hooks: %s",
+            inlineOk < 0 ? "PARTIAL"
+                         : (inlineOk == 0 ? "none (no targets)" : "all installed"));
 
     PatchAllModules();
 
