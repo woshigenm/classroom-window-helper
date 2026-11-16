@@ -1555,7 +1555,8 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         RECT ur;
         RemovePropA(h, PROP_SIZING);
         if (GetWindowRect(h, &ur)) {
-            if (IsWorkAreaSized(h, &ur) || IsMonitorSized(h, &ur)) {
+            if (GetPropA(h, PROP_USERMAX) &&
+                (IsWorkAreaSized(h, &ur) || IsMonitorSized(h, &ur))) {
                 /* 拖动的仍是"铺满屏幕"的窗口: 保留 BypassUserMax 和原来的
                    小窗还原点 —— 否则一拖就会被 enforcer 降回小窗。 */
                 TrackGeo(h, &ur);
@@ -1563,6 +1564,10 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 RemovePropA(h, PROP_USERMAX);
                 CaptionApply(h, TRUE);   /* 用户把最大化窗口拖小了: 控制栏要回来 */
                 TrackGeo(h, &ur);
+                /* ★ 只要不是"模拟最大化"状态, 松手时的矩形就是用户的最终选择
+                   —— 哪怕它几乎铺满屏幕。以前这里对"接近满屏"的矩形不记录,
+                   于是用户把小窗拉大后, 应用缓存的 441x435 仍然被当成"用户
+                   矩形", 下一次拖动/应用定时器就把窗口缩回右下角。 */
                 SetUserRect(h, &ur);  /* 用户摆好的矩形 = 以后"还原"的目标 */
                 HookLog("user-resized hwnd=%p -> %dx%d@(%d,%d) managed=%d",
                         (void*)h, (int)(ur.right - ur.left), (int)(ur.bottom - ur.top),
@@ -1735,7 +1740,25 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                渲染器会反复改写样式把最大化位清掉, 那个位不可靠;
                几何是否放行只由"用户刚动过"决定。 */
             BOOL maximizing = (wpos->cx >= mw && wpos->cy >= mh) && userCmd;
-            BOOL restoring  = userCmd && !maximizing;
+            /* ★ "还原"必须同时满足: 用户刚动过窗口 + 请求的矩形就是**我们记录的
+               用户矩形**。以前只要求"userCmd 在 1.5 秒内", 于是用户一拖边框
+               (SC_SIZE 会写 USERCMD), 渲染器紧接着那一次 500ms 定时器请求
+               (把它缓存的小矩形再发一遍) 就被当成"用户还原"放行 —— 窗口当场
+               缩回右下角的小窗。我们自己在 SC_RESTORE 里摆回用户矩形的那一条
+               请求正好等于用户矩形, 所以仍然放行。 */
+            BOOL restoring  = FALSE;
+            if (userCmd && !maximizing) {
+                RECT ur;
+                if (GetUserRect(h, &ur) &&
+                    abs((int)ur.left - (int)wpos->x) <= 8 &&
+                    abs((int)ur.top  - (int)wpos->y) <= 8 &&
+                    abs((int)(ur.right  - ur.left) - (int)wpos->cx) <= 8 &&
+                    abs((int)(ur.bottom - ur.top)  - (int)wpos->cy) <= 8)
+                    restoring = TRUE;
+                /* 系统真实的"从最大化还原"也放行 (我们不用 WS_MAXIMIZE,
+                   但渲染器/系统仍可能把它置上) */
+                if (!restoring && IsZoomed(h)) restoring = TRUE;
+            }
 
             /* ★ 已经在"模拟最大化"状态: 应用发来的任何几何变更一律冻住。
                渲染器时不时会把窗口摆成 "-8,-8 1920x1080" —— 外框贴住屏幕左上角,

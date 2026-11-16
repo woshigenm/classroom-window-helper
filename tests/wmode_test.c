@@ -10,6 +10,11 @@
  *    top   = 渲染窗还有没有 WS_EX_TOPMOST
  *    above = 渲染窗是不是排在参考窗之上 (Z 序更靠前)
  *
+ *  第二阶段 (仅注入时): 用户把小窗拖到接近满屏 -> 松手 -> 应用把出生时缓存的
+ *  小矩形再发三遍 (用 GetProcAddress 动态调 SetWindowPos, 和真渲染器一样绕开
+ *  IAT, 只考窗口子类那层判断)。期望窗口守住用户的尺寸 (resize_kept=1);
+ *  旧逻辑会把"用户刚动过窗口"直接当成"用户还原"放行, 窗口当场缩回右下角。
+ *
  *  预期基线 (不注入):              top=1 above=1
  *  旧版 DLL (TOPMOST->NOTOPMOST):  top=0 above=1   <- 缺陷: 每次重申都抬到
  *                                                 参考窗之上
@@ -43,6 +48,7 @@ static HWND   g_ref;
 static int    g_polls;
 static int    g_topSet;
 static int    g_aboveN;
+static int    g_resizeKept = 1;   /* Phase 2: 用户拖大后应用想改回去, 窗口守住了吗 */
 static FILE*  g_logFile;
 
 static void Say(const char* fmt, ...)
@@ -253,6 +259,12 @@ int main(int argc, char** argv)
             Say("WARNING: injector failed, continuing as baseline");
         /* DLL 里 Worker 有 200ms 的建窗等待 + 打补丁时间 */
         Pump(1500);
+
+        /* 真机上这个属性由 DLL 在"接管/降级"窗口时写入 (MarkManaged)。
+           窗口模式广播窗是"出生就小", 不会走降级路径, 所以测试里自己补上,
+           否则子类里"几何归用户"那一整段根本不会执行。 */
+        SetPropA(g_win, "BypassSmall", (HANDLE)1);
+        Say("marked managed (BypassSmall) so the geometry rules apply");
     }
 
     for (i = 1; i <= ticks; i++) {
@@ -282,13 +294,71 @@ int main(int argc, char** argv)
             ZIndex(g_win), ZIndex(g_ref));
     }
 
-    Say("SUMMARY polls=%d top_set=%d above_probe=%d",
-        g_polls, g_topSet, g_aboveN);
-    Say("VERDICT %s",
-        (g_topSet == 0 && g_aboveN == 0) ? "FIXED (topmost stripped, z-order frozen)"
-                                         : "NOT FIXED");
+    /* ---- Phase 2: 用户把小窗拖到接近满屏, 应用又把缓存的小矩形发回来 ----
+       19:18 的现场日志里, 渲染器是**动态取地址**调 SetWindowPos 的 (不走 IAT),
+       所以只有窗口子类那一层能拦。这里同样用 GetProcAddress 拿函数指针,
+       绕开我们自己打的 IAT 补丁, 真实地考一遍子类里的"几何归用户"判断。
 
-    ok = (g_topSet == 0 && g_aboveN == 0) ? 0 : 1;
+       模拟的用户动作: 写一次 BypassUserCmd 时间戳 (等价于 SC_SIZE/SC_MOVE 里
+       记录的那一下 —— 不直接发 SC_SIZE, 那会进系统的模态拖拽循环把测试卡住),
+       再走一遍 WM_ENTERSIZEMOVE → 改大小 → WM_EXITSIZEMOVE (松手)。 */
+    if (dllPath && g_win && IsWindow(g_win)) {
+        typedef BOOL (WINAPI *PFN_SWP)(HWND, HWND, int, int, int, int, UINT);
+        PFN_SWP dynSwp = (PFN_SWP)(void*)GetProcAddress(GetModuleHandleA("user32.dll"),
+                                                        "SetWindowPos");
+        RECT        small, now;
+        MONITORINFO mi;
+        HMONITOR    mon;
+        int uw = 0, uh = 0, ux = 0, uy = 0;
+
+        GetWindowRect(g_win, &small);
+        memset(&mi, 0, sizeof(mi));
+        mi.cbSize = sizeof(mi);
+        mon = MonitorFromWindow(g_win, MONITOR_DEFAULTTONEAREST);
+
+        if (dynSwp && GetMonitorInfoA(mon, &mi)) {
+            uw = (mi.rcWork.right - mi.rcWork.left) - 16;   /* 几乎铺满, 但不是整屏 */
+            uh = (mi.rcWork.bottom - mi.rcWork.top) - 16;
+            ux = mi.rcWork.left + 8;
+            uy = mi.rcWork.top + 8;
+
+            Say("resize: user drags %dx%d@(%d,%d) -> %dx%d@(%d,%d)",
+                (int)(small.right - small.left), (int)(small.bottom - small.top),
+                (int)small.left, (int)small.top, uw, uh, ux, uy);
+
+            SetPropA(g_win, "BypassUserCmd", (HANDLE)(ULONG_PTR)GetTickCount());
+            SendMessageA(g_win, WM_ENTERSIZEMOVE, 0, 0);
+            SetWindowPos(g_win, NULL, ux, uy, uw, uh, SWP_NOZORDER | SWP_NOACTIVATE);
+            Pump(80);
+            SendMessageA(g_win, WM_EXITSIZEMOVE, 0, 0);
+            Pump(80);
+
+            /* 渲染器 500ms 定时器: 把出生时缓存的小矩形再发一遍 (它想要回去) */
+            for (i = 0; i < 3; i++) {
+                dynSwp(g_win, NULL, (int)small.left, (int)small.top,
+                       (int)(small.right - small.left),
+                       (int)(small.bottom - small.top),
+                       SWP_NOZORDER | SWP_NOACTIVATE);
+                Pump(120);
+            }
+
+            GetWindowRect(g_win, &now);
+            g_resizeKept = ((now.right - now.left) >= uw - 24 &&
+                            (now.bottom - now.top) >= uh - 24) ? 1 : 0;
+            Say("resize: after app re-apply -> %dx%d@(%d,%d) kept=%d",
+                (int)(now.right - now.left), (int)(now.bottom - now.top),
+                (int)now.left, (int)now.top, g_resizeKept);
+        }
+    }
+
+    Say("SUMMARY polls=%d top_set=%d above_probe=%d resize_kept=%d",
+        g_polls, g_topSet, g_aboveN, g_resizeKept);
+    Say("VERDICT %s",
+        (g_topSet == 0 && g_aboveN == 0 && g_resizeKept)
+            ? "FIXED (topmost stripped, z-order frozen, user resize kept)"
+            : "NOT FIXED");
+
+    ok = (g_topSet == 0 && g_aboveN == 0 && g_resizeKept) ? 0 : 1;
 
     DestroyWindow(g_win);
     DestroyWindow(g_ref);

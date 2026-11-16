@@ -50,8 +50,8 @@
 | 信号 | 来源 | 用途 |
 |---|---|---|
 | `BypassSizing` | `WM_ENTERSIZEMOVE` ~ `WM_EXITSIZEMOVE` | 用户正在拖边框/拖标题栏 → 一切放行 |
-| `BypassUserCmd` | `WM_SYSCOMMAND`(SC_RESTORE/MAXIMIZE/MINIMIZE/MOVE/SIZE)、`WM_NCLBUTTONDBLCLK` | 用户刚下过命令（一次命令只放行一次状态切换） |
-| `BypassUserRc` | 降级完成时 / 每次 `WM_EXITSIZEMOVE` | "用户矩形"：还原的目标，不会被应用缓存尺寸污染 |
+| `BypassUserCmd` | `WM_SYSCOMMAND`(SC_RESTORE/MAXIMIZE/MINIMIZE/MOVE/SIZE)、`WM_NCLBUTTONDBLCLK` | 用户刚下过命令（**只是前提条件**，几何还要过下面的"== 用户矩形"校验） |
+| `BypassUserRc` | 降级完成时 / 每次 `WM_EXITSIZEMOVE` | "用户矩形"：还原的目标，不会被应用缓存尺寸污染；**拖到接近满屏也算**（只有"模拟最大化"状态下的拖动例外） |
 | `BypassZoomed` | `WM_WINDOWPOSCHANGED` | 记录当前是否最大化 |
 
 规则：
@@ -60,6 +60,12 @@
 - **应用发起的几何变更**（`SetWindowPos` / `MoveWindow` / `WM_WINDOWPOSCHANGING`）→
   统一改成 `SWP_NOSIZE | SWP_NOMOVE`（并吞掉 `SWP_FRAMECHANGED`，否则边框重算会把
   `WS_MAXIMIZE` 丢掉）。
+- **"用户刚下过命令"不等于"放行应用的几何请求"**：应用每 500ms 会把出生时缓存的
+  小矩形再发一遍。早年这里只看"命令是不是 1.5 秒内的"，于是用户一拖边框
+  （`SC_SIZE` 会写 `BypassUserCmd`），紧接着那次定时器就被当成"用户还原"放行，
+  窗口当场缩回右下角（19:18 实测日志：`syscmd cmd=0xF000 user=1` → 300ms 后
+  `geo … -> 441x435@(811,728)`）。现在放行条件是**请求矩形 ≈ 记录的
+  `BypassUserRc`（±8px）**；我们自己在 `SC_RESTORE` 里摆回用户矩形正好满足它。
 - **应用发起的窗口状态变更**（`ShowWindow` / `ShowWindowAsync` 的
   `SW_RESTORE/SW_SHOWNORMAL/SW_MAXIMIZE/SW_SHOWMAXIMIZED`）→ **一律忽略**。
 - **用户的最大化/还原** → 由我们在窗口线程里直接执行：
@@ -515,7 +521,7 @@ bypass.exe (普通用户)
 | `ignore app window-state change ... (cmd=9)` | 应用想还原/最大化，被忽略（9 = SW_RESTORE） |
 | `user restore ... (done by us)` | 用户点还原，由我们摆回用户矩形 |
 | `user maximize ... (done by us)` | 用户点最大化，由我们执行 |
-| `user-resized hwnd=...` | 用户拖完，记录为新的"用户矩形" |
+| `user-resized hwnd=...` | 用户拖完，记录为新的"用户矩形"（拖到接近满屏也算） |
 | `blocked SwitchDesktop(...)` | 拦住了切桌面 |
 | `suppressed SetWindowsHookExW(id=14)` | 拦住了全局鼠标钩子（14 = WH_MOUSE_LL） |
 | `untopmost hwnd=... (window-mode broadcast)` | 窗口模式广播小窗出生时带的 `WS_EX_TOPMOST` 已摘掉（见 2.4）；正常只在出生后出现一次 |
