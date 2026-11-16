@@ -41,6 +41,7 @@ make.bat lpe          :: 只编 / 铺开 bin\lpe\
 make.bat test         :: bin\hooktest32.exe
 make.bat wmodetest    :: bin\wmode_test.exe
 make.bat vdtest       :: bin\vd_pin_test.exe
+make.bat hangwintest  :: bin\hangwin_test.exe（跨进程兜底测试用的"不泵消息"受害者）
 make.bat clean | rebuild | check
 ```
 
@@ -68,7 +69,7 @@ classroom-window-helper\
 │   ├─ lpe_broker.c            自动提权用 shell_broker.exe
 │   └─ bypass_state.h          主程序 / DLL 共享状态
 ├─ lpe\                        自动提权载荷（trigger.ps1 + payload\ 里的 PoC 原样二进制）
-├─ tests\                      自测源码（hooktest32 / wmode_test / vd_pin_test）
+├─ tests\                      自测源码（hooktest32 / wmode_test / vd_pin_test / hangwin_test）
 ├─ build\                      编译 / 签名 / 打包脚本（说明见 build\README.md）
 ├─ docs\                       how-to-use.md（手册）、design.md（原理）
 └─ bin\                        所有编译产物 + 运行期配置 / 日志（gitignore）

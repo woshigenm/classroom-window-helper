@@ -400,31 +400,40 @@ static BOOL IsClassroomExe(const char* name)
     return FALSE;
 }
 
-/* pid -> "是不是课堂进程" 的小缓存, 避免每次钩子调用都 OpenProcess */
+/* pid -> "是不是课堂进程" 的小缓存, 避免每次钩子调用都 OpenProcess。
+   ★ 三种结果分开缓存: 以前只有"是/否"两种, 一次 OpenProcess 失败会被**永久**
+     记成"否", 之后这个 pid 的跨进程窗口保护全部失效 (日志里什么都看不到)。
+       1 = 确定是      (缓存 30 秒)
+       2 = 确定不是    (缓存 30 秒; pid 会被系统回收, 所以不能永久)
+       3 = 暂时查不到  (只缓存 2 秒 —— 进程刚创建 / 受保护, 过一会儿就能查了)
+     3 也缓存一下, 是为了别在每秒一轮的枚举里反复 OpenProcess 失败。 */
 static BOOL IsClassroomPid(DWORD pid)
 {
     static DWORD cachePid[16];
-    static char  cacheRes[16];      /* 0 = 未知, 1 = 是, 2 = 否 */
+    static DWORD cacheTick[16];
+    static char  cacheRes[16];      /* 0 空 / 1 是 / 2 否 / 3 暂时查不到 */
     static volatile LONG next;
     int i;
 
-    for (i = 0; i < 16; i++)
-        if (cachePid[i] == pid && cacheRes[i]) return cacheRes[i] == 1;
+    for (i = 0; i < 16; i++) {
+        DWORD ttl;
+
+        if (cachePid[i] != pid || !cacheRes[i]) continue;
+        ttl = (cacheRes[i] == 3) ? 2000 : 30000;
+        if ((DWORD)(GetTickCount() - cacheTick[i]) < ttl)
+            return (cacheRes[i] == 1) ? TRUE : FALSE;
+        break;                      /* 过期: 重新查一次 */
+    }
 
     {
-        char img[MAX_PATH];
-        BOOL yes;
-        LONG slot;
+        char  img[MAX_PATH];
+        LONG  slot = InterlockedIncrement(&next) & 15;
+        BOOL  resolved = GetPidImage(pid, img, sizeof(img));
 
-        /* ★ 取不到镜像名 (进程刚创建 / 受保护) 时不能缓存成"不是课堂进程":
-           以前那一瞬间的失败会被永久记住, 之后这个 pid 的跨进程窗口保护
-           全都不生效。拿不到就本次按"否"处理, 下次再问。 */
-        if (!GetPidImage(pid, img, sizeof(img))) return FALSE;
-        yes = IsClassroomExe(img);
-        slot = InterlockedIncrement(&next) & 15;
-        cachePid[slot] = pid;
-        cacheRes[slot] = yes ? 1 : 2;
-        return yes;
+        cachePid[slot]  = pid;
+        cacheTick[slot] = GetTickCount();
+        cacheRes[slot]  = resolved ? (IsClassroomExe(img) ? 1 : 2) : 3;
+        return resolved ? (cacheRes[slot] == 1) : FALSE;
     }
 }
 
@@ -3142,47 +3151,30 @@ static BOOL CrossBudget(HWND h)
     return FALSE;
 }
 
-/* 已经被我们小窗化过的窗口: 记住它, 之后只管样式(去置顶/去 POPUP),
-   不再动尺寸 —— 否则用户拖大、最大化会被我们一秒一次地拽回去。 */
-#define MAX_MANAGED 32
-static HWND g_managed[MAX_MANAGED];
-
 /* 已经被我们小窗化过的窗口: 用**窗口属性**做标记 (SetProp/GetProp),
    它是挂在窗口对象上的, 任何进程都读得到 —— 比"进程内表"和
    "看样式像不像"都可靠。
    ⚠ 千万不能用样式判断: 窗口模式下的广播窗天生就是 0x14C40000
-   (带 WS_CAPTION、无 WS_POPUP), 会被误判成"已经接管过"而永远不小窗化。 */
+   (带 WS_CAPTION、无 WS_POPUP), 会被误判成"已经接管过"而永远不小窗化。
+   ⚠ 也**不能**再用进程内表兜底: 句柄数值会被系统复用, 而 IsWindow() 只能
+     证明"这个句柄现在活着", 不能证明是同一个窗口 —— ScreenRender 重建渲染窗
+     时很容易拿到刚销毁那个的数值, 于是新窗口被当成"已接管", 再也不降级
+     (没有任何日志痕迹)。属性消失 = 不是我们接管的窗口, 这才是单一真相。 */
 #define PROP_SMALL "BypassSmall"
 
 static BOOL IsManaged(HWND h)
 {
-    int i;
-
-    if (GetPropA(h, PROP_SMALL)) return TRUE;
-
-    /* 进程内小缓存: 句柄会被复用, 必须验证还活着, 否则新窗口可能被误判。
-       ⚠ IsWindow 只能证明"这个句柄现在活着", 不能证明是同一个窗口 ——
-       句柄复用后, 注释掉的判断会把 SysShadow / 对话框也当成广播窗。
-       所以表里命中的还必须真的是渲染器窗口类。 */
-    for (i = 0; i < MAX_MANAGED; i++) {
-        if (g_managed[i] == h && IsWindow(h)) {
-            char cls[96] = "";
-            GetClassNameA(h, cls, sizeof(cls));
-            if (IsRenderWindowClass(cls)) return TRUE;
-        }
-    }
-    return FALSE;
+    if (!h || !IsWindow(h)) return FALSE;
+    return GetPropA(h, PROP_SMALL) ? TRUE : FALSE;
 }
 
 static void MarkManaged(HWND h)
 {
-    static volatile LONG next;
-    LONG slot;
-
-    SetPropA(h, PROP_SMALL, (HANDLE)1);
-
-    slot = InterlockedIncrement(&next) & (MAX_MANAGED - 1);
-    g_managed[slot] = h;
+    if (!h || !IsWindow(h)) return;
+    if (!SetPropA(h, PROP_SMALL, (HANDLE)1) &&
+        InterlockedIncrement(&g_subLogs) <= 20)
+        HookLog("WARNING: SetProp(BypassSmall) failed hwnd=%p err=%lu",
+                (void*)h, (unsigned long)GetLastError());
 }
 
 static BOOL LooksManaged(HWND h)
@@ -3338,9 +3330,8 @@ static void TrackGeo(HWND h, const RECT* r)
 
 /* 窗口销毁: 清掉几何/用户矩形缓存。不然句柄被系统复用后, 新窗口会拿到
    上一个广播窗的"用户矩形", 还原/最大化就会摆到错误的位置。
-   ★ 顺带清 g_managed / g_cross: IsManaged 会拿"数值相同的句柄 + 渲染器类名"
-    兜底判断, 句柄被复用给另一个渲染窗时就会误判"已经接管过", 新广播窗
-     再也不降级 (同样没有日志痕迹)。 */
+   (managed 标记现在只靠窗口属性, 窗口销毁时系统会连属性一起回收,
+    所以这里不需要再维护一张进程内表。) */
 static void ForgetWindowGeom(HWND h)
 {
     int i;
@@ -3357,8 +3348,6 @@ static void ForgetWindowGeom(HWND h)
             memset(&g_geo[i].r, 0, sizeof(RECT));
         }
     }
-    for (i = 0; i < MAX_MANAGED; i++)
-        if (g_managed[i] == h) g_managed[i] = NULL;
     for (i = 0; i < MAX_CROSS; i++)
         if (g_cross[i].h == h) g_cross[i].h = NULL;
     LeaveCriticalSection(&g_geoSs);
@@ -3759,7 +3748,12 @@ static BOOL NeedsFix(HWND h)
      线程; 对端一旦不泵消息 (模态框 / 断点 / 渲染卡死), 就会把我们唯一的
      enforcer 线程永久挂死 —— 本进程的小窗化、注入、心跳全部停摆。
      SetWindowPos 带 SWP_ASYNCWINDOWPOS 就不会等; 样式等 DLL 注进去以后,
-     由对端自己的钩子去修。 */
+     由对端自己的钩子去修。
+   ★ 异步化的固有代价: 请求还在对端队列里, 此刻 GetWindowRect 读到的还是旧
+     矩形, 所以这里**不做回读校验** (本进程窗口那条路才有 `-> now ... (wanted
+     ...)` 的校验, 那是同步 SetWindowPos, 可以回读)。判定"改没改成"只能看
+     下一轮枚举, 或者等对端注入后用日志里的 `keep user geometry` 确认。
+     MarkManaged 的窗口属性也顺便把"每轮重试"挡掉了。 */
 static BOOL FixForeignGeometry(HWND h)
 {
     RECT     r;
@@ -3781,8 +3775,15 @@ static BOOL FixForeignGeometry(HWND h)
 
     SmallRectFor(w, hh, &nx, &ny, &nw, &nh);
     if (!real_SetWindowPos) return FALSE;
-    real_SetWindowPos(h, HWND_NOTOPMOST, nx, ny, nw, nh,
-                      SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    if (!real_SetWindowPos(h, HWND_NOTOPMOST, nx, ny, nw, nh,
+                           SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)) {
+        /* 对端线程不泵消息时这个请求会失败 (实测同步版会卡 64 秒, 异步版立刻
+           返回 FALSE)。**不要**标记 managed: 下一轮等它恢复/被注入后还能再试。 */
+        if (InterlockedIncrement(&g_fixLogs) <= 60)
+            HookLog("fix(foreign, async) failed hwnd=%p err=%lu (owner not pumping?)",
+                    (void*)h, (unsigned long)GetLastError());
+        return FALSE;
+    }
     MarkManaged(h);        /* 属性挂在窗口对象上, 跨进程设置也不会阻塞 */
     if (InterlockedIncrement(&g_fixLogs) <= 60)
         HookLog("fix(foreign, async) hwnd=%p %dx%d -> %dx%d",
@@ -4023,6 +4024,81 @@ static void* FollowJump(void* target)
     return b;
 }
 
+/* 在 p 处落 5 字节 `E9 rel32`。**必须先挂起本进程里所有别的线程**:
+   直接写这 5 个字节时, 渲染器的定时器线程随时可能在 `ShowWindow` 入口
+   执行到"半个 E9" (或者 E9 已写、rel32 还是旧的), 那就是整进程崩。
+   步骤: 挂起其他线程 → 确认没有线程的 EIP 正停在 [p,p+5) 里
+   (有就放弃, 让调用方重试) → 写 → FlushInstructionCache → 恢复。
+   只用于"序言不是 hotpatch 形状"的回退路径; hotpatch 位那条路入口只落
+   一条 2 字节指令, 不需要挂线程。 */
+#define MAX_SUSP 64
+static BOOL PatchEntry5(unsigned char* p, void* hook)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 3; attempt++) {
+        HANDLE snap, th[MAX_SUSP];
+        THREADENTRY32 te;
+        DWORD  self = GetCurrentThreadId();
+        DWORD  old = 0;
+        int    n = 0, i, inside = -1;
+        BOOL   ok = FALSE;
+
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return FALSE;
+        te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+                if (te.th32ThreadID == self) continue;
+                if (n >= MAX_SUSP) break;
+                th[n] = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                   THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (!th[n]) continue;
+                if (SuspendThread(th[n]) == (DWORD)-1) {
+                    CloseHandle(th[n]);
+                    continue;
+                }
+                n++;
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+
+        for (i = 0; i < n; i++) {
+            CONTEXT c;
+            memset(&c, 0, sizeof(c));
+            c.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(th[i], &c)) {
+                DWORD eip = (DWORD)c.Eip;
+                if (eip >= (DWORD)(DWORD_PTR)p &&
+                    eip <  (DWORD)(DWORD_PTR)p + 5) {
+                    inside = i;
+                    break;
+                }
+            }
+        }
+
+        if (inside < 0 && VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) {
+            *(LONG*)(p + 1) = (LONG)((unsigned char*)hook - (p + 5));
+            p[0] = 0xE9;
+            FlushInstructionCache(GetCurrentProcess(), p, 5);
+            VirtualProtect(p, 5, old, &old);
+            ok = TRUE;
+        }
+
+        for (i = 0; i < n; i++) {
+            ResumeThread(th[i]);
+            CloseHandle(th[i]);
+        }
+        if (ok) return TRUE;
+        Sleep(50);                  /* 有线程正卡在入口里: 等一下再试 */
+    }
+
+    HookLog("inline hook: 5-byte entry patch postponed at %p "
+            "(thread inside prologue or protect failed)", p);
+    return FALSE;
+}
+
 /* 把 target 入口改成 jmp hook, 原 5 字节搬进 trampoline 再跳回 target+5。
    user32 的 ShowWindow(Async) 是 hotpatch 序言: 8B FF 55 8B EC, 正好 5 字节。
    ★ *realSlot 在写补丁**之前**就指向 trampoline, 避免打补丁的瞬间
@@ -4121,17 +4197,16 @@ static BOOL InstallInlineHook(void* target, void* hook, void** realSlot)
     tr[5] = 0xE9;
     *(LONG*)(tr + 6) = (LONG)((p + 5) - (tr + 5 + 5));   /* tr+10 -> target+5 */
 
-    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) {
-        VirtualFree(tr, 0, MEM_RELEASE);
+    *realSlot = tr;                     /* 先更新, 再打补丁 */
+    if (!PatchEntry5(p, hook)) {
+        /* 入口补丁没落上: IAT 那条路仍然有效 (Hook -> real=tr -> 原代码),
+           只是"缓存了函数指针"的调用绕不过去。不下补丁, 不留半成品。 */
+        HookLog("inline hook: IAT only (entry patch skipped) for %p", p);
         return FALSE;
     }
-    *realSlot = tr;                     /* 先更新, 再打补丁 */
-    p[0] = 0xE9;
-    *(LONG*)(p + 1) = (LONG)((unsigned char*)hook - (p + 5));
-    VirtualProtect(p, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), p, 5);
 
-    HookLog("inline hook installed: %p -> %p (trampoline %p)", p, hook, tr);
+    HookLog("inline hook installed: %p -> %p (trampoline %p, threads suspended)",
+            p, hook, tr);
     return TRUE;
 }
 

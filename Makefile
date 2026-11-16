@@ -53,7 +53,7 @@ CFLAGS32 := -std=gnu11 -O2 -Wall
 DLLFLAGS := -shared -Wl,--kill-at -static -static-libgcc
 DLLLIBS  := -lpsapi -lole32 -ladvapi32
 
-.PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest clean rebuild check
+.PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest hangwintest clean rebuild check
 
 # 主程序 + DLL + 注入器 + 自动提权载荷（自测程序按需单独编）
 all: bypass hook32 lpe
@@ -82,6 +82,10 @@ wmodetest: $(BIN)/wmode_test.exe
 # virtual desktop pin regression (tests/vd_pin_test.c)
 vdtest: $(BIN)/vd_pin_test.exe
 
+# "对端不泵消息"的受害者进程, 配合 tests\foreign_fix_test.ps1 验证跨进程兜底
+# 不会卡死 enforcer (tests/hangwin_test.c)
+hangwintest: $(BIN)/hangwin_test.exe
+
 # ---- outputs -------------------------------------------------
 
 $(BIN):
@@ -101,6 +105,9 @@ $(BIN)/hooktest32.exe: tests/hooktest32.c | $(BIN)
 
 $(BIN)/wmode_test.exe: tests/wmode_test.c | $(BIN)
 	"$(CC32)" $(CFLAGS32) "tests/wmode_test.c" -o "$@"
+
+$(BIN)/hangwin_test.exe: tests/hangwin_test.c | $(BIN)
+	"$(CC64)" $(CFLAGS32) "tests/hangwin_test.c" -o "$@"
 
 $(BIN)/vd_pin_test.exe: tests/vd_pin_test.c | $(BIN)
 	"$(CC32)" $(CFLAGS32) "tests/vd_pin_test.c" -o "$@" -lole32 -luuid -ladvapi32

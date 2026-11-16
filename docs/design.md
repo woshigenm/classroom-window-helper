@@ -83,17 +83,25 @@
 - 表满时**轮转覆盖**而不是丢弃：`Student.exe` 的顶层窗口一多，广播窗否则永远
   拿不到槽 → 没有"用户矩形" → 还原/最大化静默失效（日志里什么都不会留下）。
 - 跨进程兜底（同族进程还没被注入时）**只做异步几何**：`SetWindowPos` 带
-  `SWP_ASYNCWINDOWPOS`，一个样式字节都不写。`SetWindowLong(GWL_STYLE)` 会同步
-  `SendMessage(WM_STYLECHANGING)` 到对端 UI 线程，对端一旦不泵消息（模态框 /
-  断点 / 渲染卡死），我们唯一的 enforcer 线程就被永久挂死。
+  `SWP_ASYNCWINDOWPOS`，一个样式字节都不写。同步跨进程改窗口的代价实测过：
+  对端 UI 线程不泵消息时，`SetWindowPos` **卡了约 64 秒**才返回（`SetWindowLong`
+  则直接失败，err=1400），而我们只有一个 enforcer 线程 —— 卡一次就全停。
+  异步化的代价是**不能回读校验**（请求还在对端队列里），所以这里没有
+  `-> now ... (wanted ...)` 那类校验；是否改成只能看下一轮枚举或对端注入后的日志。
+  异步调用失败（对端彻底不响应）时**不**标记"已接管"，下一轮还能再试。
 - 内联钩子优先用微软 hotpatch 位（入口前 5 字节 `CC/90` 填充 + 入口 `8B FF`）：
-  入口只落一条**对齐的 2 字节** `jmp short`，不存在"半个 `E9 rel32`"的窗口
-  （渲染器有 500ms 定时器线程在调 `ShowWindow`，撞上就是整进程崩）；
-  序言不是这个形状时才退回"搬 5 字节到 trampoline"。
-- 子类化判定看**窗口当前的过程指针**（`GWLP_WNDPROC == SubclassProc`），
-  不能信进程内表：HWND 数值会被系统复用，旧记录会让新窗口永远不再子类化。
-  每个窗口销毁时 `ForgetWindowGeom()` 会把用户矩形 / 几何 / managed / cross
-  几处状态一并清掉。
+  入口只落一条**对齐的 2 字节** `jmp short`，不存在"半个 `E9 rel32`"的窗口。
+  序言不是这个形状时才退回"搬 5 字节到 trampoline"：那条路会**先挂起本进程
+  所有其他线程**，确认没有线程的 EIP 停在 `[entry, entry+5)`，再写 5 字节、
+  `FlushInstructionCache`、恢复线程（最多重试 3 次；实在打不上就只保留 IAT 钩子
+  并记一行 `IAT only (entry patch skipped)`）。渲染器有 500ms 定时器线程在调
+  `ShowWindow`，不挂线程直接写 5 字节就是整进程崩。
+- `BypassSmall`（"已接管"标记）只认**窗口属性**，不再用进程内表兜底：
+  `IsWindow()` 只能证明句柄活着，HWND 数值会被系统复用（`ScreenRender` 重建
+  渲染窗就是这种情况），表里的陈旧记录会让新窗口被当成"已接管"而永不降级。
+- 子类化判定同理，看**窗口当前的过程指针**（`GWLP_WNDPROC == SubclassProc`），
+  不能信进程内表；窗口销毁时 `ForgetWindowGeom()` 会把用户矩形 / 几何 /
+  cross 预算几处状态一并清掉。
 
 > 为什么不用 `WS_MAXIMIZE` 当判据：渲染器每 500ms 会把缓存的旧样式写回来（不含
 > `WS_MAXIMIZE`），一旦该位被清掉，窗口就变成「普通窗口 + 满屏几何」——标题栏被顶到
@@ -612,6 +620,24 @@ bin\inject32.exe "%CD%\bin\bypass_hook32.dll"
 
 日志出现 `caption auto-hide ... (maximized broadcast)` 与
 `caption auto-show ... (control bar visible)` 即生效。
+
+验证"跨进程兜底不会卡死 enforcer"（`make.bat hangwintest` + 脚本）：
+
+```bat
+make.bat all hangwintest
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\foreign_fix_test.ps1
+```
+
+脚本把 `bin\hangwin_test.exe` 复制成 `%TEMP%\bypass-foreign-test\ScreenRender.exe`
+再启动：它建一个 `MultiRender*` + 95% 屏的窗口，然后**挂起自己的主线程**
+（永不泵消息）。随后在该目录跑 `wmode_test --inject`，断言：
+
+- `wmode_test` 在 60 秒内跑完且自身通过（旧版同步兜底会把 enforcer 卡住）；
+- 日志里出现 `fix(foreign, async) hwnd=... 2432x1368 -> ...`。
+
+> 受害者必须是 **64 位**：我们的注入器是 32 位的，一旦把 DLL 注进受害者，
+> `PidHasDll()` 就会让 enforcer 走"对端自己有钩子"的分支，跨进程兜底根本不会执行。
+> 没有 64 位工具链时脚本会打印 `SKIP`。
 
 验证"虚拟桌面固定"（两种办法，两个虚拟桌面即可）：
 
