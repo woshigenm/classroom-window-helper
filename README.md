@@ -175,19 +175,63 @@ enabled=1
 | Loader | `bin\bypass_hook32.dll` | 装所有 inline/IAT 钩子、持有 trampoline、日志、路径、教师端判断；把 Core 从 `bin\core_cache\core.<pid>.<n>.dll` 的缓存副本加载，源文件永远不被映射 |
 | Core | `bin\bypass_hook_core.dll` | `Hook_*` 实现、窗口/抓屏/关机守卫；由 Loader `LoadLibraryEx` 后调 `Core_Init` |
 
-> P2a：缓存副本、控制管道（`\\.\pipe\bypass_core_ctl_<pid>`）、回滚和 `still mapped`
-> 已就绪；真实 Core 的 `before_unload` 还没实现（P2b），所以现在对真实 Core 发 `reload`
-> 会返回 `err no-drain (P2b)`，不会卸载它。
-
 **什么时候要重编什么**（很重要）：
 
 | 改动 | 重编 | 重启课堂客户端 |
 |---|---|---|
-| 改 `Hook_*` 的拦截逻辑 | Core | 是（进程里还是旧 Core） |
-| 加一个新的拦截点（新的 inline hook） | Loader + Core | 是 |
+| 改 `Hook_*` 的拦截逻辑 | Core | 否 —— 用「重载 Core」热换 |
+| 加一个新的拦截点（新的 inline hook / IAT dispatcher） | Loader + Core | 是（Loader 占着 DLL 名，不能热换） |
 | 只改主界面 / 托盘 / 文档 | `bypass.exe` | 否 |
 
-**回退**：`bin\bypass_hook_single.dll` 是拆分前那版的完整 DLL。把它复制成
+#### 热重载 Core
+
+主界面底部「**重载 Core**」按钮，或托盘右键 →「重载 Core（热更新）」。它走
+命名管道 `\\.\pipe\bypass_core_ctl_<pid>`：
+
+- **目标进程**：按已知课堂进程名（`RELOAD_TARGETS`：`Student.exe`、`MultiClient.exe`、
+  `MultiRender.exe`、`ScreenRender.exe`、`ScreenRecord.exe`、`SharedDesktop.exe`、
+  `StudentScreenHelper.exe`、`ScreenPen.exe`、`AudioRender.exe`、`AudioSender.exe`）
+  逐个找 PID 再连管道；不做全进程扫描。连不上 = 没注入或旧 DLL，记一行日志跳过。
+- **超时**：Loader 最坏约 12 秒（两个 3 秒线程等待 + VD 3 秒 + 3 秒 drain），所以
+  界面不等：请求发出后马上返回，后台线程最多等 15 秒，3 秒还没结果就把状态栏切成
+  「reloading Core (up to 15s)」。**只有 Loader 明确回 `err` 才算失败**。
+- **结果分类**（日志里逐进程一行）：
+
+  | 响应 | 含义 | 状态栏 |
+  |---|---|---|
+  | `ok seq=N cache=...` | 新 Core 已加载 | `Core reloaded` |
+  | `rolledback seq=N` | 新 Core 失败，已回滚到旧 Core | `reload failed, old Core kept` |
+  | `err refused-by-core` | 阶段 1 拒绝（还有 hook 在跑 / 线程还在停），什么都没动 | `nothing reloaded` |
+  | 其他 `err` | 失败，什么都没动（`--no-rollback` 时可能只剩半套） | `nothing reloaded` |
+  | `err hooks-busy (core disabled)` / `err coreDead` | **进程半禁用，终态** | `Core disabled, restart the process` |
+
+#### 半禁用不是「已直通」
+
+`before_unload` 返回 1 之后才置 `g_unloading=1`，然后 Loader 做权威 drain（3 秒）。
+如果这时还有调用卡在 hook 里（Core 撒谎：返回 1 却没停线程），Loader 保持 `g_unloading=1`、
+置 `g_coreDead=1`、**不卸载**，进程就停在半禁用状态：
+
+- **直通**（11 个包装 hook 入口查 `g_coreDisabled`）：窗口显示类、`CreateProcessW` 等；
+- **仍跑完整逻辑**（不查）：`ShowWindowAsync`、`CreateProcessA`、`WinExec`、
+  `ExitWindowsEx`、`ShellExecuteA/W`（关机/外壳类只在关机守卫开启时真正拦截），
+  以及 25 个 IAT-only 里没有包装的那部分。
+
+所以「重载失败」不等于「hook 停了」：窗口保护可能没了，但关机拦截还在。日志里会打
+`process disabled (partially bypassed)` + 具体说明。`g_coreDead` 是终态（进程全局、
+没有重置路径），只能**重启该课堂进程**或重新注入。
+
+> 为什么是 11 个包装 / 22 个不包装：8 个 inline hook 里只有 `ShowWindow`、
+> `CreateProcessW` 走 `HOOK_ENTER` 的 `g_coreDisabled` 检查，另外 6 个只碰模块全局和
+> `bypass_shut.ini`，重入不会碰到 Worker 资源（`g_stateView` / `g_sub` 等），所以不需要
+> 检查。这也是 `before_unload` 里**不调用任何 hook 函数**的原因——它只用
+> `real_SetWindowLongPtrW`、`StateClose` 这类裸 Win32。
+
+> 另外一条不对称：Loader 故意**不 patch Core 模块自己的 IAT**。Core 内部调 25 个
+> IAT-only 函数直接走原函数（不会重入 dispatcher），只有 8 个 inline hook 会重入。
+
+#### 回退
+
+`bin\bypass_hook_single.dll` 是拆分前那版的完整 DLL（Loader + Core 合一）。把它复制成
 `bin\bypass_hook32.dll`（覆盖 Loader），**重启课堂客户端**，再打开主程序。
 只换文件不重启无效——旧 DLL 已经在进程里；`inject32` 看到
 `bypass_hook32.dll` 或 `bypass_hook_single.dll` 任一个已加载都会跳过。
@@ -199,6 +243,8 @@ enabled=1
 - 卡在 `NetTeachingDesktop`：`Ctrl+Alt+D`。
 - 恢复原生全屏广播：退出工具，在 `bin\` 放 `bypass_hook.off`，重启课堂软件。
 - 让广播窗重新跟着当前虚拟桌面：`bin\bypass_vd.ini` 的 `enabled=0`（不用重启课堂软件）。
+- 「重载 Core」提示 **Core disabled, restart the process**：该课堂进程已半禁用（终态，
+  见 5.6），hook 只剩部分拦截，必须**重启那个课堂进程**（或让 `bypass.exe` 重新注入）。
 
 ## 7. 文档与签名
 

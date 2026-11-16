@@ -137,6 +137,7 @@
 #define ID_BTN_UNINSTALL    1004
 #define ID_BTN_CHECK_STATUS 1007
 #define ID_BTN_EXIT         1009
+#define ID_BTN_RELOADCORE   1017    /* 热重载注入的 Core（后台线程 + 命名管道） */
 #define ID_BTN_SMALLSTICKY  1015
 #define ID_BTN_SCREENGUARD  1016    /* 屏幕监控守卫: 老师端只看到定格画面 */
 #define ID_CHK_TRAY         1020    /* 广播窗最小化: 任务栏(真最小化) / 收起(托盘) */
@@ -160,6 +161,7 @@
 #define TRAY_RETRY_MS       500     /* 重试间隔 */
 #define IDT_TRAY_RETRY      0x52    /* 托盘图标重试定时器 (0x51 被 demote recheck 占用) */
 #define IDT_BUILD_CHECK     0x53    /* 启动后 4 秒: 检查进程内的 DLL 是否与磁盘一致 */
+#define IDT_RELOAD_STATUS   0x54    /* 重载 Core 3 秒后仍未完成 -> 显示“处理中” */
 #define IDM_TRAY_SHOW       2001
 #define IDM_TRAY_UNLOCK     2004
 #define IDM_TRAY_ABOUT      2005
@@ -169,6 +171,7 @@
 #define IDM_TRAY_CLICK      2009    /* 应急点击 */
 #define IDM_TRAY_NETDIAG    2010    /* 网络/桌面诊断 (写日志) */
 #define IDM_TRAY_SHUT       2011    /* 屏蔽控制端重启/关机 (开关) */
+#define IDM_TRAY_RELOADCORE 2012    /* 热重载注入的 Core */
 
 /* ========== UI theme constants (dark theme) ========== */
 #define TITLEBAR_H      40      /* custom title bar height */
@@ -392,6 +395,8 @@ static const BTNDEF g_btnDefs[] = {
     /* ---- 底部按钮 (不参与网格布局) ---- */
     { ID_BTN_CHECK_STATUS,L"检查当前状态", L"只读诊断: 权限/驱动/进程/配置/当前桌面",
       UI_GRAY_BTN,    UI_GRAY_HV,    UI_GRAY_DN,    0, NULL },
+    { ID_BTN_RELOADCORE,  L"重载 Core",  L"热更新注入的 Core（后台执行，最长 15 秒）",
+      UI_GRAY_BTN,    UI_GRAY_HV,    UI_GRAY_DN,    0, NULL },
     { ID_BTN_EXIT,        L"退出",     L"退出程序 (不会解除当前锁定状态)",
       RGB(150,30,60), RGB(180,50,80), RGB(118,20,46), 0, L"Ctrl+Alt+Q" },
 };
@@ -492,6 +497,7 @@ static void StateInit(void);
 static void ShutGuardLoad(void);
 static void ShutGuardSave(void);
 static void OnShutGuardToggle(HWND hwnd);
+static void OnReloadCore(HWND hwnd);
 
 /* 托盘 (notification area) */
 static HICON g_trayIcon;
@@ -4067,9 +4073,11 @@ static void LayoutControls(HWND hwnd) {
     by = h - S(50);
     hCtl = GetDlgItem(hwnd, ID_BTN_CHECK_STATUS);
     if (hCtl) MoveWindow(hCtl, S(UI_PAD), by, S(110), S(34), TRUE);
+    hCtl = GetDlgItem(hwnd, ID_BTN_RELOADCORE);
+    if (hCtl) MoveWindow(hCtl, S(UI_PAD + 120), by, S(110), S(34), TRUE);
     hCtl = GetDlgItem(hwnd, ID_BTN_EXIT);
-    if (hCtl) MoveWindow(hCtl, S(UI_PAD + 120), by, S(90), S(34), TRUE);
-    SetRect(&g_rcStatusArea, S(UI_PAD + 230), by, w - S(UI_PAD), by + S(34));
+    if (hCtl) MoveWindow(hCtl, S(UI_PAD + 240), by, S(90), S(34), TRUE);
+    SetRect(&g_rcStatusArea, S(UI_PAD + 340), by, w - S(UI_PAD), by + S(34));
 }
 
 /* ========== 创建控件 ========== */
@@ -4165,7 +4173,13 @@ void CreateControls(HWND hwnd) {
 
     hBtn = CreateWindowW(L"BUTTON", L"",
         WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
-        S(UI_PAD + 120), S(642), S(90), S(34),
+        S(UI_PAD + 120), S(642), S(110), S(34),
+        hwnd, (HMENU)(INT_PTR)ID_BTN_RELOADCORE, hInstance, NULL);
+    SetWindowSubclass(hBtn, BtnProc, (UINT_PTR)ID_BTN_RELOADCORE, 0);
+
+    hBtn = CreateWindowW(L"BUTTON", L"",
+        WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+        S(UI_PAD + 240), S(642), S(90), S(34),
         hwnd, (HMENU)(INT_PTR)ID_BTN_EXIT, hInstance, NULL);
     SetWindowSubclass(hBtn, BtnProc, (UINT_PTR)ID_BTN_EXIT, 0);
 
@@ -4229,6 +4243,186 @@ void OnUninstallDriver(HWND hwnd) {
 
 
 /* 「检查当前状态」: 清日志后做一次完整只读诊断 */
+/* ================= 重载 Core（热更新） =================
+   注入的 DLL 分成 Loader/Core 两层；Loader 在 \\.\pipe\bypass_core_ctl_<pid>
+   上提供 reload 命令。这里只负责 UI：后台线程逐个目标 PID 发命令、等响应。
+   Loader 最坏 ~12 秒（两个 3 秒线程等待 + VD 3 秒 + drain 3 秒），所以 UI
+   不等：3 秒后仍无结果就显示“处理中”，后台最多等 15 秒。 */
+static const char* RELOAD_TARGETS[] = {
+    "Student.exe", "MultiClient.exe", "MultiRender.exe", "ScreenRender.exe",
+    "ScreenRecord.exe", "SharedDesktop.exe", "StudentScreenHelper.exe",
+    "ScreenPen.exe", "AudioRender.exe", "AudioSender.exe", NULL
+};
+static volatile LONG g_reloadBusy;
+
+/* 1 = ok, 0 = no control pipe, -1 = timeout/write error */
+static int ReloadOneCore(DWORD pid, char* out, size_t cap)
+{
+    char   name[128];
+    HANDLE h;
+    DWORD  wr = 0, avail = 0, rd = 0, start;
+    int    ok = 0;
+
+    if (cap < 8) return -1;
+    out[0] = '\0';
+    _snprintf(name, sizeof(name) - 1, "\\\\.\\pipe\\bypass_core_ctl_%lu",
+              (unsigned long)pid);
+    name[sizeof(name) - 1] = '\0';
+    h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                    OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!WriteFile(h, "reload", 6, &wr, NULL)) { CloseHandle(h); return -1; }
+
+    start = GetTickCount();
+    while ((DWORD)(GetTickCount() - start) < 15000) {
+        if (PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) && avail > 0) break;
+        Sleep(100);
+    }
+    if (avail > 0 && ReadFile(h, out, (DWORD)cap - 1, &rd, NULL) && rd > 0) {
+        out[rd] = '\0';
+        ok = 1;
+    }
+    CloseHandle(h);
+    if (!ok) {
+        _snprintf(out, cap - 1, "timeout");
+        out[cap - 1] = '\0';
+        return -1;
+    }
+    return 1;
+}
+
+static void TrimEol(char* s)
+{
+    size_t n = strlen(s);
+
+    while (n && (s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == ' '))
+        s[--n] = '\0';
+}
+
+/* 响应分类: Loader 只回这几种 (见 loader.c 的 _snprintf(resp, ...))
+     ok seq=N cache=...                -> 新 Core 已加载
+     rolledback seq=N cache=...        -> 新 Core 失败, 旧 Core 已恢复
+     err refused-by-core               -> 阶段 1 拒绝, 什么都没动
+     err hooks-busy (core disabled)    -> drain 超时, 进程半禁用 (终态)
+     err coreDead | err coreDead (...) -> 之前已半禁用 (终态)
+     其他 err                          -> 失败, 什么都没动 (除非 no-rollback) */
+static void ReportReloadResult(HWND hwnd, const char* exe, DWORD pid,
+                               const char* resp, int* dead)
+{
+    if (!_strnicmp(resp, "ok ", 3) || !_stricmp(resp, "ok")) {
+        AppendLog(hwnd, "[Core] %s pid=%lu: %s\r\n", exe, (unsigned long)pid, resp);
+        return;
+    }
+    if (!_strnicmp(resp, "rolledback", 10)) {
+        AppendLog(hwnd, "[Core] %s pid=%lu: %s\r\n"
+                        "       WARNING: new Core failed, previous Core restored\r\n",
+                  exe, (unsigned long)pid, resp);
+        return;
+    }
+    if (strstr(resp, "core disabled") || strstr(resp, "coreDead")) {
+        (*dead)++;
+        /* 阶段 2 已经执行过 (before_unload 返回 1) 但 drain 没等到: 进程里
+           11 个包装 hook 直通, 22 个未包装 hook 仍跑完整逻辑 —— 不是“已直通”。 */
+        AppendLog(hwnd, "[Core] %s pid=%lu: %s\r\n"
+                        "       WARNING: process disabled (partially bypassed):\r\n"
+                        "         window/show/process-create wrappers are passthrough,\r\n"
+                        "         shutdown/shell/WinExec hooks still run their logic\r\n"
+                        "         while the shutdown guard is on.\r\n"
+                        "         Restart that classroom process to recover.\r\n",
+                  exe, (unsigned long)pid, resp);
+        return;
+    }
+    AppendLog(hwnd, "[Core] %s pid=%lu: %s\r\n", exe, (unsigned long)pid,
+              resp[0] ? resp : "failed");
+}
+
+static DWORD WINAPI ReloadCoreThread(LPVOID p)
+{
+    HWND hwnd = (HWND)p;
+    int  i, ok = 0, refused = 0, skipped = 0, total = 0, dead = 0, rolled = 0;
+    char resp[512];
+
+    AppendLog(hwnd, "\r\n[Core] reload started (后台执行, 每进程最长 15 秒)\r\n");
+    for (i = 0; RELOAD_TARGETS[i]; i++) {
+        HANDLE        snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32 pe;
+
+        if (snap == INVALID_HANDLE_VALUE) continue;
+        pe.dwSize = sizeof(pe);
+        if (Process32First(snap, &pe)) {
+            do {
+                int r;
+
+                if (_stricmp(pe.szExeFile, RELOAD_TARGETS[i]) != 0) continue;
+                total++;
+                r = ReloadOneCore(pe.th32ProcessID, resp, sizeof(resp));
+                TrimEol(resp);
+                if (r == 0) {
+                    skipped++;
+                    AppendLog(hwnd, "[Core] %s pid=%lu: no control pipe "
+                                    "(not injected / old DLL)\r\n",
+                              RELOAD_TARGETS[i], (unsigned long)pe.th32ProcessID);
+                } else if (r < 0) {
+                    refused++;
+                    AppendLog(hwnd, "[Core] %s pid=%lu: no response within 15s "
+                                    "(process may still be working)\r\n",
+                              RELOAD_TARGETS[i], (unsigned long)pe.th32ProcessID);
+                } else {
+                    if (!_strnicmp(resp, "ok ", 3) || !_stricmp(resp, "ok")) ok++;
+                    else if (!_strnicmp(resp, "rolledback", 10)) rolled++;
+                    else refused++;
+                    ReportReloadResult(hwnd, RELOAD_TARGETS[i], pe.th32ProcessID,
+                                       resp, &dead);
+                }
+            } while (Process32Next(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+
+    InterlockedExchange(&g_reloadBusy, 0);
+    if (total == 0) {
+        AppendLog(hwnd, "[Core] reload: no classroom process is running\r\n");
+        UpdateStatus(hwnd, "Status: reload: no classroom process");
+    } else {
+        AppendLog(hwnd, "[Core] reload done: ok=%d rolledback=%d refused=%d "
+                        "skipped=%d dead=%d (total=%d)\r\n",
+                  ok, rolled, refused, skipped, dead, total);
+        if (dead > 0) {
+            UpdateStatus(hwnd, "Status: Core disabled, restart the process");
+            AppendLog(hwnd, "[Core] WARNING: %d process(es) left partially bypassed; "
+                            "restart the classroom client\r\n", dead);
+        } else if (ok > 0) {
+            UpdateStatus(hwnd, "Status: Core reloaded");
+        } else if (rolled > 0) {
+            UpdateStatus(hwnd, "Status: reload failed, old Core kept");
+        } else {
+            UpdateStatus(hwnd, "Status: Core reload: nothing reloaded");
+        }
+    }
+    return 0;
+}
+
+static void OnReloadCore(HWND hwnd)
+{
+    HANDLE th;
+
+    if (InterlockedCompareExchange(&g_reloadBusy, 1, 0) != 0) {
+        AppendLog(hwnd, "[Core] reload already running\r\n");
+        return;
+    }
+    AppendLog(hwnd, "\r\n[Core] 重载 Core: 后台线程已启动 "
+                    "(3 秒后仍无结果会显示处理中)\r\n");
+    SetTimer(hwnd, IDT_RELOAD_STATUS, 3000, NULL);
+    th = CreateThread(NULL, 0, ReloadCoreThread, hwnd, 0, NULL);
+    if (!th) {
+        InterlockedExchange(&g_reloadBusy, 0);
+        KillTimer(hwnd, IDT_RELOAD_STATUS);
+        AppendLog(hwnd, "[Core] reload thread failed (err=%lu)\r\n", GetLastError());
+    } else {
+        CloseHandle(th);
+    }
+}
+
 void OnCheckStatus(HWND hwnd) {
     ClearLog(hwnd);
     CheckStatus(hwnd);
@@ -5023,6 +5217,7 @@ static void TrayShowMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING, IDM_TRAY_NETDIAG,    L"网络/桌面诊断(&N)");
     AppendMenuW(menu, MF_STRING | (g_shutGuard ? MF_CHECKED : 0),
                 IDM_TRAY_SHUT,                        L"屏蔽控制端重启/关机(&P)");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_RELOADCORE, L"重载 Core（热更新）(&L)");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_RELEASE,    L"恢复全屏广播（放行）(&R)");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -5068,6 +5263,9 @@ static void TrayShowMenu(HWND hwnd) {
         break;
     case IDM_TRAY_SHUT:
         SetShutGuard(hwnd, g_shutGuard ? FALSE : TRUE);
+        break;
+    case IDM_TRAY_RELOADCORE:
+        OnReloadCore(hwnd);
         break;
     case IDM_TRAY_RELEASE:
         /* 放行: 停止监视 + 写 bypass_hook.off, 已注入的 DLL 2 秒内停止干预。
@@ -5782,6 +5980,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_BTN_CHECK_STATUS:
                     OnCheckStatus(hwnd);
                     break;
+                case ID_BTN_RELOADCORE:
+                    OnReloadCore(hwnd);
+                    break;
                 case ID_BTN_EXIT:
                     /* 必须 DestroyWindow: 直接 PostQuitMessage 会跳过 WM_DESTROY,
                        托盘图标就会留在通知区直到资源管理器刷新。 */
@@ -5850,6 +6051,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (wParam == IDT_BUILD_CHECK) {
                 KillTimer(hwnd, IDT_BUILD_CHECK);
                 BuildStatusReport(hwnd, FALSE);   /* 只在旧 DLL 时警告 */
+                return 0;
+            }
+            if (wParam == IDT_RELOAD_STATUS) {
+                KillTimer(hwnd, IDT_RELOAD_STATUS);
+                if (InterlockedCompareExchange(&g_reloadBusy, 0, 0))
+                    UpdateStatus(hwnd,
+                        "Status: reloading Core (up to 15s)");
                 return 0;
             }
             break;

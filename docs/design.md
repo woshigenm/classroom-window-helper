@@ -733,7 +733,8 @@ P2b = 上面第 2 步的十项真正实现。
 
 > 阶段 2 某一步超时返回 0 时，Core 已经置了 `g_coreDisabled`、可能停了一半线程——
 > 这是不可逆操作开始后的固有风险。阶段 1 的检查目的就是把这种情况压到接近零；
-> Loader 收到 0 时不卸载，旧 Core 进入“活着但不再拦截”的状态并写日志。
+> Loader 收到 0 时不卸载，旧 Core 进入**半禁用**状态：11 个包装 hook 直通，
+> 22 个未包装 hook 仍会跑完整逻辑——**不是“全部直通”**（见 2.9 末尾）。
 
 P2b 测试矩阵：正常重载 / Worker 卡住（`SuspendThread`）/ `g_inHookCount` 卡住
 （hook 里 `Sleep(5000)`）/ 窗口未销毁 / 连续重载 3 次 / 阶段 1 失败后关闭窗口再次重载。
@@ -768,9 +769,11 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
   `HOOK_ENTER/HOOK_LEAVE` 对**同一个** Loader 计数器再加减一次。一次调用是
   `0 -> 1(Loader) -> 2(Core) -> 1 -> 0`，只有两层都返回才归零 —— 这是刻意
   更严格的 drain，不是“仅在直接调用时才有意义”。
-- **`g_unloading` 在 `before_unload` 之后才置 1**：`before_unload` 里 Core 自己
-  调 hook 函数（比如恢复窗口位置）仍然走完整 Loader → Core 路径；只有排空完成
-  后，新调用才在 Loader 直接直通。
+- **`g_unloading` 在 `before_unload` 之后才置 1**：`before_unload` 内部只调
+  `WaitForSingleObject`、`VD_StopWait`、`Core_RemoveSubclasses`（走
+  `real_SetWindowLongPtrW`）、`StateClose`、`uef_pop`，**一个 hook 函数都不调**。
+  原因见 2.9 末尾的“8 vs 25 不对称”：8 个 inline hook 会重入 Core，25 个
+  IAT-only 不会（Core 模块的 IAT 被 Loader 故意跳过）。
 - **Loader 侧权威 drain**：`before_unload` 返回 1、`g_unloading=1` 之后，Loader
   再等共享计数归零（最多 3s）才 `FreeLibrary`；超时返回 `err hooks-busy`
   且不卸载。
@@ -811,8 +814,9 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
   会看到「已在停止中」而拒绝，不会跳过等待去 `StateClose`。
 - 阶段 1 现在同时检查 worker / caption / vd 三个停止标志；任一「停止请求已发、
   句柄还在」都拒绝卸载（半停状态不可重用）。
-- 阶段 2 失败（线程/子类化超时）日志统一带 `(phase 2)`，该进程的 hook 功能
-  不再可靠，应重启；阶段 1 失败则 Core 完全没动，可以再次 reload。
+- 阶段 2 失败（线程/子类化超时）日志统一带 `(phase 2)`，该进程进入**半禁用**
+  （部分直通、部分继续拦截，见本节末尾），应重启；阶段 1 失败则 Core 完全没动，
+  可以再次 reload。
 - 已知限制：`g_sub[]` 存 HWND；窗口销毁后 HWND 被复用、且新窗口恰好有同名
   属性时，`replaced` 分支的 `KillTimer`/`RemoveProp` 可能作用到新窗口。这是
   `SetWindowLongPtrW` 子类化方案的固有限制。
@@ -829,8 +833,52 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
 - **`g_coreDead` 是 Core 契约的最终防御**：恶意 Core（`before_unload` 返回 1 但
   不停线程/不置 disabled）触发 drain 超时后，Loader 保持 `g_unloading=1`、置
   `g_coreDead=1`、不卸载；该进程之后所有 reload 都返回 `err coreDead`，只能
-  重启或重新注入。此时 11 个包装 hook 直通，22 个未包装 hook 可能仍执行完整逻辑
-  （它们不查 `g_coreDisabled`）——文档里明确这个不对称。
+  重启或重新注入。
+
+**8 vs 25 不对称：Core 内部调用 hook 函数时谁重入**
+
+Loader 装了两类钩子：8 个 inline hook（改函数入口）、33 个 IAT dispatcher（改导入表）。
+但 `PatchOne` **跳过 Core 模块自己的 IAT**（`mod == g_coreModule`），所以：
+
+| 函数 | Core 内部调用 | 后果 |
+|---|---|---|
+| 8 个 inline（`ShowWindow`、`ShowWindowAsync`、`WinExec`、`CreateProcessW/A`、`ExitWindowsEx`、`ShellExecuteA/W`） | 重入 `L_*` → 计数 → `Hook_*` | 安全，但会跑 Core 代码 |
+| 25 个 IAT-only（`SetWindowPos`、`SetWindowLong*`、`MoveWindow`、`SwitchDesktop`…） | 直接走 user32/kernel32 原函数 | 不经过 dispatcher，不计数 |
+
+其中 8 个 inline 里**只有 `ShowWindow` 和 `CreateProcessW` 在入口查 `g_coreDisabled`**
+（走 `HOOK_ENTER`）；另外 6 个不查，但它们只读模块全局和 `bypass_shut.ini`，
+不碰 `g_stateView` / `g_sub` 等 Worker 资源，所以半禁用期间重入不会 UAF。
+
+这条不对称是 `g_unloading` 时机论证的前提：`before_unload` 之所以可以安全地不检查
+`g_coreDisabled`，正因为它不调任何 hook 函数（只用裸 Win32 + `real_*`）。
+**以后要在 `before_unload` 里调 hook 函数，必须走 `real_*` 或先查 `g_coreDisabled`。**
+
+**半禁用的准确语义（阶段 2 失败 / drain 超时）**
+
+| 类别 | 行为 |
+|---|---|
+| 11 个包装 hook（`ShowWindow`、`CreateProcessW`、`SetWindowPos`、`SetWindowLongW/A`、`SetWindowLongPtrW/A`、`MoveWindow`、`SwitchDesktop`、`ShowCursor`、`SetCursor`） | 入口查 `g_coreDisabled`/`g_unloading` → **直通** |
+| 22 个未包装（`ShowWindowAsync`、`CreateProcessA`、`WinExec`、`ExitWindowsEx`、`ShellExecuteA/W` 等） | **继续跑完整逻辑**（关机/外壳类还要看 `SH_On` 守卫开关） |
+
+也就是说「重载失败」≠「hook 停了」：窗口保护可能已失效，但关机/进程创建拦截仍在。
+UI、日志、README 都按这个描述，不写“已直通”。`g_coreDead` 是该状态下的终态。
+
+**UI 入口（主程序 / 托盘）**
+
+主界面「重载 Core」按钮和托盘「重载 Core（热更新）」都调 `OnReloadCore`：
+
+- 目标 PID 来源：按 `RELOAD_TARGETS` 里的课堂进程名 `Process32First/Next` 匹配，
+  再连 `\\.\pipe\bypass_core_ctl_<pid>`；连不上 = 没注入/旧 DLL，记日志跳过。
+  不做全进程扫描（慢、且容易触发杀软）。
+- 线程：`ReloadCoreThread` 后台跑，`g_reloadBusy` 防重入；15 秒 `PeekNamedPipe`
+  轮询（100ms 一次）。
+- 时间预算对齐：Loader 最坏 ~12 秒（3s Worker + 3s caption + 3s VD + 3s drain），
+  所以 3 秒时 `IDT_RELOAD_STATUS` 只把状态栏切成 `reloading Core (up to 15s)`，
+  **不判失败**；只有 `err*` 响应才算失败。
+- 结果分类：`ok` / `rolledback`（新 Core 失败、旧 Core 已恢复）/
+  `refused`（阶段 1 拒绝，什么都没动）/ `dead`（含 `core disabled`、`coreDead`，
+  弹“部分直通”警告并把状态栏改成 `Core disabled, restart the process`）。
+  状态串控制在 ~45 字符内，状态栏用 `DT_END_ELLIPSIS`，再长就会被截断。
 
 ---
 
