@@ -51,6 +51,7 @@ static HMODULE        g_coreModule;
 static HrCoreApi      g_core;       /* storage for the published table      */
 static HrHost         g_hostCfg;    /* Loader's ABI block: Core keeps this pointer */
 static long           g_patchCount;
+static int            g_scanLogged;
 
 /* ---------------- reals (trampolines for the inline hooks) ---------------- */
 
@@ -649,10 +650,13 @@ static long PatchAllModules(void)
 {
     HMODULE mods[512];
     DWORD   needed = 0, i;
+    DWORD   count = 0;
     long    before = g_patchCount;
+    long    delta;
 
     if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return 0;
     if (needed > sizeof(mods)) needed = sizeof(mods);
+    count = needed / sizeof(HMODULE);
 
     for (i = 0; i < needed / sizeof(HMODULE); i++) {
         PatchOne(mods[i], "user32.dll", "SetWindowPos",        (void*)L_SetWindowPos);
@@ -693,7 +697,16 @@ static long PatchAllModules(void)
         PatchOne(mods[i], "user32.dll",  "GetDC",              (void*)L_GetDC);
         PatchOne(mods[i], "user32.dll",  "GetWindowDC",        (void*)L_GetWindowDC);
     }
-    return g_patchCount - before;
+
+    delta = g_patchCount - before;
+    /* 第一次扫描（Core 加载前）和后续"有新模块被加载"时各记一行:
+       既能确认扫到了多少模块, 也能看出 Core 的增量是不是真的 0。 */
+    if (!g_scanLogged || delta > 0) {
+        g_scanLogged = 1;
+        HookLog("[Loader] IAT scan: %lu modules, %ld slots patched",
+                (unsigned long)count, delta);
+    }
+    return delta;
 }
 
 /* ---------------- paths / teacher guard ---------------- */
@@ -940,8 +953,7 @@ static BOOL LoadCore(void)
 
     if (!init(&g_hostCfg, &g_core)) {
         /* Core 自己检查了 ABI, 失败时什么都没做 -> FreeLibrary 安全 */
-        HookLog("[Loader] Core_Init failed (ABI %u, loader %u)",
-                g_hostCfg.abi_version, (unsigned)HR_ABI_VERSION);
+        HookLog("[Loader] Core_Init failed (returned 0) - FreeLibrary safe");
         FreeLibrary(g_coreModule);
         g_coreModule = NULL;
         return FALSE;

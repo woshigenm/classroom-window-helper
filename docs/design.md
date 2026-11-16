@@ -669,12 +669,42 @@ bypass_hook_core.dll (Core)
   `inject32` 会同时识别两个文件名，避免两者同时注入打架。
 - 版本自检（2.7）现在同时比较 Loader 和 Core 的 PE `TimeDateStamp`。
 
+**扫描日志**：Loader 每次 `PatchAllModules` 在“第一次”或“本次有新模块被补”时记一行
+`[Loader] IAT scan: 53 modules, 78 slots patched`。`attached: ... IAT patched (0 entries)`
+里的 0 是 **Core 首次调用时的增量**（Loader 在 `Core_Init` 之前已经扫过一轮），不是漏打；
+测试里能看到随后还有 `56 modules, 6 slots` 这种补扫行。
+
+### 2.9 P2 重载语义（先定下来，P2 按这个实现）
+
+`g_table` 只有三种状态：`NULL`（无 Core / 加载失败）、旧 Core、新 Core。
+
+重载顺序（P2b）：
+
+1. Loader 收到 `reload`；把新 Core 复制到 `core.<pid>.<seq>.dll`（新序号）。
+2. **`g_table` 仍指向旧 Core 时**调用旧 Core 的 `before_unload()`：
+   - Core 先置 `g_coreDisabled = 1`：新进来的 hook 直接直通，不再进拦截逻辑；
+   - 停 Worker / caption pump / VD 线程（每个 3 秒超时，超时返回 0）；
+   - 等 `g_inHookCount == 0`（3 秒超时，超时返回 0）；
+   - 把状态写进 blob，返回 1。
+3. `before_unload()` 返回 0：**什么都不做**，`g_table` 不动，旧 Core 继续服务。
+4. 返回 1：`InterlockedExchangePointer(&g_table, NULL)` → `FreeLibrary(旧 Core)`。
+   - 此时新调用全部直通（dispatcher 的 NULL 分支）；
+   - inline/IAT 钩子属于 Loader，**不需要** Core 摘（也摘不了）。
+5. 加载新 Core → `Core_Init`；成功则发布新 `g_table`。
+6. 失败：从 `prev` 缓存副本**重新加载旧 Core** + 恢复 blob，再发布——不留在 `NULL`
+   状态（否则重载失败 = 所有拦截失效）。
+7. `still mapped` 检测：`FreeLibrary` 后 `GetModuleHandleA(旧缓存路径)` 必须为 `NULL`；
+   非 `NULL` 说明有线程/窗口类没清干净，记 `coreDead` 并拒绝继续重载。
+
+为了能在没有真正 `before_unload` 的情况下先验证装载/回滚，P2 分两步：
+P2a = 缓存副本 + `still mapped` + 回滚框架（`before_unload` 先只 `return 1`）；
+P2b = 上面第 2 步的十项真正实现。
+
 ---
 
 ## 3. 日志与排错
 
 日志文件：
-
 - `bypass_hook.log` —— **唯一的日志文件**。注入的 DLL（每个被注入进程一份输出，行首格式如下：
   `[HH:MM:SS.mmm] [pid N] 内容`，时间戳用于判断"最大化→还原"隔了多久、定时器有没有在跑）和
   主程序的启动/提权过程（`launcher ...`、`lpe: ...`、`[elevate] ...`、
@@ -812,6 +842,26 @@ VERDICT PASS
 > `InitiateSystemShutdown` 或裸的 `shutdown -s|/s|-r|/r|-t` 字面量就直接拒绝运行。
 > `ExitWindowsEx(0x80000000, 0)` **不是**"无害探针"——Windows 会当成关机请求，
 > 开发时已经因此关过机器，绝对不要再加回去。
+
+验证 Loader 的失败路径（`make.bat fakecores` + `tests\fake_core_test.ps1`）：
+
+```bat
+make.bat all fakecores
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\fake_core_test.ps1
+```
+
+脚本把 `bin\bypass_hook_core.dll` 临时换成三个故意损坏的假 Core，各跑一次
+`wmode_test --inject`：
+
+| 假 Core | 期望日志 | 期望行为 |
+|---|---|---|
+| `Core_Init` 返回 0 | `Core_Init failed (returned 0) - FreeLibrary safe` | 可安全卸载，表 NULL，直通 |
+| 返回 1，`abi_version=999` | `Core_Init returned bad ABI ... leaving it mapped` | **不卸载**，表 NULL，直通 |
+| 返回 1，ABI 对，hook 表缺字段 | `Core hook table incomplete ... leaving it mapped` | **不卸载**，表 NULL，直通 |
+
+后两种假 Core 会起一个心跳线程写 `%TEMP%\bypass_fake_core_beat.txt`；脚本检查它存在，
+证明 `Core_Init` 返回 1 后 Loader 没有 `FreeLibrary`（否则线程会执行已释放代码、进程崩）。
+最后恢复真 Core，`wmode` 必须回到 `FIXED`。
 
 验证"跨进程兜底不会卡死 enforcer"（`make.bat hangwintest` + 脚本）：
 
