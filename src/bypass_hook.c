@@ -2403,6 +2403,13 @@ static BOOL WINAPI Impl_ShowWindow(HWND h, int cmd)
         if (InterlockedCompareExchange(&once, 1, 0) == 0) Sleep(5000);
     }
 #endif
+#ifdef BYPASS_EVIL_CORE
+    /* P2b-3 malicious-Core test: hold the dispatcher refcount for 60 s so the
+       Loader's drain times out (the Core still lies in before_unload).
+       ShowWindow is inline-hooked by the Loader even in this module. */
+    HookLog("[evil] Impl_ShowWindow sleeping (hwnd=%p)", (void*)h);
+    Sleep(60000);
+#endif
     if (!g_disabled && IsTargetWindow(h) &&
         cmd != SW_SHOW && cmd != SW_SHOWNORMAL &&
         InterlockedIncrement(&g_showLogs) <= 20)
@@ -4456,6 +4463,34 @@ static void FillHookTable(HrHooks* h)
     h->InitiateSystemShutdownExW = SH_Hook_InitiateSystemShutdownExW;
 }
 
+#ifdef BYPASS_EVIL_CORE
+static BOOL CALLBACK EvilEnum(HWND h, LPARAM lp)
+{
+    DWORD pid = 0;
+
+    if (!IsWindowVisible(h)) return TRUE;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == g_pid) { *(HWND*)lp = h; return FALSE; }
+    return TRUE;
+}
+
+static DWORD WINAPI EvilThread(LPVOID p)
+{
+    HWND h = NULL;
+    int  i;
+
+    (void)p;
+    for (i = 0; i < 100 && !h; i++) {
+        EnumWindows(EvilEnum, (LPARAM)&h);
+        if (!h) Sleep(100);
+    }
+    if (h)
+        ShowWindow(h, SW_SHOW);
+    HookLog("[evil] thread done hwnd=%p", (void*)h);
+    return 0;
+}
+#endif
+
 /* P2b-2 ③: restore the original WNDPROC on every window we subclassed.
    Uses real_SetWindowLongPtrW (not the hook) and never touches a window whose
    WNDPROC was replaced by someone else.  Returns 0 if a window still points at
@@ -4535,6 +4570,13 @@ static int __cdecl Core_BeforeUnload(void)
 {
     DWORD w;
 
+#ifdef BYPASS_EVIL_CORE
+    /* P2b-3 malicious Core: lie to the Loader.  No drain, no disable, the
+       EvilThread keeps a SetWindowPos call inside Impl_SetWindowPos. */
+    HookLog("[evil] before_unload lying, count=%ld", (long)HR_HOOKS_RUNNING());
+    return 1;
+#endif
+
     /* ---- phase 1: read-only checks ---- */
     if (HR_HOOKS_RUNNING() > 0) {
         Sleep(10);
@@ -4606,8 +4648,9 @@ static int __cdecl Core_BeforeUnload(void)
        线程停完后必须再等一次引用计数归零 (P2b-1 补的竞态窗口)。
        P2b-2: 计数在 Loader 的 33 个 dispatcher 里, 覆盖全部 hook。 */
     {
-        int i;
-        for (i = 0; i < 50 && HR_HOOKS_RUNNING() > 0; i++)
+        DWORD start = GetTickCount();
+        while (HR_HOOKS_RUNNING() > 0 &&
+               (DWORD)(GetTickCount() - start) < 50)
             Sleep(1);
         if (HR_HOOKS_RUNNING() > 0) {
             HookLog("[Core] unload failed (phase 2): %ld hooks still executing after thread stop",
@@ -4676,5 +4719,12 @@ __declspec(dllexport) int __cdecl Core_Init(const HrHost* host, HrCoreApi* api)
         HookLog("[Core] Worker thread failed (err=%lu)", GetLastError());
         return 0;
     }
+
+#ifdef BYPASS_EVIL_CORE
+    {
+        HANDLE t = CreateThread(NULL, 0, EvilThread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+#endif
     return 1;
 }

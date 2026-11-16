@@ -1488,13 +1488,17 @@ static int DoReload(int noRollback, char* resp, size_t cap)
     /* Core threads are stopped; from here new calls passthrough at the
        Loader and are not counted.  In-flight calls still drain to 0. */
     InterlockedExchange(&g_unloading, 1);
+    HookLog("[Loader] before_unload ok; draining (count=%ld)",
+            (long)InterlockedCompareExchange(&g_inHookCount, 0, 0));
 
     /* Loader-side drain: authoritative, covers all 33 dispatchers, not just
        the hooks the Core knows about. */
     {
-        int i;
-        for (i = 0; i < 3000 && InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0; i++)
-            Sleep(1);
+        DWORD start = GetTickCount();
+
+        while (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0 &&
+               (DWORD)(GetTickCount() - start) < 3000)
+            Sleep(10);
         if (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0) {
             /* ★ before_unload 已经执行: Worker 停了、g_coreDisabled=1、
                UEF 也 pop 了 —— 这个 Core 不可逆。绝不能把 g_unloading 恢复
@@ -1513,6 +1517,7 @@ static int DoReload(int noRollback, char* resp, size_t cap)
        最终状态写进 blob (窗口位置/计数等), 先拍会把这份最终状态丢掉。 */
     BlobSnapshot();
 
+    HookLog("[Loader] drained; unloading %s", prev);
     InterlockedExchangePointer((PVOID volatile*)&g_table, NULL);
     g_cur.valid = 0;
     FreeLibrary(g_cur.mod);

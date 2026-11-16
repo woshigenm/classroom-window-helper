@@ -823,6 +823,14 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
   `InterlockedIncrement`、2 次 `Decrement`、且 Increment 在 `Tbl()` 之前；
   45 个 hook/Impl 函数体内不出现
   `g_stateView|g_stateMap|g_stateEvent|g_sub|EnsureSubclassed|StateReadView`。
+- **drain 用墙钟 deadline**（`GetTickCount`），不是 `N × Sleep(1)`：Windows 的
+  `Sleep(1)` 实际约 15ms，3000 次会等 45 秒——3 秒超时被拖长，宿主可能先正常退出，
+  reload 响应为空。Core 的 50ms drain 同理。
+- **`g_coreDead` 是 Core 契约的最终防御**：恶意 Core（`before_unload` 返回 1 但
+  不停线程/不置 disabled）触发 drain 超时后，Loader 保持 `g_unloading=1`、置
+  `g_coreDead=1`、不卸载；该进程之后所有 reload 都返回 `err coreDead`，只能
+  重启或重新注入。此时 11 个包装 hook 直通，22 个未包装 hook 可能仍执行完整逻辑
+  （它们不查 `g_coreDisabled`）——文档里明确这个不对称。
 
 ---
 
@@ -1023,6 +1031,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\stuck_test.ps1
 | hook 卡死（第一次 `ShowWindow` Sleep 5s） | reload → `err refused-by-core`，日志 `hooks still executing`；5s 后再次 reload → `ok seq=` |
 | Worker 卡死（收到停止请求后 Sleep 60s） | reload → 0（阶段 2 超时），日志 `(phase 2): worker did not stop`；再 reload 被阶段 1 拒绝；进程存活 |
 | 子类恢复失败 | reload → 0（阶段 2），日志 `(phase 2): a window still points`；再 reload 仍是阶段 2 失败；进程存活 |
+
+验证「恶意 Core」（`make.bat testcores` 也构建 `core_evil.dll`，脚本 `tests\evil_core_test.ps1`）：
+
+| 场景 | 断言 |
+|---|---|
+| `before_unload` 返回 1 但不停线程（线程卡在 hook 里） | reload → `err hooks-busy (core disabled)`；日志 `reload aborted ... core disabled`；`status` 里 `dead=1`；再 reload → `err coreDead`；进程存活 |
+
+> `g_coreDead` 是终态：该进程不能恢复，测试必须用独立宿主、且不包含“恢复后 reload”的断言。
 
 验证"跨进程兜底不会卡死 enforcer"（`make.bat hangwintest` + 脚本）：
 

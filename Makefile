@@ -96,7 +96,7 @@ shuttest: $(BIN)/shutguard_test.exe
 fakecores: $(BIN)/fake_core_return0.dll $(BIN)/fake_core_abi.dll $(BIN)/fake_core_hooks.dll $(BIN)/fake_core_leak.dll $(BIN)/fake_core_good.dll
 
 # P2b-3: real Core built with a deliberate unload fault
-testcores: $(BIN)/core_stuck_hook.dll $(BIN)/core_stuck_worker.dll $(BIN)/core_subclass_fail.dll
+testcores: $(BIN)/core_stuck_hook.dll $(BIN)/core_stuck_worker.dll $(BIN)/core_subclass_fail.dll $(BIN)/core_evil.dll
 
 # 长驻宿主: 自注入 Loader 后睡眠, 供 P2a 重载脚本通过命名管道驱动
 corehost: $(BIN)/core_host.exe
@@ -160,6 +160,9 @@ $(BIN)/core_stuck_worker.dll: src/bypass_hook.c src/bypass_vd.inc src/bypass_scr
 $(BIN)/core_subclass_fail.dll: src/bypass_hook.c src/bypass_vd.inc src/bypass_screen.inc src/bypass_shut.inc src/bypass_abi.h | $(BIN)
 	"$(CC32)" $(CFLAGS32) -DBYPASS_SUBCLASS_FAIL $(DLLFLAGS) "src/bypass_hook.c" -o "$@" $(DLLLIBS)
 
+$(BIN)/core_evil.dll: src/bypass_hook.c src/bypass_vd.inc src/bypass_screen.inc src/bypass_shut.inc src/bypass_abi.h | $(BIN)
+	"$(CC32)" $(CFLAGS32) -DBYPASS_EVIL_CORE $(DLLFLAGS) "src/bypass_hook.c" -o "$@" $(DLLLIBS)
+
 $(BIN)/vd_pin_test.exe: tests/vd_pin_test.c | $(BIN)
 	"$(CC32)" $(CFLAGS32) "tests/vd_pin_test.c" -o "$@" -lole32 -luuid -ladvapi32
 
@@ -180,7 +183,7 @@ clean:
 	-@del /q "$(BIN)\vd_pin_test.exe" 2>nul
 	-@del /q "$(BIN)\screenguard_test.exe" 2>nul
 	-@del /q "$(BIN)\shutguard_test.exe" 2>nul
-	-@del /q "$(BIN)\fake_core_return0.dll" "$(BIN)\fake_core_abi.dll" "$(BIN)\fake_core_hooks.dll" "$(BIN)\fake_core_leak.dll" "$(BIN)\fake_core_good.dll" "$(BIN)\core_host.exe" "$(BIN)\core_stuck_hook.dll" "$(BIN)\core_stuck_worker.dll" "$(BIN)\core_subclass_fail.dll" 2>nul
+	-@del /q "$(BIN)\fake_core_return0.dll" "$(BIN)\fake_core_abi.dll" "$(BIN)\fake_core_hooks.dll" "$(BIN)\fake_core_leak.dll" "$(BIN)\fake_core_good.dll" "$(BIN)\core_host.exe" "$(BIN)\core_stuck_hook.dll" "$(BIN)\core_stuck_worker.dll" "$(BIN)\core_subclass_fail.dll" "$(BIN)\core_evil.dll" 2>nul
 	-@rmdir /s /q "$(BIN)\lpe" 2>nul
 	@echo [clean] done
 
