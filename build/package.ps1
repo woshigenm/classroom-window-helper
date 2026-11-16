@@ -13,7 +13,8 @@ $Root = Split-Path -Parent $PSScriptRoot
 if (-not $OutDir) { $OutDir = Join-Path $Root "dist" }
 $Bin = Join-Path $Root "bin"
 
-$required = @("bypass.exe", "bypass_hook32.dll", "inject32.exe")
+$required = @("bypass.exe", "bypass_hook32.dll", "bypass_hook_core.dll", "inject32.exe")
+$optional = @("bypass_hook_single.dll")          # rollback: copy over bypass_hook32.dll
 foreach ($name in $required) {
     $p = Join-Path $Bin $name
     if (-not (Test-Path -LiteralPath $p)) { throw "missing: $p" }
@@ -47,6 +48,14 @@ try {
     foreach ($name in $required) {
         Copy-Item -LiteralPath (Join-Path $Bin $name) -Destination $stageBin
     }
+    foreach ($name in $optional) {
+        $p = Join-Path $Bin $name
+        if (Test-Path -LiteralPath $p) {
+            Copy-Item -LiteralPath $p -Destination $stageBin
+        } else {
+            Write-Warning ("optional file missing (rollback will not be available): " + $name)
+        }
+    }
 
     $cfg = Join-Path $Bin "bypass_config.ini"
     if (Test-Path -LiteralPath $cfg) {
@@ -61,10 +70,15 @@ try {
         ) | Set-Content -LiteralPath (Join-Path $stageBin "bypass_config.ini") -Encoding ASCII
     }
 
+    # Keep the docs\ subfolder: README links to docs/design.md and
+    # docs/how-to-use.md, so flattening them would break the links.
+    $stageDocs = Join-Path $stage "docs"
+    New-Item -ItemType Directory -Path $stageDocs -Force | Out-Null
     foreach ($rel in @("README.md", "docs\how-to-use.md", "docs\design.md")) {
         $src = Join-Path $Root $rel
         if (Test-Path -LiteralPath $src) {
-            Copy-Item -LiteralPath $src -Destination $stage
+            $dst = if ($rel.StartsWith("docs\")) { $stageDocs } else { $stage }
+            Copy-Item -LiteralPath $src -Destination $dst
         }
     }
 
@@ -87,12 +101,28 @@ try {
     }
 
     @(
-        "Classroom Window Mode"
+        "Classroom Window Mode v2.0"
         ""
-        "1. Extract this zip."
+        "1. Extract this zip (bin\ must stay on a local disk)."
         "2. Run bin\bypass.exe as Administrator."
         "3. Config: bin\bypass_config.ini"
-        "4. Kill switch: create bin\bypass_hook.off"
+        "4. Kill switch: create bin\bypass_hook.off (then restart the classroom app)."
+        ""
+        "Files:"
+        "  bin\bypass.exe            main UI / tray"
+        "  bin\bypass_hook32.dll     Loader (hooks, hot reload control pipe)"
+        "  bin\bypass_hook_core.dll  Core (all hook logic; hot-reloadable)"
+        "  bin\bypass_hook_single.dll  old single-DLL build, rollback only:"
+        "                            copy it over bypass_hook32.dll and restart"
+        "                            the classroom client"
+        "  bin\inject32.exe          injector"
+        ""
+        "Hot reload (change Core logic without restarting the classroom app):"
+        "  make.bat core  ->  click 'Reload Core' in the UI (or the tray item)."
+        "  Loader changes still need a classroom-client restart."
+        "  See README.md 5.6 / docs\design.md 2.9."
+        ""
+        "Docs: docs\how-to-use.md (usage), docs\design.md (internals)."
         ""
         "Authorized lab use only."
     ) | Set-Content -LiteralPath (Join-Path $stage "RUN.txt") -Encoding ASCII
