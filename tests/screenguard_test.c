@@ -151,6 +151,10 @@ static int CheckAffinity(void)
                          GetModuleHandleA(NULL), NULL);
     if (!w1) { printf("control window failed\n"); return 1; }
     ShowWindow(w1, SW_SHOW);
+    /* 抓屏区域必须真的被这个窗口覆盖住: 放到最上面, 否则前台终端会挡住,
+       "visible" 和 "hidden" 两次抓到的是同一个画面 -> 误报 FAIL */
+    SetWindowPos(w1, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     UpdateWindow(w1);
     Pump(500);
     GetWindowRect(w1, &r);
@@ -173,6 +177,8 @@ static int CheckAffinity(void)
         SetWindowDisplayAffinity(w2, WDA_MONITOR);
     GetWindowDisplayAffinity(w2, &aff);
     ShowWindow(w2, SW_SHOW);
+    SetWindowPos(w2, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     UpdateWindow(w2);
     Pump(500);
     GetWindowRect(w2, &r);

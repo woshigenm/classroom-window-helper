@@ -59,9 +59,12 @@ static int PrepareProbeExe(void)
     if (strlen(sys) + 9 < sizeof(sys)) strcat(sys, "\\cmd.exe");
     else return 0;
 
-    if (!CopyFileA(sys, g_probeA, FALSE) &&
-        GetLastError() != ERROR_FILE_EXISTS)
-        return 0;
+    /* 目标已存在时 CopyFile 可能因为上一个测试的进程还映射着它而失败;
+       只要文件在, 就沿用旧副本 (内容同样是 cmd.exe 的拷贝)。 */
+    if (!CopyFileA(sys, g_probeA, FALSE)) {
+        if (GetFileAttributesA(g_probeA) == INVALID_FILE_ATTRIBUTES)
+            return 0;
+    }
 
     if (!MultiByteToWideChar(CP_ACP, 0, g_probeA, -1, g_probeW, MAX_PATH))
         return 0;
@@ -297,11 +300,11 @@ int main(int argc, char** argv)
         if (w <= 31) pass = 0;
 
         _snprintf(needle, sizeof(needle) - 1,
-                  "[pid %lu] [Guard] hooks", (unsigned long)GetCurrentProcessId());
+                  "[pid %lu] [Loader] core loaded:", (unsigned long)GetCurrentProcessId());
         if (LogHas(needle)) {
-            printf("  %-46s ok\n", "log: hook summary present");
+            printf("  %-46s ok\n", "log: core loaded");
         } else {
-            printf("  %-46s FAIL (log line missing)\n", "log: hook summary present");
+            printf("  %-46s FAIL (log line missing)\n", "log: core loaded");
             pass = 0;
         }
 
@@ -385,27 +388,27 @@ int main(int argc, char** argv)
                w > 31 ? "ok" : "FAIL", (unsigned)w);
         if (w <= 31) pass = 0;
 
-        /* Zero-risk proof for the 0x27 path: the DLL reports its hook summary
-           at startup (and logs a FAILED line if one entry hook did not take).
-           Nothing calls the API here. */
+        /* Zero-risk proof for the 0x27 path: the Loader reports whether all
+           inline entries (including ExitWindowsEx) were installed.  Nothing
+           calls the API here. */
         _snprintf(needle, sizeof(needle) - 1,
-                  "[pid %lu] [Guard] hooks", (unsigned long)GetCurrentProcessId());
+                  "[pid %lu] [Loader] inline hooks: all installed",
+                  (unsigned long)GetCurrentProcessId());
         if (LogHas(needle)) {
-            printf("  %-46s ok\n", "log: hook summary present");
+            printf("  %-46s ok\n", "ExitWindowsEx entry hook armed (log)");
         } else {
-            printf("  %-46s FAIL (log line missing)\n", "log: hook summary present");
+            printf("  %-46s FAIL (Loader did not install all inline hooks)\n",
+                   "ExitWindowsEx entry hook armed (log)");
             pass = 0;
         }
 
         _snprintf(needle, sizeof(needle) - 1,
-                  "[pid %lu] [Guard] hook FAILED: ExitWindowsEx",
-                  (unsigned long)GetCurrentProcessId());
+                  "[pid %lu] [Loader] core loaded:", (unsigned long)GetCurrentProcessId());
         if (LogHas(needle)) {
-            printf("  %-46s FAIL (entry hook did not take)\n",
-                   "ExitWindowsEx entry hook armed (log)");
-            pass = 0;
+            printf("  %-46s ok\n", "log: core loaded");
         } else {
-            printf("  %-46s ok\n", "ExitWindowsEx entry hook armed (log)");
+            printf("  %-46s FAIL (log line missing)\n", "log: core loaded");
+            pass = 0;
         }
 
         _snprintf(needle, sizeof(needle) - 1,

@@ -595,8 +595,9 @@ FUN_00413560(cmd)
   保证 ini / DLL / 勾选框状态一致），打开时调 `RunInjector` 保证 DLL 已进入 `Student.exe`。
 - 只影响被注入的课堂进程；用户自己从开始菜单/`shutdown` 关机不经过这些进程，不受影响。
 - 日志（刻意压量，控制端会每 ~20 秒重发）：
-  - 启动时每个进程一行汇总：`[Guard] hooks installed: WinExec CreateProcessW ...`；
-    任何一个入口没打上会有 `[Guard] hook FAILED: <api>`（正常情况下不应出现）。
+  - P1 起入口 hook 由 Loader 装：每个进程一行
+    `[Loader] inline hooks: all installed`（失败是 `PARTIAL` / 逐条 `postponed`），
+    Core 加载成功是 `[Loader] core loaded: ... build=...`。
   - 拦截前 3 次逐条：`[Guard] blocked ExitWindowsEx flags=0x6 (restart)` /
     `[Guard] blocked CreateProcessW (shutdown -s -t 1)`；之后每 25 次一行
     `[Guard] blocked 25 remote power commands (last: ...)`。
@@ -624,7 +625,7 @@ FUN_00413560(cmd)
 > `ExitWindowsEx`（实测 `ExitWindowsEx(0x80000000, 0)` 会被 Windows 当成关机，直接把机器关掉），
 > 也不允许出现裸的 `shutdown -s -t 1`（会解析到 `System32\shutdown.exe`）。
 > 测试只跑 `%TEMP%\shutguard_probe\shutdown.exe`（`cmd.exe` 的重名副本）+ 从日志读
-> `[Guard] hooks installed:` / 没有 `[Guard] hook FAILED: ExitWindowsEx`；
+> `[Loader] inline hooks: all installed` / `[Loader] core loaded:`；
 > `tests\shutguard_test.ps1` 在运行前会扫描二进制，发现这两类东西就拒绝执行。
 
 ### 2.8 Loader / Core 分层（P1）
@@ -803,7 +804,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\shutguard_test.ps1
 ```
 case 1/2: guard off -> fake shutdown.exe 正常启动；命令行透传
 case 2/2: guard on  -> 所有 shutdown 写法都被吞掉，不创建进程
-                      日志里有 [Guard] hooks installed（且没有 hook FAILED）
+                      日志里有 [Loader] inline hooks: all installed + [Loader] core loaded
 VERDICT PASS
 ```
 
