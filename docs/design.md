@@ -789,6 +789,20 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
    `WndProc`/`SubclassProc` 里的 `g_coreDisabled` 检查**不能**跳过
    `WM_DESTROY`/`WM_NCDESTROY` 的清理分支，否则 `DestroyWindow` 会漏释放资源。
 
+**③ 已实现**：本项目的子类化是 `SetWindowLongPtrW(GWLP_WNDPROC, SubclassProc)`，
+不是 `SetWindowSubclass`，所以“摘”就是恢复原过程：
+
+- `Core_RemoveSubclasses()` 遍历 `g_sub[]`：
+  - 窗口已销毁 → `gone`；
+  - 当前 WNDPROC 已被别人换掉 → `replaced`（不动）；
+  - 仍是我们 → `KillTimer` + `real_SetWindowLongPtrW` 恢复原过程 + 清属性 → `removed`；
+  - 恢复失败 → `failed`，`before_unload` 返回 0，Loader 不卸载。
+- `SubclassProc` 的 `WM_NCDESTROY` 清理移到函数最前面，之后才看
+  `g_coreDisabled`；disabled 期间其它消息直接交给原过程，不再设置定时器。
+- 测试：`core_host --window` 创建一个 `MultiRender*` 窗口 → 日志出现
+  `subclassed hwnd=`；重载时 `[Core] unsubclass: removed=1`；新 Core 重新
+  `subclassed hwnd=`，宿主存活。
+
 ---
 
 ## 3. 日志与排错

@@ -1248,6 +1248,23 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     WNDPROC old = SubOldProc(h);
     LRESULT r;
 
+    /* ★ 清理必须在 g_coreDisabled 检查之前: 卸载期间窗口可能被销毁,
+       WM_NCDESTROY 仍要 KillTimer/RemoveProp/ForgetWindowGeom。
+       处理完直接交给原过程返回, 不再进入下面的 timer/业务逻辑。 */
+    if (msg == WM_NCDESTROY) {
+        KillTimer(h, TIMER_CAPTION);
+        RemovePropA(h, PROP_CAPTIMER);
+        ForgetWindowGeom(h);
+        if (old) return CallWindowProcW(old, h, msg, wp, lp);
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+
+    /* 退场中: 只把消息交给原过程, 不再设置定时器/跑 Core 逻辑 */
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0)) {
+        if (old) return CallWindowProcW(old, h, msg, wp, lp);
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+
     /* 标题栏自动隐藏: 定时器装在窗口自己的线程里。
        (跨线程 SetTimer 的 WM_TIMER 会投到别的线程, 再跨线程改样式会互等。) */
     if (!GetPropA(h, PROP_CAPTIMER)) {
@@ -1351,11 +1368,7 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         msg == WM_EXITMENULOOP)
         SetPropA(h, PROP_MENUTICK, (HANDLE)(ULONG_PTR)GetTickCount());
 
-    if (msg == WM_NCDESTROY) {
-        KillTimer(h, TIMER_CAPTION);
-        RemovePropA(h, PROP_CAPTIMER);
-        ForgetWindowGeom(h);
-    }
+    /* WM_NCDESTROY 的清理已在函数入口处理 (必须在 disabled 检查之前) */
 
     /* ★ 用户命令必须"在交给原过程之前"记下来: SC_RESTORE/SC_MAXIMIZE 会在
        DefWindowProc 里同步改窗口几何, 等原过程返回再记就晚了。 */
@@ -4411,6 +4424,58 @@ static void FillHookTable(HrHooks* h)
     h->InitiateSystemShutdownExW = SH_Hook_InitiateSystemShutdownExW;
 }
 
+/* P2b-2 ③: restore the original WNDPROC on every window we subclassed.
+   Uses real_SetWindowLongPtrW (not the hook) and never touches a window whose
+   WNDPROC was replaced by someone else.  Returns 0 if a window still points at
+   SubclassProc -- unloading then would leave a dangling WNDPROC. */
+static int Core_RemoveSubclasses(void)
+{
+    HWND    hs[MAX_SUBCLASS];
+    WNDPROC olds[MAX_SUBCLASS];
+    int     n = 0, i;
+    int     removed = 0, gone = 0, replaced = 0, failed = 0;
+
+    if (!g_subCsReady) return 1;
+
+    EnterCriticalSection(&g_subCs);
+    for (i = 0; i < MAX_SUBCLASS; i++) {
+        if (g_sub[i].h) {
+            hs[n] = g_sub[i].h;
+            olds[n] = g_sub[i].old;
+            n++;
+        }
+    }
+    LeaveCriticalSection(&g_subCs);
+
+    for (i = 0; i < n; i++) {
+        HWND h = hs[i];
+
+        if (!IsWindow(h)) { gone++; continue; }   /* destroyed externally */
+        if ((WNDPROC)GetWindowLongPtrW(h, GWLP_WNDPROC) != SubclassProc) {
+            replaced++;                            /* someone else took over */
+            continue;
+        }
+        KillTimer(h, TIMER_CAPTION);
+        if (real_SetWindowLongPtrW &&
+            (WNDPROC)real_SetWindowLongPtrW(h, GWLP_WNDPROC,
+                                           (LONG_PTR)olds[i]) == SubclassProc) {
+            RemovePropA(h, "BypassOldProc");
+            RemovePropA(h, PROP_CAPTIMER);
+            removed++;
+        } else {
+            failed++;
+        }
+    }
+
+    EnterCriticalSection(&g_subCs);
+    memset(g_sub, 0, sizeof(g_sub));
+    LeaveCriticalSection(&g_subCs);
+
+    HookLog("[Core] unsubclass: removed=%d gone=%d replaced=%d failed=%d",
+            removed, gone, replaced, failed);
+    return (failed == 0) ? 1 : 0;
+}
+
 /* P2b-1: unload handshake.
    Phase 1 is read-only: any failure returns 0 without touching anything.
    Phase 2 is irreversible: disable the Core, stop its threads, then return 1.
@@ -4466,6 +4531,13 @@ static int __cdecl Core_BeforeUnload(void)
        that reason; subclasses/timers/window classes are P2b-2.) */
     if (!VD_StopWait(3000)) {
         HookLog("[Core] unload failed: VD thread did not stop in 3s");
+        return 0;
+    }
+
+    /* ③ 摘子类化: 窗口过程恢复成原函数, 否则 FreeLibrary 后消息会跳到
+       已释放的 SubclassProc。失败了就不让 Loader 卸载。 */
+    if (!Core_RemoveSubclasses()) {
+        HookLog("[Core] unload failed: a window still points at SubclassProc");
         return 0;
     }
 

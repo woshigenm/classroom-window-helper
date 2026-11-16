@@ -152,7 +152,8 @@ try {
     Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
     $from2 = if (Test-Path $log) { (Get-Item $log).Length } else { 0 }
     $host2 = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
-        -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll', '--seconds', '20')
+        -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll',
+                        '--window', '--seconds', '20')
     for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "core_host (real) did not write its pidfile" }
     $pid2 = [int](Get-Content $pidfile -Raw).Trim()
@@ -160,7 +161,8 @@ try {
 
     $boot = Log-New $from2
     "--- real Core boot (all three threads?) ---"
-    foreach ($pat in @('attached: core_host.exe', 'caption pump started', 'vd: thread started')) {
+    foreach ($pat in @('attached: core_host.exe', 'caption pump started',
+                       'vd: thread started', 'subclassed hwnd=')) {
         if ($boot -match [regex]::Escape($pat)) { "  $pat : ok" }
         else { "  $pat : FAIL"; $pass = $false }
     }
@@ -170,12 +172,16 @@ try {
     "--- real Core reload (P2b-1: must succeed) ---"
     "  resp     : $r"
     if ($r -notmatch '^ok seq=') { $pass = $false }
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 1500
     $new2 = Log-New $fromReload
     if ($new2 -match '\[Core\] before_unload: worker \+ caption \+ vd stopped') { "  log      : ok (threads stopped)" }
     else { "  log      : FAIL (missing before_unload line)"; $pass = $false }
+    if ($new2 -match '\[Core\] unsubclass: removed=([1-9]\d*)') { "  unsubclass: ok (removed)" }
+    else { "  unsubclass: FAIL (no window unsubclassed)"; $pass = $false }
     if ($new2 -match '\[Loader\] core loaded:') { "  new core : ok" }
     else { "  new core : FAIL"; $pass = $false }
+    if ($new2 -match 'subclassed hwnd=') { "  re-subclass: ok (new Core)" }
+    else { "  re-subclass: FAIL"; $pass = $false }
     $st = Send-Ctl $pid2 'status'
     "  status   : $st"
 } finally {

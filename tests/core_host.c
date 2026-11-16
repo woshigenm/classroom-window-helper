@@ -40,6 +40,11 @@ static int RunInjector(const char* injector, const char* dll)
     return rc == 0;
 }
 
+static LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    return DefWindowProcA(h, m, w, l);
+}
+
 int main(int argc, char** argv)
 {
     const char* pidfile = NULL;
@@ -47,6 +52,7 @@ int main(int argc, char** argv)
     const char* injector = NULL;
     int seconds = 30;
     int crashAfter = 0;
+    int makeWindow = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -54,6 +60,7 @@ int main(int argc, char** argv)
         else if (!_stricmp(argv[i], "--inject") && i + 1 < argc) dll = argv[++i];
         else if (!_stricmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!_stricmp(argv[i], "--crash-after") && i + 1 < argc) crashAfter = atoi(argv[++i]);
+        else if (!_stricmp(argv[i], "--window")) makeWindow = 1;
         else if (!injector) injector = argv[i];
     }
 
@@ -83,6 +90,28 @@ int main(int argc, char** argv)
 
     printf("pid=%lu ready\n", (unsigned long)GetCurrentProcessId());
     fflush(stdout);
+
+    if (makeWindow) {
+        WNDCLASSA wc;
+        int      sw = GetSystemMetrics(SM_CXSCREEN);
+        int      sh = GetSystemMetrics(SM_CYSCREEN);
+        HWND     w;
+
+        memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc   = HostProc;
+        wc.hInstance     = GetModuleHandleA(NULL);
+        wc.hCursor       = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
+        wc.lpszClassName = "MultiRenderP2bTest";
+        RegisterClassA(&wc);
+
+        w = CreateWindowExA(0, "MultiRenderP2bTest", "p2b subclass host",
+                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                            sw / 10, sh / 10, sw * 8 / 10, sh * 8 / 10,
+                            NULL, NULL, wc.hInstance, NULL);
+        if (w) ShowWindow(w, SW_SHOW);
+        printf("window=%p\n", (void*)w);
+        fflush(stdout);
+    }
 
     if (crashAfter > 0) {
         Sleep((DWORD)crashAfter);
