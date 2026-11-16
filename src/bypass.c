@@ -140,6 +140,7 @@
 #define ID_BTN_SMALLSTICKY  1015
 #define ID_BTN_SCREENGUARD  1016    /* 屏幕监控守卫: 老师端只看到定格画面 */
 #define ID_CHK_TRAY         1020    /* 广播窗最小化: 任务栏(真最小化) / 收起(托盘) */
+#define ID_CHK_SHUT         1021    /* 屏蔽控制端重启/关机 (横幅/关机守卫) */
 #define ID_LOG_OUTPUT       1100
 #define ID_STATUS_BAR       1200
 #define ID_lblStatus        1201
@@ -406,6 +407,8 @@ static int    g_hoverTitle = 0;      /* 0 = none, 1 = min, 2 = close */
 static BOOL   g_titleTracking = FALSE;
 /* 屏幕监控守卫 (bin\bypass_screen.ini, 由注入的 DLL 在 0.5s 内读到) */
 static BOOL   g_screenGuard = FALSE;
+/* 远程重启/关机守卫 (bin\bypass_shut.ini, 同样由注入的 DLL 读) */
+static BOOL   g_shutGuard = FALSE;
 
 /* DPI awareness (Per-Monitor V2, no manifest needed) */
 static UINT g_dpi    = 96;
@@ -484,6 +487,9 @@ static void LayoutControls(HWND hwnd);
 static BOOL ReadMinimizeTaskbarMode(void);
 static void WriteMinimizeMode(BOOL taskbar);
 static void StateInit(void);
+static void ShutGuardLoad(void);
+static void ShutGuardSave(void);
+static void OnShutGuardToggle(HWND hwnd);
 
 /* 托盘 (notification area) */
 static HICON g_trayIcon;
@@ -3812,6 +3818,8 @@ static void LayoutControls(HWND hwnd) {
         }
         hCtl = GetDlgItem(hwnd, ID_CHK_TRAY);
         if (hCtl) MoveWindow(hCtl, S(UI_PAD), S(CHK_Y), S(300), S(24), TRUE);
+        hCtl = GetDlgItem(hwnd, ID_CHK_SHUT);
+        if (hCtl) MoveWindow(hCtl, S(UI_PAD + 308), S(CHK_Y), S(360), S(24), TRUE);
         hCtl = GetDlgItem(hwnd, ID_BTN_SCREENGUARD);
         if (hCtl) MoveWindow(hCtl, S(UI_PAD), S(ROW3_Y),
                              S(BTN2_W) * 2 + S(BTN_GAP), S(BTN_H), TRUE);
@@ -3846,6 +3854,8 @@ static void ApplyControlFonts(HWND hwnd)
     h = GetDlgItem(hwnd, ID_LOG_OUTPUT);
     if (h) SendMessageW(h, WM_SETFONT, (WPARAM)g_hFontLog, TRUE);
     h = GetDlgItem(hwnd, ID_CHK_TRAY);
+    if (h) SendMessageW(h, WM_SETFONT, (WPARAM)g_hFontHint, TRUE);
+    h = GetDlgItem(hwnd, ID_CHK_SHUT);
     if (h) SendMessageW(h, WM_SETFONT, (WPARAM)g_hFontHint, TRUE);
 }
 
@@ -3906,6 +3916,13 @@ void CreateControls(HWND hwnd) {
         hwnd, (HMENU)(INT_PTR)ID_CHK_TRAY, hInstance, NULL);
     CheckDlgButton(hwnd, ID_CHK_TRAY,
                    ReadMinimizeTaskbarMode() ? BST_CHECKED : BST_UNCHECKED);
+
+    /* 远程重启/关机守卫: 只吞控制端的 0x27/0x28, 不影响本机自己关机 */
+    CreateWindowW(L"BUTTON", L"屏蔽控制端重启/关机",
+        WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+        S(UI_PAD + 308), S(CHK_Y), S(360), S(24),
+        hwnd, (HMENU)(INT_PTR)ID_CHK_SHUT, hInstance, NULL);
+    CheckDlgButton(hwnd, ID_CHK_SHUT, g_shutGuard ? BST_CHECKED : BST_UNCHECKED);
 
     /* bottom row buttons (positioned by LayoutControls) */
     hBtn = CreateWindowW(L"BUTTON", L"",
@@ -4403,6 +4420,91 @@ static void OnScreenGuardToggle(HWND hwnd)
         HWND b = GetDlgItem(hwnd, ID_BTN_SCREENGUARD);
         if (b) InvalidateRect(b, NULL, TRUE);
     }
+}
+
+/* ===== 远程重启/关机守卫 =====
+   老师端的「远程关机 / 远程重启」在协议里就是两个命令字节 (REA/Ghidra 实证
+   Student.exe FUN_00413560: 0x27 重启, 0x28 关机)。学生端自己的执行路径:
+     0x27 -> ExitWindowsEx(EWX_REBOOT|EWX_FORCE)
+     0x28 -> systemoper.dll!SYS_RunCommand("shutdown -s -t 1")
+   注入的 DLL 在函数入口把这两条路吞掉 (返回"成功"避免控制端重试)。
+   这里只负责开关: 写 bin\bypass_shut.ini, DLL 0.5 秒内读到。 */
+static void ShutGuardPath(char* out, DWORD size)
+{
+    char dir[MAX_PATH];
+
+    if (!out || size < 2) return;
+    out[0] = '\0';
+    if (!GetModuleFileNameA(NULL, dir, sizeof(dir))) return;
+    PathRemoveFileSpecA(dir);
+    PathCombineA(out, dir, "bypass_shut.ini");
+}
+
+static void ShutGuardLoad(void)
+{
+    char  path[MAX_PATH];
+    char  line[160];
+    FILE* f;
+
+    g_shutGuard = FALSE;
+    ShutGuardPath(path, sizeof(path));
+    f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        char* eq = strchr(line, '=');
+        char* v;
+
+        if (!eq) continue;
+        *eq = '\0';
+        v = eq + 1;
+        while (*v == ' ' || *v == '\t') v++;
+        if (!_stricmp(line, "enabled"))
+            g_shutGuard = (atoi(v) != 0) ? TRUE : FALSE;
+    }
+    fclose(f);
+}
+
+static void ShutGuardSave(void)
+{
+    char  path[MAX_PATH];
+    char  tmp[MAX_PATH];
+    FILE* f;
+
+    ShutGuardPath(path, sizeof(path));
+    if (!path[0]) return;
+    _snprintf(tmp, sizeof(tmp) - 1, "%s.tmp", path);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "; 远程重启/关机守卫: 注入的 bypass_hook32.dll 读取本文件 (0.5 秒内生效)\r\n");
+    fprintf(f, ";   enabled=1    忽略老师端的 0x27(重启) / 0x28(关机), 只写日志\r\n");
+    fprintf(f, ";   enabled=0    正常: 控制端可以远程关机/重启本机 (默认)\r\n");
+    fprintf(f, "enabled=%d\r\n", g_shutGuard ? 1 : 0);
+    fclose(f);
+
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        DeleteFileA(tmp);
+}
+
+static void OnShutGuardToggle(HWND hwnd)
+{
+    g_shutGuard = (IsDlgButtonChecked(hwnd, ID_CHK_SHUT) == BST_CHECKED)
+                      ? TRUE : FALSE;
+    ShutGuardSave();
+
+    /* 守卫逻辑在注入的 DLL 里: 打开时确保它已经进了 Student.exe 等进程 */
+    if (g_shutGuard) RunInjector(hwnd, TRUE);
+
+    if (g_shutGuard) {
+        AppendLog(hwnd, "\r\n[Guard] 屏蔽控制端重启/关机 -> 开 (bin\\bypass_shut.ini)\r\n"
+                        "[Guard] 老师端发来的 0x27/0x28 会被吞掉: 不重启、不关机, 只记一行日志\r\n");
+    } else {
+        AppendLog(hwnd, "\r\n[Guard] 屏蔽控制端重启/关机 -> 关 (bin\\bypass_shut.ini)\r\n"
+                        "[Guard] 恢复正常: 老师端可以远程关机/重启本机\r\n");
+    }
+    UpdateStatus(hwnd, g_shutGuard ? "Status: remote shutdown blocked"
+                                   : "Status: remote shutdown allowed");
 }
 
 /* ========== 托盘 (notification area) ==========
@@ -5424,6 +5526,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                  : "tray (hidden; toggle sticky off to restore)");
                     break;
                 }
+                case ID_CHK_SHUT:
+                    OnShutGuardToggle(hwnd);
+                    break;
                 case ID_BTN_CHECK_STATUS:
                     OnCheckStatus(hwnd);
                     break;
@@ -5686,6 +5791,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* 配置 + 共享状态（必须在注入 DLL 之前） */
     StateInit();
     ScreenGuardLoad();          /* 屏幕监控守卫: 读 bin\bypass_screen.ini */
+    ShutGuardLoad();            /* 远程重启/关机守卫: 读 bin\bypass_shut.ini */
 
     /* this run only: truncate before any DLL starts appending.
        An instance spawned by the elevation chain must NOT truncate - the

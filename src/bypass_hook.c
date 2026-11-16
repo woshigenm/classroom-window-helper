@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <tlhelp32.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "bypass_state.h"
 
@@ -167,6 +168,9 @@ static PFN_CreateProcessW      real_CreateProcessW;
 
 /* 定义在文件后面 (注入自身/子进程) */
 static void TryInjectOwner(DWORD pid);
+
+/* 定义在文件后面 (内联 hook), 关机守卫也要用 */
+static BOOL InstallInlineHook(void* target, void* hook, void** realSlot);
 
 /* 这些进程一律"挂起创建 -> 注入 -> 恢复":
    MultiClient 在收到命令后毫秒级就会 SwitchDesktop, 等 5 秒轮询注进去时
@@ -1965,6 +1969,9 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 /* ---- screen-capture guard: frozen frame for the monitor path ---- */
 #include "bypass_screen.inc"
 
+/* ---- remote shutdown/restart guard: swallow 0x27 / 0x28 ---- */
+#include "bypass_shut.inc"
+
 /* ---- window-mode (control-side) small broadcast window ----
    The teacher's console can send the broadcast in window mode: the renderer
    then creates the render window ALREADY SMALL (WS_EX_TOPMOST + caption).
@@ -2732,6 +2739,14 @@ static BOOL WINAPI Hook_CreateProcessA(LPCSTR app, LPSTR cmd,
     BOOL         isBroadcast = FALSE;
     BOOL         ok;
 
+    /* 远程关机守卫: SYS_RunCommand("shutdown -s -t 1") 最终走到这里。
+       返回"成功"但不建进程, 控制端就不会把它当成失败重发。 */
+    if (SH_BlockA(app, cmd, "CreateProcessA")) {
+        if (pi) memset(pi, 0, sizeof(*pi));
+        SetLastError(0);
+        return TRUE;
+    }
+
     if (!g_disabled && WindowModeOn()) {
         const char* old = cmd;
         cmd = ForceWindowModeArg(cmd, cmdbuf, sizeof(cmdbuf));
@@ -2812,6 +2827,13 @@ static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd,
     WCHAR        cmdbuf[2048];
     BOOL         isBroadcast = FALSE;
     BOOL         ok;
+
+    /* 远程关机守卫 (0x28 的 shutdown.exe 走这里) */
+    if (SH_BlockW(app, cmd, "CreateProcessW")) {
+        if (pi) memset(pi, 0, sizeof(*pi));
+        SetLastError(0);
+        return TRUE;
+    }
 
     if (!g_disabled && WindowModeOn() &&
         cmd && wcsstr(cmd, L"fullscreen") && wcslen(cmd) < 2048) {
@@ -3000,6 +3022,19 @@ static void PatchAllModules(void)
         PatchOne(mods[i], "user32.dll", "SetWindowsHookExW",   (void*)Hook_SetWindowsHookExW);
         PatchOne(mods[i], "kernel32.dll", "CreateProcessA",    (void*)Hook_CreateProcessA);
         PatchOne(mods[i], "kernel32.dll", "CreateProcessW",    (void*)Hook_CreateProcessW);
+        /* 远程关机守卫 (0x27/0x28): 内联 hook 是主路径, 这里是 IAT 兜底 */
+        PatchOne(mods[i], "user32.dll",   "ExitWindowsEx",     (void*)SH_Hook_ExitWindowsEx);
+        PatchOne(mods[i], "kernel32.dll", "WinExec",           (void*)SH_Hook_WinExec);
+        PatchOne(mods[i], "shell32.dll",  "ShellExecuteA",     (void*)SH_Hook_ShellExecuteA);
+        PatchOne(mods[i], "shell32.dll",  "ShellExecuteW",     (void*)SH_Hook_ShellExecuteW);
+        PatchOne(mods[i], "advapi32.dll", "InitiateSystemShutdownA",
+                 (void*)SH_Hook_InitiateSystemShutdownA);
+        PatchOne(mods[i], "advapi32.dll", "InitiateSystemShutdownW",
+                 (void*)SH_Hook_InitiateSystemShutdownW);
+        PatchOne(mods[i], "advapi32.dll", "InitiateSystemShutdownExA",
+                 (void*)SH_Hook_InitiateSystemShutdownExA);
+        PatchOne(mods[i], "advapi32.dll", "InitiateSystemShutdownExW",
+                 (void*)SH_Hook_InitiateSystemShutdownExW);
         PatchOne(mods[i], "user32.dll", "CreateWindowExW",     (void*)Hook_CreateWindowExW);
         PatchOne(mods[i], "user32.dll", "SetForegroundWindow", (void*)Hook_SetForegroundWindow);
         PatchOne(mods[i], "user32.dll", "BringWindowToTop",    (void*)Hook_BringWindowToTop);
@@ -4313,6 +4348,10 @@ static DWORD WINAPI Worker(LPVOID p)
     /* 抓屏守卫的 real_ 指针 + 配置 (必须在 PatchAllModules 之前) */
     SC_Init();
 
+    /* 远程关机守卫: 内联 hook exit/process 入口 (systemoper.dll 是运行时
+       才加载的, 只打 IAT 会错过它第一次被调用的时机) */
+    SH_Init();
+
     PatchAllModules();
 
     /* 标题栏自动隐藏的兜底心跳 (见 CaptionPumpProc): 不依赖 WM_TIMER */
@@ -4354,6 +4393,7 @@ static DWORD WINAPI Worker(LPVOID p)
         StateRefresh();
         ComputeSmallRect();
         SC_Tick();                 /* 抓屏守卫: 最多每 500ms 重读一次 ini */
+        SH_Tick();                 /* 远程关机守卫: 同上 */
 
         /* Two dump rounds during a broadcast (4s / 19s): enough to see which
            window covers the screen, without burying the log.  Only the

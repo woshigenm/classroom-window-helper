@@ -12,6 +12,7 @@ rem     make.bat wmodetest    -> bin\wmode_test.exe
 rem     make.bat vdtest       -> bin\vd_pin_test.exe
 rem     make.bat hangwintest  -> bin\hangwin_test.exe (foreign-fix test victim)
 rem     make.bat screentest   -> bin\screenguard_test.exe (screen-guard test)
+rem     make.bat shuttest     -> bin\shutguard_test.exe (remote shutdown guard test)
 rem     make.bat check        -> print both gcc versions
 rem     make.bat rebuild      -> clean + all
 rem     make.bat clean        -> delete outputs (incl. the 3 deliverables)

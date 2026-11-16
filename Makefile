@@ -53,7 +53,7 @@ CFLAGS32 := -std=gnu11 -O2 -Wall
 DLLFLAGS := -shared -Wl,--kill-at -static -static-libgcc
 DLLLIBS  := -lpsapi -lole32 -ladvapi32 -lgdi32
 
-.PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest hangwintest screentest clean rebuild check
+.PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest hangwintest screentest shuttest clean rebuild check
 
 # 主程序 + DLL + 注入器 + 自动提权载荷（自测程序按需单独编）
 all: bypass hook32 lpe
@@ -89,6 +89,9 @@ hangwintest: $(BIN)/hangwin_test.exe
 # 屏幕监控守卫自测载体 (tests/screenguard_test.c)
 screentest: $(BIN)/screenguard_test.exe
 
+# 远程重启/关机守卫自测载体 (tests/shutguard_test.c)
+shuttest: $(BIN)/shutguard_test.exe
+
 # ---- outputs -------------------------------------------------
 
 $(BIN):
@@ -97,7 +100,7 @@ $(BIN):
 $(BIN)/bypass.exe: src/bypass.c src/elevate.c src/elevate.h src/bypass_state.h | $(BIN)
 	"$(CC64)" $(CFLAGS64) "src/bypass.c" "src/elevate.c" -o "$@" $(LIBS64)
 
-$(BIN)/bypass_hook32.dll: src/bypass_hook.c src/bypass_vd.inc src/bypass_state.h | $(BIN)
+$(BIN)/bypass_hook32.dll: src/bypass_hook.c src/bypass_vd.inc src/bypass_screen.inc src/bypass_shut.inc src/bypass_state.h | $(BIN)
 	"$(CC32)" $(CFLAGS32) $(DLLFLAGS) "src/bypass_hook.c" -o "$@" $(DLLLIBS)
 
 $(BIN)/inject32.exe: src/inject32.c | $(BIN)
@@ -114,6 +117,9 @@ $(BIN)/hangwin_test.exe: tests/hangwin_test.c | $(BIN)
 
 $(BIN)/screenguard_test.exe: tests/screenguard_test.c | $(BIN)
 	"$(CC32)" $(CFLAGS32) "tests/screenguard_test.c" -o "$@" -lgdi32 -luser32
+
+$(BIN)/shutguard_test.exe: tests/shutguard_test.c | $(BIN)
+	"$(CC32)" $(CFLAGS32) "tests/shutguard_test.c" -o "$@" -lshell32 -luser32
 
 $(BIN)/vd_pin_test.exe: tests/vd_pin_test.c | $(BIN)
 	"$(CC32)" $(CFLAGS32) "tests/vd_pin_test.c" -o "$@" -lole32 -luuid -ladvapi32
@@ -133,6 +139,8 @@ clean:
 	-@del /q "$(BIN)\hooktest32.exe" 2>nul
 	-@del /q "$(BIN)\wmode_test.exe" 2>nul
 	-@del /q "$(BIN)\vd_pin_test.exe" 2>nul
+	-@del /q "$(BIN)\screenguard_test.exe" 2>nul
+	-@del /q "$(BIN)\shutguard_test.exe" 2>nul
 	-@rmdir /s /q "$(BIN)\lpe" 2>nul
 	@echo [clean] done
 

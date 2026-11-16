@@ -129,6 +129,25 @@ mode=freeze     ; freeze=第一帧当定格帧（默认） / blank=固定纯色
 - 只覆盖 GDI 抓屏；换成 DXGI / `PrintWindow` 抓屏就拦不到。定格后画面完全不动，老师端容易
   看出是静态图——这是"画面固定"的固有代价（详见 `docs\design.md` 2.6）。
 
+### 5.5 屏蔽控制端重启/关机（`bin\bypass_shut.ini`）
+
+主界面勾选框「屏蔽控制端重启/关机」。勾上之后，老师端菜单里的**远程重启 (0x27)** 和
+**远程关机 (0x28)** 都会被吞掉：本机不关机、不重启，只在 `bin\bypass_hook.log` 里留一行
+`[Guard] remote power command blocked: ...`。
+
+```ini
+; bin\bypass_shut.ini（点勾选框自动生成，DLL 每 0.5 秒重读，改完不用重启）
+enabled=1
+```
+
+- 拦截点：`ExitWindowsEx`（0x27 的直接调用）、`CreateProcessA/W` / `WinExec` /
+  `ShellExecuteA/W`（0x28 的 `shutdown -s -t 1`）、`InitiateSystemShutdown*`（未使用，兜底）。
+- 被拦的调用会返回"成功"（`TRUE` / `33`），控制端不会当成失败反复重发。
+- 只影响课堂进程（`Student.exe`、`MultiClient.exe` 等被注入的进程）；**你自己点开始菜单关机
+  不受影响**。
+- `systemoper.dll` 是运行时才加载的，所以用的是函数入口 inline hook，不是只改 IAT
+  （见 `docs\design.md` 2.7）。
+
 ## 6. 安全与回退
 
 - 误锁键盘：点主界面「解锁键盘」。键盘被驱动锁住时**快捷键按不出来**；

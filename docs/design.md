@@ -556,6 +556,55 @@ FUN_10025610 (0x10025610, 调用方 FUN_10025720)
 
 ---
 
+### 2.7 屏蔽控制端重启/关机（吞掉 0x27 / 0x28）
+
+**需求**：老师端点「远程关机 / 远程重启」时，本机不执行。
+
+**先确认过反向不可行**（`Teacher.exe` sha256 `8432e1…1e0f`）：老师端只有**发命令**的代码
+（`CRemoteShutDownDlg`、`FUN_00497940` 里逐台学生写 `cmd=0x27/0x28`），
+导入表没有 `ExitWindowsEx` / `InitiateSystemShutdown*`，也没有 `shutdown -s -t 1`、
+`systemoper`、`SYS_RunCommand` 这些字符串，更没有学生端那套 `CShutDownDlg` /
+`StuShutDownWnd.xml`。所以把同样的包发回老师端不会执行任何东西；能关的只有学生端自己。
+
+**学生端的执行链（REA / Ghidra，`Student.exe` sha256 `fcb7ab…473f`）**：
+
+```
+FUN_00413560(cmd)
+  case 0x27 (重启): FUN_00413080 -> FUN_00403a20
+        AdjustTokenPrivileges(SeShutdownPrivilege)
+        ExitWindowsEx(EWX_REBOOT|EWX_FORCE, 0)          // 直接调用
+  case 0x28 (关机): FUN_00412d80 (CShutDownDlg) -> FUN_00412d40
+        FUN_00404970(L"shutdown -s -t 1", 0)
+          -> LoadLibrary("systemoper.dll") + GetProcAddress("SYS_RunCommand")   // 运行时解析
+             -> CreateProcess("shutdown -s -t 1")
+```
+
+`systemoper.dll` 是**第一次用到才加载**的，如果只在模块加载后扫 IAT，会正好错过它第一次
+被调用的时刻。所以 `src\bypass_shut.inc` 用的是**函数入口 inline hook**（进程内所有模块共享）：
+
+| 拦截点 | 覆盖 | 备注 |
+|---|---|---|
+| `ExitWindowsEx`（user32） | 0x27 重启 | 直接调用，入口 hook 稳 |
+| `CreateProcessA/W`、`WinExec`、`ShellExecuteA/W` | 0x28 的 `shutdown -s -t 1` | 命令行按"可执行名 + `/s` `/r` `/p` `/g`"识别，兼容 `cmd /c`、带引号全路径 |
+| `InitiateSystemShutdownExW/A`、`InitiateSystemShutdownW/A` | 兜底 | 客户端没用到，顺手覆盖 |
+
+- 被拦的调用返回**成功**（`ExitWindowsEx` → `TRUE`，`WinExec` → `33`，`ShellExecute` → `(HINSTANCE)33`，
+  `CreateProcess` → `TRUE` + 全零 `PROCESS_INFORMATION`），控制端不会把它当成失败重试。
+- 开关：`bin\bypass_shut.ini` 的 `enabled=0/1`，DLL 每 0.5 秒重读；主界面勾选框
+  「屏蔽控制端重启/关机」写这个文件并调 `RunInjector` 保证 DLL 已进入 `Student.exe`。
+- 只影响被注入的课堂进程；用户自己从开始菜单/`shutdown` 关机不经过这些进程，不受影响。
+- 日志：`[Guard] hook <api>: installed/FAILED (IAT only)`（启动时每个入口一行）、
+  `[Guard] remote power command blocked: <api> (<cmdline>)`（拦截时）。
+
+> **自测注意（血泪教训）**：`tests\shutguard_test.c` **不允许**调用
+> `ExitWindowsEx`（实测 `ExitWindowsEx(0x80000000, 0)` 会被 Windows 当成关机，直接把机器关掉），
+> 也不允许出现裸的 `shutdown -s -t 1`（会解析到 `System32\shutdown.exe`）。
+> 测试只跑 `%TEMP%\shutguard_probe\shutdown.exe`（`cmd.exe` 的重名副本）+ 从日志读
+> `hook ExitWindowsEx: installed`；`tests\shutguard_test.ps1` 在运行前会扫描二进制，
+> 发现这两类东西就拒绝执行。
+
+---
+
 ## 3. 日志与排错
 
 日志文件：
@@ -675,6 +724,28 @@ case 2/2: guard ON  (expect frozen=1)
   on: frozen=1
 VERDICT PASS
 ```
+
+验证"屏蔽控制端重启/关机"（`make.bat shuttest` + 脚本，**建议在虚拟机里跑**）：
+
+```bat
+make.bat all shuttest
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\shutguard_test.ps1
+```
+
+脚本对 `enabled=0/1` 各注入一次 DLL，只操作 `%TEMP%\shutguard_probe\shutdown.exe`
+（`cmd.exe` 的重名副本，执行它什么也不做）：
+
+```
+case 1/2: guard off -> fake shutdown.exe 正常启动；命令行透传
+case 2/2: guard on  -> 所有 shutdown 写法都被吞掉，不创建进程
+                      日志里有 hook ExitWindowsEx: installed
+VERDICT PASS
+```
+
+> 脚本运行前会扫描 `bin\shutguard_test.exe`：只要里面出现 `ExitWindowsEx` 导入、
+> `InitiateSystemShutdown` 或裸的 `shutdown -s|/s|-r|/r|-t` 字面量就直接拒绝运行。
+> `ExitWindowsEx(0x80000000, 0)` **不是**"无害探针"——Windows 会当成关机请求，
+> 开发时已经因此关过机器，绝对不要再加回去。
 
 验证"跨进程兜底不会卡死 enforcer"（`make.bat hangwintest` + 脚本）：
 
