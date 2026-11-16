@@ -185,7 +185,7 @@ $(LPEOUT)/shell_broker.exe: src/lpe_broker.c | $(BIN)
 
 # ---- housekeeping --------------------------------------------
 
-# 只删 bin\ 里的编译产物（三个交付文件也在内），不碰运行期配置和日志。
+# 只删 bin\ 里的编译产物（三个交付文件也在内），不碰运行期配置和 ini。
 #    想恢复就重新 `make.bat all`；正在运行的 bypass.exe 会锁住文件，先退出。
 clean:
 	-@del /q "$(BIN)\bypass.exe" "$(BIN)\bypass_hook32.dll" "$(BIN)\bypass_hook_core.dll" "$(BIN)\inject32.exe" 2>nul
@@ -195,6 +195,9 @@ clean:
 	-@del /q "$(BIN)\screenguard_test.exe" 2>nul
 	-@del /q "$(BIN)\shutguard_test.exe" 2>nul
 	-@del /q "$(BIN)\fake_core_return0.dll" "$(BIN)\fake_core_abi.dll" "$(BIN)\fake_core_hooks.dll" "$(BIN)\fake_core_leak.dll" "$(BIN)\fake_core_good.dll" "$(BIN)\core_host.exe" "$(BIN)\core_stuck_hook.dll" "$(BIN)\core_stuck_worker.dll" "$(BIN)\core_subclass_fail.dll" "$(BIN)\core_evil.dll" "$(BIN)\ui_preview.exe" 2>nul
+	-@del /q "$(BIN)\hangwin_test.exe" "$(BIN)\hooktest_result.txt" "$(BIN)\wmode_test.log" 2>nul
+	-@del /q "$(BIN)\Student.exe" "$(BIN)\MultiClient.exe" "$(BIN)\MultiRender.exe" "$(BIN)\ScreenRecord.exe" "$(BIN)\ScreenRender.exe" "$(BIN)\ScreenPen.exe" "$(BIN)\SharedDesktop.exe" 2>nul
+	-@del /q "$(BIN)\core_cache\core.*.dll" 2>nul
 	-@rmdir /s /q "$(BIN)\lpe" 2>nul
 	@echo [clean] done
 

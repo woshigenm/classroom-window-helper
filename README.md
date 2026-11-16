@@ -15,9 +15,17 @@
 | `bin\bypass_hook_single.dll` | 回退用的旧版单 DLL（P1 之前那版），把名字改回 `bypass_hook32.dll` 即可回退 |
 | `bin\inject32.exe` | 注入器（主程序自动拉起，也可手动） |
 | `bin\lpe\` | 启动时的自动提权载荷（可选；没有它就走 UAC） |
+| `bin\*.ini` | 运行配置（`bypass_config` / `bypass_screen` / `bypass_shut` / `bypass_vd` / `bypass_elevate`），首次运行自动生成 |
+| `bin\core_cache\` | 运行期产物（Loader 的 Core 缓存副本），可以整个删掉；Loader 启动时会清掉死进程留下的孤儿 |
 
 > ⚠ `bin\` 必须在本机磁盘。VMware 共享目录 / 网络盘不支持 PE image section 映射，
 > 目标进程里 `LoadLibraryW` 返回 0，注入必失败。
+
+> 交付时 `bin\` 只需要上表这些。仓库里跑过测试后还会多出 `core_host.exe`、
+> `ui_preview.exe`、`core_stuck_*` / `core_evil` / `fake_core_*`、`*_test.exe`、
+> `hooktest_result.txt`、`wmode_test.log`，以及测试脚本复制出来的 `Student.exe` /
+> `MultiClient.exe` / `ScreenRecord.exe` / `ScreenRender.exe`（都是 `core_host.exe` 的副本，
+> 会被同名课堂进程误认成"正在运行"）。**这些都不随交付**，`make.bat clean` 会一起删。
 
 ## 2. 快速开始
 

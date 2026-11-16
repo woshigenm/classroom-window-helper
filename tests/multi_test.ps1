@@ -129,7 +129,12 @@ function Stop-Host($h) {
     if ($null -eq $h) { return }
     if ($h.Proc -and !$h.Proc.HasExited) { Stop-Process -Id $h.Proc.Id -Force -ErrorAction SilentlyContinue }
     Remove-Item $h.Pidfile -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path $bin $h.Name) -Force -ErrorAction SilentlyContinue
+    # the image stays locked for a moment after Stop-Process returns
+    $exe = Join-Path $bin $h.Name
+    for ($i = 0; $i -lt 20 -and (Test-Path $exe); $i++) {
+        Remove-Item $exe -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 100
+    }
 }
 
 Copy-Item $core $save -Force

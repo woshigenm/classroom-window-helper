@@ -145,7 +145,11 @@ try {
     if ($prev -and !$prev.HasExited) { Stop-Process -Id $prev.Id -Force -ErrorAction SilentlyContinue }
     if ($host0 -and !$host0.HasExited) { Stop-Process -Id $host0.Id -Force -ErrorAction SilentlyContinue }
     Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path $bin 'ScreenRender.exe') -Force -ErrorAction SilentlyContinue
+    $exe = Join-Path $bin 'ScreenRender.exe'
+    for ($i = 0; $i -lt 20 -and (Test-Path $exe); $i++) {
+        Remove-Item $exe -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 100
+    }
     Copy-Item $save $core -Force
     Remove-Item $save -Force -ErrorAction SilentlyContinue
 }

@@ -1670,6 +1670,63 @@ static DWORD WINAPI CtlThread(LPVOID p)
     return 0;
 }
 
+/* Cache copies are left behind on purpose when a load fails *after* the module
+   was initialized (bad ABI / incomplete hook table are kept mapped), and never
+   deleted after coreDead.  Nothing references those files and only the owning
+   process could have removed them, so a killed process leaks them forever.
+   Once per injected process: delete files whose <pid> is gone.
+
+   pid reuse: a new process with the old pid is "alive", so its file is kept
+   (a leak, not a mistake).  A file that really is mapped cannot be deleted
+   anyway - DeleteFileA fails and we just skip it. */
+static void CleanOrphanCaches(void)
+{
+    char  dir[MAX_PATH], pat[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE fh;
+    int removed = 0, kept = 0;
+
+    _snprintf(dir, sizeof(dir) - 1, "%s%s", g_baseDir, HR_CACHE_DIR);
+    dir[sizeof(dir) - 1] = '\0';
+    _snprintf(pat, sizeof(pat) - 1, "%s\\core.*.dll", dir);
+    pat[sizeof(pat) - 1] = '\0';
+
+    fh = FindFirstFileA(pat, &fd);
+    if (fh == INVALID_HANDLE_VALUE) return;
+
+    do {
+        char*          end = NULL;
+        unsigned long  pid;
+        char           full[MAX_PATH];
+        HANDLE         hp;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (_strnicmp(fd.cFileName, "core.", 5) != 0) continue;
+
+        pid = strtoul(fd.cFileName + 5, &end, 10);
+        if (!pid || !end || *end != '.' || pid == (unsigned long)g_pid) continue;
+
+        hp = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+        if (hp) {
+            CloseHandle(hp);            /* pid still alive: keep */
+            kept++;
+            continue;
+        }
+        if (GetLastError() != ERROR_INVALID_PARAMETER) {
+            kept++;                     /* access denied: assume alive */
+            continue;
+        }
+
+        _snprintf(full, sizeof(full) - 1, "%s\\%s", dir, fd.cFileName);
+        full[sizeof(full) - 1] = '\0';
+        if (DeleteFileA(full)) removed++;
+    } while (FindNextFileA(fh, &fd));
+    FindClose(fh);
+
+    if (removed || kept)
+        HookLog("[Loader] cache: %d orphan(s) removed, %d live kept", removed, kept);
+}
+
 static DWORD WINAPI Manager(LPVOID p)
 {
     char full[MAX_PATH], src[MAX_PATH], cache[MAX_PATH], err[160];
@@ -1690,6 +1747,8 @@ static DWORD WINAPI Manager(LPVOID p)
         HookLog("[Loader] skip: %s is teacher-side (no hooks, no core)", g_ownImage);
         return 0;
     }
+
+    CleanOrphanCaches();
 
     ResolveReals();
     inlineOk = InstallInlineHooks();

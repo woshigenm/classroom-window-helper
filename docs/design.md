@@ -615,7 +615,8 @@ FUN_00413560(cmd)
   `[build] image=Student.exe dll=bypass_hook32.dll built=Nov 16 2026 21:08:38 pid=6116`。
   主程序判断"进程里的是不是新 DLL"**不靠这行日志**，而是比较**磁盘 DLL** 与**进程内
   DLL** 的 PE `FileHeader.TimeDateStamp`：
-  - `bypass_hook.log` 每次启动都会截断，旧进程的 `[build]` 行会被抹掉；
+  - `bypass_hook.log` 由 DLL 以 `FILE_APPEND_DATA` 追加，只有 `bypass.exe` 启动时清一次；
+    删掉文件后下一次 `HookLog` 会重建，不能当版本台账；
   - `bypass.exe` 和 `bypass_hook32.dll` 是两次编译，`__TIME__` 天然差几秒，字符串比对会误报；
   - PE 头不受日志/共享内存/版本号影响，还能一次看到 `Student.exe`、`MultiClient.exe`、
     `ScreenRecord.exe`、`ScreenRender.exe` 各自加载的是哪个版本。
@@ -705,6 +706,16 @@ P2b = 上面第 2 步的十项真正实现。
 
 - 缓存目录 `bin\core_cache\core.<pid>.<seq>.dll`：源文件 `bypass_hook_core.dll`
   从不被映射，构建输出可以随时覆盖；成功重载后删除旧缓存。
+  **垃圾文件规则**：`LoadLibrary` 失败 / `Core_Init` 返回 0 → `FreeLibrary` +
+  `DeleteFileA`，不留；`bad ABI` / `hooks incomplete` → 故意保留映射，留下
+  `core.<pid>.<seq>.dll`，而且这两种失败没有写 `g_cur.path`，下一次 reload 的
+  `DeleteFileA(prev)` 不会碰它们 → **孤儿**；`coreDead` 之后不再 `FreeLibrary`、
+  不再删 `prev`，那份文件一直被映射到进程退出。`seq` 是进程内 `++g_seq`，
+  所以反复失败会留下 `.1 .2 .3…`。
+  自愈：Loader 的 `Manager` 启动时跑一次 `CleanOrphanCaches()`——枚举
+  `core.*.dll`，按 `<pid>` 用 `OpenProcess(SYNCHRONIZE)` 判断进程是否还在，
+  只在 `ERROR_INVALID_PARAMETER`（pid 不存在）时删除；被映射的文件删不掉，
+  `DeleteFileA` 失败即跳过。pid 复用会漏删（留下垃圾，不是误删）。
 - 控制管道 `\\.\pipe\bypass_core_ctl_<pid>`，一行命令 / 一行响应：
   `status`、`reload`、`reload norollback`（`norollback` 用于调试，失败时不回滚）。
   消息模式下请求超过 127 字节时 `ReadFile` 返回 `ERROR_MORE_DATA`，必须把剩余消息
@@ -1010,8 +1021,11 @@ phase 2:         g_coreDisabled=1  ->  等 depth==0（1s）  ->  清 worker/capt
 - `bypass_hook.log` —— **唯一的日志文件**。注入的 DLL（每个被注入进程一份输出，行首格式如下：
   `[HH:MM:SS.mmm] [pid N] 内容`，时间戳用于判断"最大化→还原"隔了多久、定时器有没有在跑）和
   主程序的启动/提权过程（`launcher ...`、`lpe: ...`、`[elevate] ...`、
-  `elevated instance pid=... is up`）都写在这里。启动器每次启动截断一次；被 broker 拉起的
-  实例不截断（链路日志要连续）。所有写方都用追加语义，多进程并发安全。
+  `elevated instance pid=... is up`）都写在这里。
+  **清空只发生在 `bypass.exe` 启动时**（`TruncateHookLog` → `CREATE_ALWAYS`，提权子实例
+  不截断，见 4.4）；注入的 DLL 侧 `HookLog` 用 `FILE_APPEND_DATA + OPEN_ALWAYS`，
+  **只追加**，跨进程、跨重启持续增长。手动删掉文件后，下一次 `HookLog` 会重建（每 64 行
+  检查一次句柄），所以"删日志"立即生效，而不是等下次启动。
 - 主程序界面日志 —— 按钮操作、扫描结果、被降级的窗口、注入器的 stdout
   （**不再生成 `bypass_inject.log`**：注入器输出走匿名管道直接进界面/日志）
 

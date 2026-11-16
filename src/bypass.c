@@ -1834,7 +1834,8 @@ static const char* CONFIG_KEYS_TO_ZERO[] = {
  * 判定方式：直接比较 **磁盘上的 DLL** 和 **目标进程内存里的 DLL** 的
  * PE TimeDateStamp（FileHeader.TimeDateStamp）。这比读日志可靠：
  *   - 两边是同一个编译器产物时，__TIME__ 天然差几秒，不能直接字符串比；
- *   - bypass_hook.log 每次启动都会截断，旧进程的 [build] 行会被抹掉；
+ *   - bypass_hook.log 只追加（DLL 侧），bypass.exe 启动时才会清一次；删掉文件后
+ *     下一次写入会重建，所以不能把它当版本台账；
  *   - PE 头不受日志、共享内存、版本号影响，而且能一次看到每个进程。
  * 日志里仍然保留一行 [build]（image + built），方便人工 grep。
  */
