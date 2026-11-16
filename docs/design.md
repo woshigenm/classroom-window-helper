@@ -781,27 +781,25 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
 - 测试补了 **“重载后 CoreUef 仍被调用”**：宿主在重载后 `RaiseException`，日志里
   必须出现该 pid 的 `!! crash`（如果链还指向已卸载的旧 Core，就不会有这行）。
 
-**P2b-2 剩余三项的顺序**：
+**P2b-2 ③⑤ 已实现**：
 
-1. `RemoveWindowSubclass`（`g_coreDisabled=1` 之后；它本身不触发 `SubclassProc`）；
-2. `StateClose`（不依赖窗口，Worker 已停，`UnmapViewOfFile` 安全）；
-3. `KillTimer` → `DestroyWindow`（确认 `IsWindow(h)==FALSE`）→ `UnregisterClass`。
-   `WndProc`/`SubclassProc` 里的 `g_coreDisabled` 检查**不能**跳过
-   `WM_DESTROY`/`WM_NCDESTROY` 的清理分支，否则 `DestroyWindow` 会漏释放资源。
-
-**③ 已实现**：本项目的子类化是 `SetWindowLongPtrW(GWLP_WNDPROC, SubclassProc)`，
-不是 `SetWindowSubclass`，所以“摘”就是恢复原过程：
-
-- `Core_RemoveSubclasses()` 遍历 `g_sub[]`：
+- ③ 子类化：本项目的机制是 `SetWindowLongPtrW(GWLP_WNDPROC, SubclassProc)`，
+  不是 `SetWindowSubclass`，所以“摘”就是恢复原过程：
   - 窗口已销毁 → `gone`；
-  - 当前 WNDPROC 已被别人换掉 → `replaced`（不动）；
-  - 仍是我们 → `KillTimer` + `real_SetWindowLongPtrW` 恢复原过程 + 清属性 → `removed`；
+  - 当前 WNDPROC 已被别人换掉 → `replaced`：**不碰 WNDPROC**，但仍然
+    `KillTimer` + 清 `BypassOldProc`/`CAPTIMER` 属性（把我们的资源和窗口解绑），
+    不阻止卸载；
+  - 仍是我们 → `KillTimer` + `real_SetWindowLongPtrW(old)` + 清属性 → `removed`；
   - 恢复失败 → `failed`，`before_unload` 返回 0，Loader 不卸载。
 - `SubclassProc` 的 `WM_NCDESTROY` 清理移到函数最前面，之后才看
-  `g_coreDisabled`；disabled 期间其它消息直接交给原过程，不再设置定时器。
-- 测试：`core_host --window` 创建一个 `MultiRender*` 窗口 → 日志出现
-  `subclassed hwnd=`；重载时 `[Core] unsubclass: removed=1`；新 Core 重新
-  `subclassed hwnd=`，宿主存活。
+  `g_coreDisabled`；disabled 期间其它消息直接交给原过程。
+- ⑤ `StateClose`：`UnmapViewOfFile` + `CloseHandle(map/event)`，在 Worker 停止后调用。
+- ④ **本项目不适用**：Core 没有 `RegisterClass`/`CreateWindowEx`，不持有自己的窗口类；
+  唯一的定时器（`TIMER_CAPTION`）挂在应用的窗口上，已在 ③ 的每个窗口里
+  `KillTimer`。以后如果 Core 自己创建窗口/类，再补 `DestroyWindow` +
+  `UnregisterClass`。
+- 测试：`core_host --window` 创建 `MultiRender*` 窗口 → 日志 `subclassed hwnd=`；
+  重载时 `[Core] unsubclass: removed=1`；新 Core 重新子类化，宿主存活。
 
 ---
 

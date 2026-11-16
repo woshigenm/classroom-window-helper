@@ -3416,6 +3416,24 @@ static void StateOpen(void)
     g_stateFirst = 1;
 }
 
+/* P2b-2 ⑤: release the shared-memory view/handles.  Only the Worker calls
+   StateReadView/StateRefresh, and it is stopped before this runs. */
+static void StateClose(void)
+{
+    if (g_stateView) {
+        UnmapViewOfFile(g_stateView);
+        g_stateView = NULL;
+    }
+    if (g_stateMap) {
+        CloseHandle(g_stateMap);
+        g_stateMap = NULL;
+    }
+    if (g_stateEvent) {
+        CloseHandle(g_stateEvent);
+        g_stateEvent = NULL;
+    }
+}
+
 static BOOL StateReadView(BypassState* out)
 {
     int i;
@@ -4452,7 +4470,13 @@ static int Core_RemoveSubclasses(void)
 
         if (!IsWindow(h)) { gone++; continue; }   /* destroyed externally */
         if ((WNDPROC)GetWindowLongPtrW(h, GWLP_WNDPROC) != SubclassProc) {
-            replaced++;                            /* someone else took over */
+            /* 别人在我们之上又子类化了。不能恢复它的 WNDPROC, 但我们自己的
+               timer/属性要解绑, 否则窗口上留着一个没人处理的 WM_TIMER。
+               replaced 不阻止卸载 (按评审: 先解绑, 不碰 WNDPROC)。 */
+            KillTimer(h, TIMER_CAPTION);
+            RemovePropA(h, "BypassOldProc");
+            RemovePropA(h, PROP_CAPTIMER);
+            replaced++;
             continue;
         }
         KillTimer(h, TIMER_CAPTION);
@@ -4540,6 +4564,11 @@ static int __cdecl Core_BeforeUnload(void)
         HookLog("[Core] unload failed: a window still points at SubclassProc");
         return 0;
     }
+
+    /* ⑤ 共享内存视图/句柄: Worker 已停, 之后没人再读 g_stateView */
+    StateClose();
+
+    HookLog("[Core] before_unload: subclasses removed, state closed (P2b-2)");
 
     /* ★ 阶段 1 通过到 g_coreDisabled=1 之间可能刚进来一个 hook:
        线程停完后必须再等一次引用计数归零 (P2b-1 补的竞态窗口)。
