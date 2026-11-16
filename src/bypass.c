@@ -1174,7 +1174,13 @@ static BOOL RemoveKeyboardClassFilterEntry(HWND hwnd, const char* filterName) {
                     if (!removedOne) {
                         free(out);
                     } else if (outLen > 0) {
-                        DWORD outType = (type == REG_SZ) ? REG_SZ : REG_MULTI_SZ;
+                        /* 标准语义: UpperFilters/LowerFilters 是"字符串列表"。
+                           只剩一项且原来是 REG_SZ 时按 SZ 写回; 剩下多项必须是
+                           MULTI_SZ —— 用 REG_SZ 写多串会在第一个 NUL 截断, 有的
+                           解析器又会当 MULTI_SZ 读, 行为不一致。 */
+                        DWORD outType = (type == REG_SZ &&
+                                         outLen == (DWORD)(strlen((char*)out) + 1))
+                                        ? REG_SZ : REG_MULTI_SZ;
                         DWORD cb = (outType == REG_SZ)
                                    ? (DWORD)(strlen((char*)out) + 1)
                                    : outLen + 1;
@@ -1823,11 +1829,18 @@ BOOL CheckStatus(HWND hwnd) {
     /* 实时锁定状态 (实证项) */
     AppendLog(hwnd, "\r\n--- Runtime Lock State ---\r\n");
     {
-        char cur[128];
-        GetInputDesktopName(cur, sizeof(cur));
-        AppendLog(hwnd, "  input desktop   : %s%s\r\n",
-                  cur[0] ? cur : "(unknown)",
-                  IsLockDesktopActive() ? "   <== LOCKED (MCLOCK Desktop)" : "");
+        char cur[128] = "";
+
+        if (GetInputDesktopName(cur, sizeof(cur))) {
+            AppendLog(hwnd, "  input desktop   : %s%s\r\n", cur,
+                      IsLockDesktopActive() ? "   <== LOCKED (MCLOCK Desktop)" : "");
+        } else {
+            /* OpenInputDesktop 失败 = UAC 安全桌面 / 锁屏 / 桌面被切走。
+               这时"锁没锁"是**未知**, 不能当成"没锁" (以前这里只打 (unknown),
+               很容易被读成"没锁")。 */
+            AppendLog(hwnd, "  input desktop   : (cannot query: UAC secure desktop / "
+                            "locked / switched away - lock state UNKNOWN)\r\n");
+        }
         AppendLog(hwnd, "  unlock IOCTL    : 0x%X (%s)\r\n", IOCTL_KEYBOARD_ALL_RELEASE,
                   (g_workingIoctl == IOCTL_KEYBOARD_ALL_RELEASE) ? "verified" : "not verified yet");
     }
@@ -1885,6 +1898,18 @@ static BOOL AutoAllCore(HWND hwnd) {
 
     UpdateStatus(hwnd, "Status: Bypass completed!");
     return TRUE;
+}
+
+/* /auto 的后台执行体。
+   ★ AutoAllCore 里有 Sleep×4 + 等驱动停止 (每个最长 3 秒) + 等卸载器 (10 秒),
+     放在 UI 线程会"未响应"。这里把它整个挪到工作线程, 日志照常流回编辑框。 */
+static volatile LONG g_autoAllBusy = 0;
+
+static DWORD WINAPI AutoAllThread(LPVOID lp)
+{
+    AutoAllCore((HWND)lp);
+    InterlockedExchange(&g_autoAllBusy, 0);
+    return 0;
 }
 
 /* ============================================================================
@@ -2123,23 +2148,61 @@ static BOOL SetFullscreenDowngradeFor(const char* exePath, HWND hwndLog, BOOL qu
         return FALSE;
     }
 
-    /* 已经设过就别重复写 */
+    /* 1) 读现有值: 先查**真实大小**再读。RegQueryValueExW 在缓冲区不足时返回
+       ERROR_MORE_DATA 且只写半截 —— 以前固定 256 wchar, 长值会走"追加"分支,
+       用空串把用户原有的 RUNASADMIN / HIGHDPIAWARE 等兼容标志覆盖掉。 */
     {
-        wchar_t cur[256] = {0};
-        DWORD   curSize = sizeof(cur), type = 0;
-        if (RegQueryValueExW(hKey, wPath, NULL, &type, (LPBYTE)cur,
-                             &curSize) == ERROR_SUCCESS &&
-            type == REG_SZ &&
-            wcsstr(cur, L"DISABLEDXMAXIMIZEDWINDOWEDMODE")) {
-            RegCloseKey(hKey);
-            return TRUE;
+        DWORD    type = 0, size = 0;
+        wchar_t* cur = NULL;
+
+        if (RegQueryValueExW(hKey, wPath, NULL, &type, NULL, &size) == ERROR_SUCCESS &&
+            size >= sizeof(wchar_t) && size <= 64 * 1024 &&
+            (type == REG_SZ || type == REG_EXPAND_SZ) &&
+            (cur = (wchar_t*)malloc(size + sizeof(wchar_t))) != NULL) {
+            DWORD got = size;
+
+            memset(cur, 0, size + sizeof(wchar_t));
+            if (RegQueryValueExW(hKey, wPath, NULL, &type, (LPBYTE)cur, &got) == ERROR_SUCCESS) {
+                cur[size / sizeof(wchar_t)] = L'\0';
+
+                if (wcsstr(cur, L"DISABLEDXMAXIMIZEDWINDOWEDMODE")) {
+                    free(cur);
+                    RegCloseKey(hKey);
+                    return TRUE;
+                }
+
+                /* 2) 追加标志, 不覆盖原有内容 */
+                {
+                    size_t  need = wcslen(cur) + wcslen(FULLSCREEN_DOWNGRADE_FLAG) + 3;
+                    wchar_t* merged = (wchar_t*)malloc(need * sizeof(wchar_t));
+
+                    if (merged) {
+                        size_t         n = wcslen(cur);
+                        const wchar_t* sep = (n && cur[n - 1] != L' ') ? L" " : L"";
+
+                        _snwprintf(merged, need - 1, L"%s%s%s", cur, sep,
+                                   FULLSCREEN_DOWNGRADE_FLAG);
+                        merged[need - 1] = L'\0';
+                        if (RegSetValueExW(hKey, wPath, 0, REG_SZ, (const BYTE*)merged,
+                                           (DWORD)((wcslen(merged) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS)
+                            applied = TRUE;
+                        free(merged);
+                    }
+                }
+            }
+            free(cur);
         }
     }
 
-    cb = (DWORD)((wcslen(FULLSCREEN_DOWNGRADE_FLAG) + 1) * sizeof(wchar_t));
-    if (RegSetValueExW(hKey, wPath, 0, REG_SZ,
-                       (const BYTE*)FULLSCREEN_DOWNGRADE_FLAG, cb) == ERROR_SUCCESS) {
-        applied = TRUE;
+    /* 3) 原来没有值 (或读不出来): 直接写标志 */
+    if (!applied) {
+        cb = (DWORD)((wcslen(FULLSCREEN_DOWNGRADE_FLAG) + 1) * sizeof(wchar_t));
+        if (RegSetValueExW(hKey, wPath, 0, REG_SZ,
+                           (const BYTE*)FULLSCREEN_DOWNGRADE_FLAG, cb) == ERROR_SUCCESS)
+            applied = TRUE;
+    }
+
+    if (applied) {
         if (!quiet && hwndLog)
             AppendLog(hwndLog,
                 "[SmallWin][T1.5] disable fullscreen-optimization preset: %s "
@@ -2496,18 +2559,21 @@ static BOOL VerifyDemoted(HWND hwnd, int screenW, int screenH) {
 
 /* 分级降级 + 验证; 返回实际达到的 Tier: 0=失败, 1=基础, 2=加固 */
 /* 跨进程改窗口会向目标线程发同步消息, 目标卡死时本进程 UI 也会跟着假死。
-   先用 SMTO_ABORTIFHUNG 探一下: 200ms 内不回就跳过这个窗口。 */
-static BOOL WindowResponds(HWND hwnd) {
+   先用 SMTO_ABORTIFHUNG 探一下。probeMs 是等待上限:
+     - 在 UI 线程上 (FlushPendingDemote) 必须很短 (60ms), 否则一次复核就能
+       让窗口"拖不动";
+     - 在 worker 线程上可以给 200ms, 少误判"无响应"。 */
+static BOOL WindowResponds(HWND hwnd, DWORD probeMs) {
     DWORD_PTR res = 0;
     if (!IsWindow(hwnd)) return FALSE;
     if (SendMessageTimeout(hwnd, WM_NULL, 0, 0,
-                           SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &res))
+                           SMTO_ABORTIFHUNG | SMTO_BLOCK, probeMs, &res))
         return TRUE;
     return FALSE;
 }
 
-static int DemoteWindowTiered(HWND hwnd, int screenW, int screenH) {
-    if (!WindowResponds(hwnd)) return 0;     /* 目标无响应: 别把界面拖死 */
+static int DemoteWindowTiered(HWND hwnd, int screenW, int screenH, DWORD probeMs) {
+    if (!WindowResponds(hwnd, probeMs)) return 0;   /* 目标无响应: 别把界面拖死 */
     DemoteWindowBase(hwnd, screenW, screenH);
     if (VerifyDemoted(hwnd, screenW, screenH)) {
         return 1;
@@ -2656,7 +2722,7 @@ static int FlushPendingDemote(void) {
         handled++;
 
         GetClassNameA(h, cls, sizeof(cls));
-        tier = DemoteWindowTiered(h, screenW, screenH);
+        tier = DemoteWindowTiered(h, screenW, screenH, 60);   /* UI 线程: 短探针 */
         if (tier > 0) {
             n++;
             MarkManagedWin(h);
@@ -2746,7 +2812,7 @@ static void CALLBACK BroadcastWinEventProc(HWINEVENTHOOK hook, DWORD event, HWND
     if (IsManagedWin(hwnd) && !topmost) return;
 
     /* 1) 先立即处理一次 (窗口出现时往往已是最终尺寸), 并回读验证 */
-    if (DemoteWindowTiered(hwnd, screenW, screenH) > 0) {
+    if (DemoteWindowTiered(hwnd, screenW, screenH, 200) > 0) {
         MarkManagedWin(hwnd);
         ClearDemoteFailure(hwnd);
     } else {
@@ -2888,7 +2954,7 @@ static BOOL CALLBACK DemoteEnumProc(HWND hwnd, LPARAM lp) {
            误导性的 "likely exclusive fullscreen"。 */
         if (fullscreen) ctx->fullscreen++;
 
-        tier = DemoteWindowTiered(hwnd, ctx->screenW, ctx->screenH);
+        tier = DemoteWindowTiered(hwnd, ctx->screenW, ctx->screenH, 200);
         if (tier > 0) {
             RECT rr;
             MarkManagedWin(hwnd);
@@ -3185,6 +3251,15 @@ void RunInjector(HWND hwndLog, BOOL verbose) {
         }
 
         if (WaitForSingleObject(pi.hProcess, 50) == WAIT_OBJECT_0) break;
+
+        /* ★ 用户关掉了「持续保持小窗」: 别再等最多 8 秒的注入器。
+           它只负责注入, 杀掉不影响已经加载进目标进程的 DLL。 */
+        if (!g_smallWinRun) {
+            AppendLog(hwndLog, "[Hook] sticky mode is off - aborting inject32.exe\r\n");
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 500);
+            break;
+        }
 
         if (GetTickCount() - start > 8000) {
             AppendLog(hwndLog, "[Hook] inject32.exe 超时, 强制结束\r\n");
@@ -4905,11 +4980,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetForegroundWindow(hwnd);
             return 0;
 
-        /* /auto: 在消息循环里跑, 不要卡住 WinMain */
-        case WM_APP_AUTOALL:
-            AppendLog(hwnd, "[Startup] /auto: running the bypass once\r\n");
-            AutoAllCore(hwnd);
+        /* /auto: 在后台线程跑 (AutoAllCore 里有 Sleep + 等驱动停止) */
+        case WM_APP_AUTOALL: {
+            HANDLE th;
+
+            if (InterlockedCompareExchange(&g_autoAllBusy, 1, 0) != 0) return 0;
+            AppendLog(hwnd, "[Startup] /auto: running the bypass in the background\r\n");
+            th = CreateThread(NULL, 0, AutoAllThread, hwnd, 0, NULL);
+            if (th) {
+                CloseHandle(th);
+            } else {
+                InterlockedExchange(&g_autoAllBusy, 0);
+                AutoAllCore(hwnd);      /* 线程建不起来就退回原来的同步路径 */
+            }
             return 0;
+        }
 
         /* full custom painting (dark theme) */
         case WM_PAINT: {
