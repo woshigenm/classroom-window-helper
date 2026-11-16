@@ -74,7 +74,7 @@ try {
     # docs/how-to-use.md, so flattening them would break the links.
     $stageDocs = Join-Path $stage "docs"
     New-Item -ItemType Directory -Path $stageDocs -Force | Out-Null
-    foreach ($rel in @("README.md", "docs\how-to-use.md", "docs\design.md")) {
+    foreach ($rel in @("README.md", "CHANGELOG.md", "docs\how-to-use.md", "docs\design.md")) {
         $src = Join-Path $Root $rel
         if (Test-Path -LiteralPath $src) {
             $dst = if ($rel.StartsWith("docs\")) { $stageDocs } else { $stage }
