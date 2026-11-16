@@ -54,9 +54,12 @@ function Run-Suite([string]$name, [scriptblock]$body) {
     if (-not $ok) { $script:failed++ }
 }
 
+# build:
+#   make.bat all / fakecores / testcores / corehost / uitest
+
 if (-not $NoBuild) {
-    Invoke-Build @('all', 'fakecores', 'testcores', 'corehost', 'wmodetest',
-                   'screentest', 'shuttest')
+    Invoke-Build @('all', 'fakecores', 'testcores', 'corehost', 'uitest',
+                   'wmodetest', 'screentest', 'shuttest')
 }
 
 $script:results = @()
@@ -102,6 +105,19 @@ Run-Suite 'foreign fix stayed async' {
 
 Run-Suite 'shutdown guard' {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'shutguard_test.ps1') |
+        Out-Host
+}
+
+Run-Suite 'version self-check (content hash)' {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'version_test.ps1') |
+        Out-Host
+}
+
+# Multi-instance / concurrency: four classroom processes, one UI click, two
+# clients on the same pipe, a status check during a slow reload, crash
+# isolation.  Runs last: it swaps the Core DLL around (always restored).
+Run-Suite 'multi-instance / pipe concurrency' {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'multi_test.ps1') |
         Out-Host
 }
 

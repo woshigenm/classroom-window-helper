@@ -830,6 +830,9 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
 - **drain 用墙钟 deadline**（`GetTickCount`），不是 `N × Sleep(1)`：Windows 的
   `Sleep(1)` 实际约 15ms，3000 次会等 45 秒——3 秒超时被拖长，宿主可能先正常退出，
   reload 响应为空。Core 的 50ms drain 同理。
+- **阶段 2 的顺序是「gate → 等 `g_initDepth` → 清停止标志」**：先清标志再等，会把
+  Worker 在 `Core_Init` 尾巴上 re-arm 的 caption/VD 线程漏掉，3 秒等待必然失败
+  （见「多实例与并发」）。`g_initDepth` 只包住 `VD_Start` 和 caption 创建两段。
 - **`g_coreDead` 是 Core 契约的最终防御**：恶意 Core（`before_unload` 返回 1 但
   不停线程/不置 disabled）触发 drain 超时后，Loader 保持 `g_unloading=1`、置
   `g_coreDead=1`、不卸载；该进程之后所有 reload 都返回 `err coreDead`，只能
@@ -912,6 +915,38 @@ UI、日志、README 都按这个描述，不写“已直通”。`g_coreDead` �
 > Loader 在拷贝后还会比一次 `hash(cache) vs hash(src)`，不同就记
 > `core hash mismatch ... (DLL rewritten during the copy?)`——这是「替换 DLL 与重载
 > 并发」的唯一进程内证据。
+
+**多实例与并发（C 组验证）**
+
+控制管道是**单连接**的（`nMaxInstances=1` + `PIPE_WAIT`），所以第二个客户端会拿到
+`ERROR_PIPE_BUSY`——这**不是**「没注入」。`CtlRequest` 用 `WaitNamedPipeA` 等待并复用
+同一个超时预算；等不到才返回 `busy`/`-1`。UI 早先把它当 0 会误报 “not injected”。
+
+**Core 的「初始化 vs 卸载」竞态**（`multi_test` 抓到的真实缺陷）：`Core_Init` 里
+Worker 有 `Sleep(200)`，之后才 `VD_Start()` 和创建 caption 线程。若 reload 恰好落在
+这一段，旧顺序（先清 `g_captionRunning`）会把随后 re-arm 的线程漏掉，线程永不退出 →
+phase 2 3 秒超时（实测日志 `caption pump did not stop in 3s (wait=258)`）→ reload 失败。
+
+修复是 `g_initDepth` 握手，且**顺序必须是「先 gate，再等，最后清」**：
+
+```
+Worker 建线程:   depth++  ->  已 gate 就 depth-- 放弃  ->  建线程  ->  depth--
+phase 2:         g_coreDisabled=1  ->  等 depth==0（1s）  ->  清 worker/caption 标志
+```
+
+顺序反过来（先清标志再等 depth）仍会漏掉「已经 re-arm 的线程」。`g_initDepth` 只覆盖
+`VD_Start` 和 caption 创建这两段（Worker 自己是 `Core_Init` 同步创建的，Loader 不会在
+`Core_Init` 返回前调 `before_unload`）。
+
+**每个进程独立的状态**：`g_inHookCount`、UEF 栈、blob 仓库、缓存目录
+（`core.<pid>.<seq>.dll`）、控制管道名（带 pid）。多开不需要共享任何东西，
+一次 UI 点击 4 个进程全部 `ok seq=2`，各自 hash 与磁盘一致、旧 `.1.dll` 被删；
+一个进程崩溃时 `!! crash` 只出现在该 pid，其余进程仍然 `dead=0`。
+同一个 pid 收到两个并发 `reload` 会被管道串行化，两个都成功（seq=3、seq=4），
+不会交错。
+
+> 未覆盖：真实多桌面会话、真实课堂客户端的 4 个进程同时广播（需要另一台/另一个
+> 桌面环境）。
 
 ---
 
@@ -1132,10 +1167,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1 -NoBuild
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1 -NoBuild -Filter *reload*
 ```
 
-`run_all.ps1` 先构建 `all / fakecores / testcores / corehost / wmodetest /
-screentest / shuttest`，然后依次跑：fake cores、reload、stuck、恶意 Core、wmode、
-screenguard、foreign_fix、shutguard，最后打印汇总；任一失败退出码非 0。
-恶意 Core 那组是终态，脚本把它排在 reload 系最后，且后面不再做“恢复后重载”断言。
+`run_all.ps1` 先构建 `all / fakecores / testcores / corehost / uitest / wmodetest /
+screentest / shuttest`，然后依次跑 10 个套件：
+
+| 套件 | 覆盖 |
+|---|---|
+| fake cores | Loader 加载失败路径（return0 / bad ABI / hooks 不全 / 泄漏） |
+| reload | 缓存副本、回滚、`still mapped`、UEF、窗口重载、hammer |
+| stuck | hook / worker / subclass 三组卸载失败 |
+| 恶意 Core | drain 超时 → `coreDead` 终态（独立宿主） |
+| wmode | 置顶剥离、z 序冻结、用户 resize |
+| screenguard | 冻结首帧 |
+| foreign_fix | 跨进程兜底不卡死 enforcer |
+| shutguard | 关机/重启拦截 |
+| version | P3 自检：current / OLD+「重载」/ 磁盘重写不给建议 |
+| multi | 4 进程一次点击、管道并发、慢 reload 期间的状态检查、崩溃隔离 |
+
+任一失败退出码非 0。恶意 Core 那组是终态，脚本把它排在 reload 系最后，且后面不再做
+“恢复后重载”断言；multi 那组会临时换 Core 文件，结束时恢复。
 
 验证"跨进程兜底不会卡死 enforcer"（`make.bat hangwintest` + 脚本）：
 

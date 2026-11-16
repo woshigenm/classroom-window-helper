@@ -1959,14 +1959,19 @@ static volatile LONG g_reloadBusy;
    (\\.\pipe\bypass_core_ctl_<pid>).  Returns
      1  = reply received (out filled, newline trimmed)
      0  = no pipe: not injected, or the pre-P1 single DLL
-    -1  = timeout / write error (out = "timeout";  a *busy* Loader is
-          indistinguishable from a hung one here, the caller decides) */
+    -1  = timeout / busy / write error (out = "timeout" | "busy";  a *busy*
+          Loader is indistinguishable from a hung one here, the caller decides)
+
+   The Loader's control thread serves one connection at a time, so a second
+   client (UI + script, or a status check during a reload) gets ERROR_PIPE_BUSY.
+   That is NOT "not injected": wait for the instance instead of reporting 0. */
 static int CtlRequest(DWORD pid, const char* msg, char* out, size_t cap,
                       DWORD timeoutMs)
 {
     char   name[128];
-    HANDLE h;
-    DWORD  wr = 0, avail = 0, rd = 0, start;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    DWORD  wr = 0, avail = 0, rd = 0, start = GetTickCount();
+    DWORD  left;
 
     if (!out || cap < 8 || !msg) return -1;
     out[0] = '\0';
@@ -1974,9 +1979,35 @@ static int CtlRequest(DWORD pid, const char* msg, char* out, size_t cap,
               (unsigned long)pid);
     name[sizeof(name) - 1] = '\0';
 
-    h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                    OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
+    for (;;) {
+        DWORD waited = (DWORD)(GetTickCount() - start);
+
+        h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                        OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) break;
+
+        if (GetLastError() != ERROR_PIPE_BUSY) return 0;   /* really no pipe */
+
+        if (waited >= timeoutMs) {
+            _snprintf(out, cap - 1, "busy");
+            out[cap - 1] = '\0';
+            return -1;
+        }
+        left = timeoutMs - waited;
+        if (!WaitNamedPipeA(name, left)) {
+            DWORD e = GetLastError();
+
+            if (e == ERROR_PIPE_NOT_CONNECTED) continue;
+            _snprintf(out, cap - 1, "busy");
+            out[cap - 1] = '\0';
+            return -1;
+        }
+    }
+
+    /* the instance was busy part of the budget above; give the reply its own
+       window (the UI caps the whole reload at 15 s anyway) */
+    start = GetTickCount();
+
     if (!WriteFile(h, msg, (DWORD)strlen(msg), &wr, NULL)) {
         CloseHandle(h);
         _snprintf(out, cap - 1, "timeout");
@@ -1984,7 +2015,6 @@ static int CtlRequest(DWORD pid, const char* msg, char* out, size_t cap,
         return -1;
     }
 
-    start = GetTickCount();
     while ((DWORD)(GetTickCount() - start) < timeoutMs) {
         if (PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) && avail > 0) break;
         Sleep(20);
@@ -2026,6 +2056,9 @@ static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
     DWORD disk[2] = { 0, 0 };
     unsigned long diskHash = 0;
     int   i, d, restartCount = 0, reloadCount = 0;
+    /* total budget for all `status` round-trips (the button must stay
+       responsive even if another client is reloading); ~1 ms each normally */
+    DWORD ctlBudget = verbose ? 1500 : 600, ctlStart = GetTickCount();
 
     if (GetModuleFileNameA(NULL, dir, sizeof(dir))) {
         char* p = strrchr(dir, '\\');
@@ -2078,8 +2111,14 @@ static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
 
         /* 300 ms keeps the UI responsive; the Loader answers in ~1 ms unless it
            is inside a reload (its control thread is single-connection).  The
-           user-initiated check gets a bit more slack. */
-        r = CtlRequest(pid, "status", ctl, sizeof(ctl), verbose ? 1000 : 300);
+           user-initiated check gets a bit more slack, but bounded in total. */
+        {
+            DWORD used = (DWORD)(GetTickCount() - ctlStart);
+            DWORD left = (used < ctlBudget) ? (ctlBudget - used) : 0;
+
+            r = CtlRequest(pid, "status", ctl, sizeof(ctl),
+                           left > 300 ? left : 300);
+        }
         if (r == 1) {
             char* p = strstr(ctl, "hash=");
             if (p) procHash = (unsigned long)strtoul(p + 5, NULL, 16);

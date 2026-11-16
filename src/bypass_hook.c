@@ -3920,6 +3920,31 @@ static DWORD WINAPI CaptionPumpProc(LPVOID p)
     return 0;
 }
 
+/* >0 while the Worker is inside a "start a thread" section (VD_Start / caption).
+   Phase 2 waits for 0 before it clears the stop flags, otherwise this race is
+   real: Worker re-arms g_captionRunning and creates the thread just after
+   phase 2 cleared it -> the new thread never stops -> reload fails at the 3 s
+   wait (seen when a reload lands ~200 ms after the previous Core loaded, i.e.
+   while Core_Init is still finishing). */
+static volatile LONG g_initDepth;
+
+/* Returns 1 = go ahead (caller must CoreEndThreadInit), 0 = unload started. */
+static int CoreBeginThreadInit(void)
+{
+    InterlockedIncrement(&g_initDepth);
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0) ||
+        InterlockedCompareExchange(&g_workerRunning, 0, 0) == 0) {
+        InterlockedDecrement(&g_initDepth);
+        return 0;
+    }
+    return 1;
+}
+
+static void CoreEndThreadInit(void)
+{
+    InterlockedDecrement(&g_initDepth);
+}
+
 static DWORD WINAPI Worker(LPVOID p)
 {
     int reps = 0;
@@ -3949,7 +3974,9 @@ static DWORD WINAPI Worker(LPVOID p)
     }
 
     /* virtual desktop pin: own STA thread, never COM on the renderer thread */
+    if (!CoreBeginThreadInit()) return 0;
     VD_Start();
+    CoreEndThreadInit();
 
     /* 抓屏守卫的 real_ 指针 + 配置 (必须在 IAT 打补丁之前) */
     SC_Init();
@@ -3962,8 +3989,10 @@ static DWORD WINAPI Worker(LPVOID p)
         long patched = g_host->patch_modules();
 
         /* 标题栏自动隐藏的兜底心跳 (见 CaptionPumpProc): 不依赖 WM_TIMER */
+        if (!CoreBeginThreadInit()) return 0;
         InterlockedExchange(&g_captionRunning, 1);
         g_hCaption = CreateThread(NULL, 0, CaptionPumpProc, NULL, 0, NULL);
+        CoreEndThreadInit();
         if (g_hCaption)
             HookLog("caption pump started (250ms, WM_BYPASS_CAP)");
         else {
@@ -4600,7 +4629,25 @@ static int __cdecl Core_BeforeUnload(void)
     }
 
     /* ---- phase 2: irreversible ---- */
+    /* Order matters: gate first, then wait for any in-flight "start a thread"
+       section.  A section that starts after the gate aborts (CoreBeginThreadInit
+       sees g_coreDisabled); one that started before may finish re-arming its
+       stop flag, and we only clear the flags once it is done.  Without this, a
+       reload landing ~200 ms after the previous Core loaded (Worker still
+       finishing Core_Init) re-armed g_captionRunning after the clear and the
+       caption thread never stopped. */
     InterlockedExchange(&g_coreDisabled, 1);
+    {
+        DWORD t0 = GetTickCount();
+
+        while (InterlockedCompareExchange(&g_initDepth, 0, 0) != 0 &&
+               (DWORD)(GetTickCount() - t0) < 1000)
+            Sleep(1);
+        if (InterlockedCompareExchange(&g_initDepth, 0, 0) != 0) {
+            HookLog("[Core] unload failed (phase 2): thread init still in flight");
+            return 0;
+        }
+    }
     InterlockedExchange(&g_workerRunning, 0);
     InterlockedExchange(&g_captionRunning, 0);
 

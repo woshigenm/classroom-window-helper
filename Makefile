@@ -101,6 +101,9 @@ testcores: $(BIN)/core_stuck_hook.dll $(BIN)/core_stuck_worker.dll $(BIN)/core_s
 # 长驻宿主: 自注入 Loader 后睡眠, 供 P2a 重载脚本通过命名管道驱动
 corehost: $(BIN)/core_host.exe
 
+# UI harness: 真实主窗口 (含 bypass.c), 供按钮/托盘路径的脚本驱动
+uitest: $(BIN)/ui_preview.exe
+
 # ---- outputs -------------------------------------------------
 
 $(BIN):
@@ -108,6 +111,9 @@ $(BIN):
 
 $(BIN)/bypass.exe: src/bypass.c src/elevate.c src/elevate.h src/bypass_state.h src/bypass_hash.h | $(BIN)
 	"$(CC64)" $(CFLAGS64) "src/bypass.c" "src/elevate.c" -o "$@" $(LIBS64)
+
+$(BIN)/ui_preview.exe: tests/ui_preview.c src/bypass.c src/bypass_hash.h src/bypass_state.h src/elevate.c | $(BIN)
+	"$(CC64)" $(CFLAGS64) "tests/ui_preview.c" "src/elevate.c" -o "$@" $(LIBS64)
 
 $(BIN)/bypass_hook32.dll: src/loader.c src/bypass_abi.h src/bypass_hash.h | $(BIN)
 	"$(CC32)" $(CFLAGS32) $(DLLFLAGS) "src/loader.c" -o "$@" -lpsapi -luser32
@@ -183,7 +189,7 @@ clean:
 	-@del /q "$(BIN)\vd_pin_test.exe" 2>nul
 	-@del /q "$(BIN)\screenguard_test.exe" 2>nul
 	-@del /q "$(BIN)\shutguard_test.exe" 2>nul
-	-@del /q "$(BIN)\fake_core_return0.dll" "$(BIN)\fake_core_abi.dll" "$(BIN)\fake_core_hooks.dll" "$(BIN)\fake_core_leak.dll" "$(BIN)\fake_core_good.dll" "$(BIN)\core_host.exe" "$(BIN)\core_stuck_hook.dll" "$(BIN)\core_stuck_worker.dll" "$(BIN)\core_subclass_fail.dll" "$(BIN)\core_evil.dll" 2>nul
+	-@del /q "$(BIN)\fake_core_return0.dll" "$(BIN)\fake_core_abi.dll" "$(BIN)\fake_core_hooks.dll" "$(BIN)\fake_core_leak.dll" "$(BIN)\fake_core_good.dll" "$(BIN)\core_host.exe" "$(BIN)\core_stuck_hook.dll" "$(BIN)\core_stuck_worker.dll" "$(BIN)\core_subclass_fail.dll" "$(BIN)\core_evil.dll" "$(BIN)\ui_preview.exe" 2>nul
 	-@rmdir /s /q "$(BIN)\lpe" 2>nul
 	@echo [clean] done
 

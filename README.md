@@ -49,13 +49,15 @@ make.bat fakecores | testcores | corehost   :: 失败注入用的假/坏 Core、
 make.bat clean | rebuild | check
 ```
 
-跑全部回归（构建 + 8 个套件，任一失败退出码非 0）：
+跑全部回归（构建 + 10 个套件，任一失败退出码非 0）：
 
 ```bat
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1
 ```
 
 `-NoBuild` 用现有 `bin\` 直接跑，`-Filter *reload*` 只跑名字匹配的套件。
+其中 `version` 覆盖「检查当前状态」的内容哈希判据，`multi` 覆盖 4 进程同时重载、
+控制管道并发、慢 reload 期间的状态检查与崩溃隔离。
 
 - 工具链：32 位 `i686-w64-mingw32-gcc`（课堂软件全是 32 位，主程序也用 32 位编），
   `make.bat` / `Makefile` 自动探测 RedPanda-Cpp 与 `C:\mingw32`；直接
@@ -227,6 +229,19 @@ enabled=1
 
 > 顺带修掉一个真 bug：从 64 位主程序枚举 32 位课堂进程的模块必须带
 > `TH32CS_SNAPMODULE32`，否则模块表永远为空、每个进程都显示 `not loaded`。
+
+#### 多开 / 并发
+
+控制管道是**单连接**的，因此第二个客户端（UI + 脚本、或重载期间的检查）会拿到
+`ERROR_PIPE_BUSY`：这不是「没注入」，会等管道实例空出来（`WaitNamedPipe`）再发。
+
+一次「重载 Core」会逐个进程发送，4 个课堂进程同时开着也是 `ok=4`；每个进程用自己的
+`core.<pid>.<seq>.dll` 缓存副本、自己的 `g_inHookCount` / UEF 栈 / blob，互不影响。
+一个进程崩溃（`!! crash`）只影响它自己，其余仍然正常。
+
+> 旧 Core 的初始化（`Sleep(200)` 之后才建 VD / caption 线程）与 reload 撞车时，
+> 会出现「刚建好的线程不停」→ 阶段 2 超时。已用 `g_initDepth` 握手修掉（见
+> `docs\design.md` 2.9「多实例与并发」），`tests\multi_test.ps1` 覆盖。
 
 #### 半禁用不是「已直通」
 
