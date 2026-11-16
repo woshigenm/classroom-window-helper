@@ -719,9 +719,11 @@ static int VD_StopWait(DWORD ms)
     InterlockedExchange(&g_vdRunning, 0);
     if (!g_vdThread) return 1;
     w = WaitForSingleObject(g_vdThread, ms);
+    if (w != WAIT_OBJECT_0)
+        return 0;                  /* 句柄保留: 下一次 reload 继续等/被阶段 1 拒绝 */
     CloseHandle(g_vdThread);
     g_vdThread = NULL;
-    return (w == WAIT_OBJECT_0) ? 1 : 0;
+    return 1;
 }
 
 /* Called from the hooks: hand the window to the VD thread and wait briefly so

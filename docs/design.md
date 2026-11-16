@@ -801,6 +801,22 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
 - 测试：`core_host --window` 创建 `MultiRender*` 窗口 → 日志 `subclassed hwnd=`；
   重载时 `[Core] unsubclass: removed=1`；新 Core 重新子类化，宿主存活。
 
+**P2b-2 加固（评审后）**：
+
+- 33 个 dispatcher 的计数顺序改成 **先 `InterlockedIncrement`，再读
+  `g_unloading` / `Tbl()`**。如果 Loader 的 drain 看到 0，说明该调用还没
+  Increment，它随后一定看到 `g_unloading=1` 而直通；不存在「读到表指针、
+  还没计数就被 FreeLibrary」的窗口。
+- `VD_StopWait` 超时**不再关句柄/置 NULL**：句柄保留，下一次 reload 的阶段 1
+  会看到「已在停止中」而拒绝，不会跳过等待去 `StateClose`。
+- 阶段 1 现在同时检查 worker / caption / vd 三个停止标志；任一「停止请求已发、
+  句柄还在」都拒绝卸载（半停状态不可重用）。
+- 阶段 2 失败（线程/子类化超时）日志统一带 `(phase 2)`，该进程的 hook 功能
+  不再可靠，应重启；阶段 1 失败则 Core 完全没动，可以再次 reload。
+- 已知限制：`g_sub[]` 存 HWND；窗口销毁后 HWND 被复用、且新窗口恰好有同名
+  属性时，`replaced` 分支的 `KillTimer`/`RemoveProp` 可能作用到新窗口。这是
+  `SetWindowLongPtrW` 子类化方案的固有限制。
+
 ---
 
 ## 3. 日志与排错

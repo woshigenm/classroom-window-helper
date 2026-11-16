@@ -169,183 +169,211 @@ static const HrCoreApi* Tbl(void)
 
 static BOOL WINAPI L_SetWindowPos(HWND h, HWND a, int x, int y, int cx, int cy, UINT f)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SetWindowPos(h, a, x, y, cx, cy, f);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetWindowPos ? real_SetWindowPos(h, a, x, y, cx, cy, f) : FALSE;
 }
 
 static LONG WINAPI L_SetWindowLongW(HWND h, int i, LONG v)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     LONG _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SetWindowLongW(h, i, v);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetWindowLongW ? real_SetWindowLongW(h, i, v) : 0;
 }
 
 static LONG WINAPI L_SetWindowLongA(HWND h, int i, LONG v)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     LONG _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SetWindowLongA(h, i, v);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetWindowLongA ? real_SetWindowLongA(h, i, v) : 0;
 }
 
 static LONG_PTR WINAPI L_SetWindowLongPtrW(HWND h, int i, LONG_PTR v)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     LONG_PTR _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SetWindowLongPtrW32(h, i, v);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetWindowLongPtrW ? real_SetWindowLongPtrW(h, i, v) : 0;
 }
 
 static LONG_PTR WINAPI L_SetWindowLongPtrA(HWND h, int i, LONG_PTR v)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     LONG_PTR _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SetWindowLongPtrA32(h, i, v);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetWindowLongPtrA ? real_SetWindowLongPtrA(h, i, v) : 0;
 }
 
 static BOOL WINAPI L_MoveWindow(HWND h, int x, int y, int cx, int cy, BOOL r)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.MoveWindow(h, x, y, cx, cy, r);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_MoveWindow ? real_MoveWindow(h, x, y, cx, cy, r) : FALSE;
 }
 
 static BOOL WINAPI L_SetWindowPlacement(HWND h, const WINDOWPLACEMENT* wp)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SetWindowPlacement(h, wp);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetWindowPlacement ? real_SetWindowPlacement(h, wp) : FALSE;
 }
 
 static BOOL WINAPI L_ShowWindow(HWND h, int c)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.ShowWindow(h, c);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_ShowWindow ? real_ShowWindow(h, c) : FALSE;
 }
 
 static BOOL WINAPI L_ShowWindowAsync(HWND h, int c)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.ShowWindowAsync(h, c);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_ShowWindowAsync ? real_ShowWindowAsync(h, c) : FALSE;
 }
 
 static int WINAPI L_ShowCursor(BOOL b)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     int _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.ShowCursor(b);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_ShowCursor ? real_ShowCursor(b) : 0;
 }
 
 static HCURSOR WINAPI L_SetCursor(HCURSOR c)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     HCURSOR _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SetCursor(c);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetCursor ? real_SetCursor(c) : NULL;
 }
 
 static BOOL WINAPI L_SwitchDesktop(HDESK d)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SwitchDesktop(d);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SwitchDesktop ? real_SwitchDesktop(d) : FALSE;
 }
 
 static HHOOK WINAPI L_SetWindowsHookExA(int id, HOOKPROC p, HINSTANCE m, DWORD t)
 {
-    const HrCoreApi* h = g_unloading ? NULL : Tbl();
+    const HrCoreApi* h;
     HHOOK _hr;
+    InterlockedIncrement(&g_inHookCount);
+    h = g_unloading ? NULL : Tbl();
     if (h) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = h->hooks.SetWindowsHookExA(id, p, m, t);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetWindowsHookExA ? real_SetWindowsHookExA(id, p, m, t) : NULL;
 }
 
 static HHOOK WINAPI L_SetWindowsHookExW(int id, HOOKPROC p, HINSTANCE m, DWORD t)
 {
-    const HrCoreApi* h = g_unloading ? NULL : Tbl();
+    const HrCoreApi* h;
     HHOOK _hr;
+    InterlockedIncrement(&g_inHookCount);
+    h = g_unloading ? NULL : Tbl();
     if (h) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = h->hooks.SetWindowsHookExW(id, p, m, t);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetWindowsHookExW ? real_SetWindowsHookExW(id, p, m, t) : NULL;
 }
 
@@ -353,68 +381,78 @@ static HWND WINAPI L_CreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR name, DWORD 
                                      int x, int y, int w, int h, HWND parent,
                                      HMENU menu, HINSTANCE inst, LPVOID param)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     HWND _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.CreateWindowExW(ex, cls, name, st, x, y, w, h,
                                      parent, menu, inst, param);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_CreateWindowExW ? real_CreateWindowExW(ex, cls, name, st, x, y, w, h,
                                                        parent, menu, inst, param) : NULL;
 }
 
 static BOOL WINAPI L_SetForegroundWindow(HWND h)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SetForegroundWindow(h);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetForegroundWindow ? real_SetForegroundWindow(h) : FALSE;
 }
 
 static BOOL WINAPI L_BringWindowToTop(HWND h)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.BringWindowToTop(h);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_BringWindowToTop ? real_BringWindowToTop(h) : FALSE;
 }
 
 static HWND WINAPI L_SetActiveWindow(HWND h)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     HWND _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.SetActiveWindow(h);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_SetActiveWindow ? real_SetActiveWindow(h) : NULL;
 }
 
 static BOOL WINAPI L_ExitWindowsEx(UINT f, DWORD r)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.ExitWindowsEx(f, r);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_ExitWindowsEx ? real_ExitWindowsEx(f, r) : FALSE;
 }
 
@@ -423,14 +461,16 @@ static BOOL WINAPI L_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBUTES
                                     LPVOID env, LPCSTR cwd, LPSTARTUPINFOA si,
                                     LPPROCESS_INFORMATION pi)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.CreateProcessA(app, cmd, pa, ta, inh, fl, env, cwd, si, pi);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_CreateProcessA ? real_CreateProcessA(app, cmd, pa, ta, inh, fl,
                                                      env, cwd, si, pi) : FALSE;
 }
@@ -440,107 +480,123 @@ static BOOL WINAPI L_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUT
                                     LPVOID env, LPCWSTR cwd, LPSTARTUPINFOW si,
                                     LPPROCESS_INFORMATION pi)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.CreateProcessW(app, cmd, pa, ta, inh, fl, env, cwd, si, pi);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_CreateProcessW ? real_CreateProcessW(app, cmd, pa, ta, inh, fl,
                                                      env, cwd, si, pi) : FALSE;
 }
 
 static UINT WINAPI L_WinExec(LPCSTR cmd, UINT show)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     UINT _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.WinExec(cmd, show);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_WinExec ? real_WinExec(cmd, show) : 0;
 }
 
 static BOOL WINAPI L_BitBlt(HDC d, int x, int y, int w, int h, HDC s, int sx, int sy, DWORD rop)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.BitBlt(d, x, y, w, h, s, sx, sy, rop);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_BitBlt ? real_BitBlt(d, x, y, w, h, s, sx, sy, rop) : FALSE;
 }
 
 static HDC WINAPI L_CreateDCW(LPCWSTR drv, LPCWSTR dev, LPCWSTR port, const DEVMODEW* dm)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     HDC _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.CreateDCW(drv, dev, port, dm);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_CreateDCW ? real_CreateDCW(drv, dev, port, dm) : NULL;
 }
 
 static HDC WINAPI L_CreateDCA(LPCSTR drv, LPCSTR dev, LPCSTR port, const DEVMODE* dm)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     HDC _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.CreateDCA(drv, dev, port, dm);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_CreateDCA ? real_CreateDCA(drv, dev, port, dm) : NULL;
 }
 
 static HDC WINAPI L_GetDC(HWND h)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     HDC _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.GetDC(h);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_GetDC ? real_GetDC(h) : NULL;
 }
 
 static HDC WINAPI L_GetWindowDC(HWND h)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     HDC _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.GetWindowDC(h);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_GetWindowDC ? real_GetWindowDC(h) : NULL;
 }
 
 static HINSTANCE WINAPI L_ShellExecuteA(HWND o, LPCSTR op, LPCSTR file,
                                         LPCSTR args, LPCSTR dir, INT show)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     HINSTANCE _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.ShellExecuteA(o, op, file, args, dir, show);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_ShellExecuteA ? real_ShellExecuteA(o, op, file, args, dir, show)
                               : (HINSTANCE)0;
 }
@@ -548,42 +604,48 @@ static HINSTANCE WINAPI L_ShellExecuteA(HWND o, LPCSTR op, LPCSTR file,
 static HINSTANCE WINAPI L_ShellExecuteW(HWND o, LPCWSTR op, LPCWSTR file,
                                         LPCWSTR args, LPCWSTR dir, INT show)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     HINSTANCE _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.ShellExecuteW(o, op, file, args, dir, show);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_ShellExecuteW ? real_ShellExecuteW(o, op, file, args, dir, show)
                               : (HINSTANCE)0;
 }
 
 static BOOL WINAPI L_InitiateSystemShutdownA(LPSTR m, LPSTR msg, DWORD to, BOOL f, BOOL r)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.InitiateSystemShutdownA(m, msg, to, f, r);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_InitiateSystemShutdownA
            ? real_InitiateSystemShutdownA(m, msg, to, f, r) : FALSE;
 }
 
 static BOOL WINAPI L_InitiateSystemShutdownW(LPWSTR m, LPWSTR msg, DWORD to, BOOL f, BOOL r)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.InitiateSystemShutdownW(m, msg, to, f, r);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_InitiateSystemShutdownW
            ? real_InitiateSystemShutdownW(m, msg, to, f, r) : FALSE;
 }
@@ -591,14 +653,16 @@ static BOOL WINAPI L_InitiateSystemShutdownW(LPWSTR m, LPWSTR msg, DWORD to, BOO
 static BOOL WINAPI L_InitiateSystemShutdownExA(LPSTR m, LPSTR msg, DWORD to, BOOL f,
                                                BOOL r, DWORD why)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.InitiateSystemShutdownExA(m, msg, to, f, r, why);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_InitiateSystemShutdownExA
            ? real_InitiateSystemShutdownExA(m, msg, to, f, r, why) : FALSE;
 }
@@ -606,14 +670,16 @@ static BOOL WINAPI L_InitiateSystemShutdownExA(LPSTR m, LPSTR msg, DWORD to, BOO
 static BOOL WINAPI L_InitiateSystemShutdownExW(LPWSTR m, LPWSTR msg, DWORD to, BOOL f,
                                                BOOL r, DWORD why)
 {
-    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    const HrCoreApi* t;
+    InterlockedIncrement(&g_inHookCount);
+    t = g_unloading ? NULL : Tbl();
     BOOL _hr;
     if (t) {
-        InterlockedIncrement(&g_inHookCount);
         _hr = t->hooks.InitiateSystemShutdownExW(m, msg, to, f, r, why);
         InterlockedDecrement(&g_inHookCount);
         return _hr;
     }
+    InterlockedDecrement(&g_inHookCount);
     return real_InitiateSystemShutdownExW
            ? real_InitiateSystemShutdownExW(m, msg, to, f, r, why) : FALSE;
 }

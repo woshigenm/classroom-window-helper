@@ -4524,6 +4524,14 @@ static int __cdecl Core_BeforeUnload(void)
         HookLog("[Core] unload refused: worker already stopping");
         return 0;
     }
+    if (InterlockedCompareExchange(&g_captionRunning, 0, 0) == 0 && g_hCaption) {
+        HookLog("[Core] unload refused: caption already stopping");
+        return 0;
+    }
+    if (InterlockedCompareExchange(&g_vdRunning, 0, 0) == 0 && g_vdThread) {
+        HookLog("[Core] unload refused: vd already stopping");
+        return 0;
+    }
 
     /* ---- phase 2: irreversible ---- */
     InterlockedExchange(&g_coreDisabled, 1);
@@ -4533,7 +4541,7 @@ static int __cdecl Core_BeforeUnload(void)
     if (g_hWorker) {
         w = WaitForSingleObject(g_hWorker, 3000);
         if (w != WAIT_OBJECT_0) {
-            HookLog("[Core] unload failed: worker did not stop in 3s (wait=%ld)",
+            HookLog("[Core] unload failed (phase 2): worker did not stop in 3s (wait=%ld)",
                     (long)w);
             return 0;
         }
@@ -4543,7 +4551,7 @@ static int __cdecl Core_BeforeUnload(void)
     if (g_hCaption) {
         w = WaitForSingleObject(g_hCaption, 3000);
         if (w != WAIT_OBJECT_0) {
-            HookLog("[Core] unload failed: caption pump did not stop in 3s (wait=%ld)",
+            HookLog("[Core] unload failed (phase 2): caption pump did not stop in 3s (wait=%ld)",
                     (long)w);
             return 0;
         }
@@ -4554,14 +4562,14 @@ static int __cdecl Core_BeforeUnload(void)
        Worker would crash right after FreeLibrary.  (P2b-1 includes it for
        that reason; subclasses/timers/window classes are P2b-2.) */
     if (!VD_StopWait(3000)) {
-        HookLog("[Core] unload failed: VD thread did not stop in 3s");
+        HookLog("[Core] unload failed (phase 2): VD thread did not stop in 3s");
         return 0;
     }
 
     /* ③ 摘子类化: 窗口过程恢复成原函数, 否则 FreeLibrary 后消息会跳到
        已释放的 SubclassProc。失败了就不让 Loader 卸载。 */
     if (!Core_RemoveSubclasses()) {
-        HookLog("[Core] unload failed: a window still points at SubclassProc");
+        HookLog("[Core] unload failed (phase 2): a window still points at SubclassProc");
         return 0;
     }
 
@@ -4578,7 +4586,7 @@ static int __cdecl Core_BeforeUnload(void)
         for (i = 0; i < 50 && HR_HOOKS_RUNNING() > 0; i++)
             Sleep(1);
         if (HR_HOOKS_RUNNING() > 0) {
-            HookLog("[Core] unload failed: %ld hooks still executing after thread stop",
+            HookLog("[Core] unload failed (phase 2): %ld hooks still executing after thread stop",
                     (long)HR_HOOKS_RUNNING());
             return 0;
         }
