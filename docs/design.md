@@ -738,6 +738,22 @@ P2b = 上面第 2 步的十项真正实现。
 P2b 测试矩阵：正常重载 / Worker 卡住（`SuspendThread`）/ `g_inHookCount` 卡住
 （hook 里 `Sleep(5000)`）/ 窗口未销毁 / 连续重载 3 次 / 阶段 1 失败后关闭窗口再次重载。
 
+**P2b-1 已实现（骨架）**：
+
+- `Core_BeforeUnload` 两阶段：阶段 1 检查 `g_inHookCount`（10ms 归零）和
+  “Worker 不是已在停止中”；阶段 2 置 `g_coreDisabled`、停线程、返回 1。
+- 守卫先加在 3 个最忙的 hook 上：`ShowWindow`、`SetWindowPos`、`CreateProcessW`
+  （`g_coreDisabled` 直通 + `g_inHookCount` 进出计数）。其余 30 个在 P2b-2 补齐。
+- **比“只停 Worker”多停了 caption pump 和 VD 线程**：这两个线程每 250/500ms
+  都会执行 Core 代码，只停 Worker 的话 `FreeLibrary` 之后它们立刻会踩到已释放
+  代码。`core_host` 的实测也证明必须一起停。
+- 真实 Core 重载已通过：`before_unload: worker + caption + vd stopped` →
+  `still mapped` 不报错 → 新 Core 加载 → `core_host` 存活。
+
+P2b-2 剩余：其余 30 个 hook 的守卫、`RemoveWindowSubclass`、`KillTimer`、
+`UnregisterClass`、`StateClose`（共享内存句柄）、`g_prevUef` 链不能在重载后
+指向已卸载的旧 Core。
+
 ---
 
 ## 3. 日志与排错

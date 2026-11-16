@@ -82,6 +82,8 @@ static char   g_vdCfgGuid[64];
 
 /* shared with the hooks */
 static volatile LONG g_vdStarted;
+static volatile LONG g_vdRunning;
+static HANDLE        g_vdThread;
 static volatile LONG g_vdEnabled = 1;
 static volatile LONG g_vdBusy;
 static volatile LONG g_vdLogs;
@@ -618,7 +620,10 @@ static DWORD WINAPI VD_Thread(LPVOID p)
 
     for (;;) {
         HWND  h = NULL;
-        DWORD w = WaitForSingleObject(g_vdReq, 500);
+        DWORD w;
+
+        if (InterlockedCompareExchange(&g_vdRunning, 0, 0) == 0) break;
+        w = WaitForSingleObject(g_vdReq, 500);
 
         if (w == WAIT_OBJECT_0) {
             EnterCriticalSection(&g_vdCs);
@@ -655,7 +660,14 @@ static DWORD WINAPI VD_Thread(LPVOID p)
             VD_Sweep();
         }
     }
-    /* never reached: the process exits with us */
+    /* P2b: reached when VD_StopWait sets g_vdRunning = 0 */
+    if (g_vdObj) {
+        g_vdObj->v->Release(g_vdObj);
+        g_vdObj = NULL;
+    }
+    CoUninitialize();
+    InterlockedExchange(&g_vdInit, 1);
+    return 0;
 }
 
 static void VD_Start(void)
@@ -687,13 +699,27 @@ static void VD_Start(void)
         InterlockedExchange(&g_vdInit, 1);
         return;
     }
+    InterlockedExchange(&g_vdRunning, 1);
     th = CreateThread(NULL, 0, VD_Thread, NULL, 0, NULL);
-    if (th) CloseHandle(th);
+    if (th) g_vdThread = th;      /* kept for VD_StopWait (P2b) */
     else {
         HookLog("vd: worker thread failed (err=%lu)", (unsigned long)GetLastError());
         InterlockedExchange(&g_vdEnabled, 0);
         InterlockedExchange(&g_vdInit, 1);
     }
+}
+
+/* P2b: stop the VD thread and wait.  1 = stopped (or never started). */
+static int VD_StopWait(DWORD ms)
+{
+    DWORD w;
+
+    InterlockedExchange(&g_vdRunning, 0);
+    if (!g_vdThread) return 1;
+    w = WaitForSingleObject(g_vdThread, ms);
+    CloseHandle(g_vdThread);
+    g_vdThread = NULL;
+    return (w == WAIT_OBJECT_0) ? 1 : 0;
 }
 
 /* Called from the hooks: hand the window to the VD thread and wait briefly so

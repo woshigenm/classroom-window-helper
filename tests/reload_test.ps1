@@ -145,7 +145,7 @@ $fixed = ($out -join "`n") -match 'VERDICT FIXED'
 "  wmode    : " + $(if ($fixed) { 'FIXED (ok)' } else { 'FAIL' })
 if (-not $fixed) { $pass = $false }
 
-# P2a: the real Core has no before_unload yet -> reload must be refused safely
+# P2b-1: the real Core now has before_unload (threads) -> reload must succeed
 $host2 = $null
 $pid2 = 0
 try {
@@ -156,10 +156,19 @@ try {
     if (!(Test-Path $pidfile)) { throw "core_host (real) did not write its pidfile" }
     $pid2 = [int](Get-Content $pidfile -Raw).Trim()
     Start-Sleep -Milliseconds 1500
+    $from2 = if (Test-Path $log) { (Get-Item $log).Length } else { 0 }
     $r = Send-Ctl $pid2 'reload'
-    "--- real Core reload (P2a: must be refused) ---"
+    "--- real Core reload (P2b-1: must succeed) ---"
     "  resp     : $r"
-    if ($r -notmatch '^err no-drain') { $pass = $false }
+    if ($r -notmatch '^ok seq=') { $pass = $false }
+    Start-Sleep -Milliseconds 500
+    $new2 = Log-New $from2
+    if ($new2 -match '\[Core\] before_unload: worker \+ caption \+ vd stopped') { "  log      : ok (threads stopped)" }
+    else { "  log      : FAIL (missing before_unload line)"; $pass = $false }
+    if ($new2 -match '\[Loader\] core loaded:') { "  new core : ok" }
+    else { "  new core : FAIL"; $pass = $false }
+    $st = Send-Ctl $pid2 'status'
+    "  status   : $st"
 } finally {
     if ($host2 -and !$host2.HasExited) { Stop-Process -Id $host2.Id -Force -ErrorAction SilentlyContinue }
     if ($pid2 -gt 0) {

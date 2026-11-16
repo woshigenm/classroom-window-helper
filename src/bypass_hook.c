@@ -61,6 +61,15 @@ extern IMAGE_DOS_HEADER __ImageBase;
 
 static const HrHost* g_host;        /* Loader 传进来的 ABI (Core_Init 设置) */
 static char          g_baseDir[MAX_PATH];  /* "...\\bin\\" */
+
+/* P2b: unload handshake.  Guards are added to hooks incrementally (P2b-1:
+   ShowWindow / SetWindowPos / CreateProcessW). */
+static volatile LONG g_coreDisabled;
+static volatile LONG g_inHookCount;
+static volatile LONG g_workerRunning;
+static HANDLE        g_hWorker;
+static volatile LONG g_captionRunning;
+static HANDLE        g_hCaption;
 static DWORD  g_pid;
 static HMODULE g_self;
 static volatile LONG g_disabled;
@@ -1912,7 +1921,7 @@ static BOOL SmallBcastNoRaise(HWND h)
     return TRUE;                                    /* plain small broadcast window */
 }
 
-static BOOL WINAPI Hook_SetWindowPos(HWND h, HWND after,
+static BOOL WINAPI Impl_SetWindowPos(HWND h, HWND after,
                                      int x, int y, int cx, int cy, UINT flags)
 {
     BOOL changed = FALSE;
@@ -2356,7 +2365,7 @@ static BOOL ShowStateAllowed(HWND h, int cmd)
     return TRUE;
 }
 
-static BOOL WINAPI Hook_ShowWindow(HWND h, int cmd)
+static BOOL WINAPI Impl_ShowWindow(HWND h, int cmd)
 {
     if (!g_disabled && IsTargetWindow(h) &&
         cmd != SW_SHOW && cmd != SW_SHOWNORMAL &&
@@ -2733,7 +2742,7 @@ static BOOL WINAPI Hook_CreateProcessA(LPCSTR app, LPSTR cmd,
     return ok;
 }
 
-static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd,
+static BOOL WINAPI Impl_CreateProcessW(LPCWSTR app, LPWSTR cmd,
                                        LPSECURITY_ATTRIBUTES pa,
                                        LPSECURITY_ATTRIBUTES ta, BOOL inh,
                                        DWORD flags, LPVOID env, LPCWSTR cwd,
@@ -3811,6 +3820,7 @@ static DWORD WINAPI CaptionPumpProc(LPVOID p)
 
     (void)p;
     for (;;) {
+        if (InterlockedCompareExchange(&g_captionRunning, 0, 0) == 0) break;
         if (g_disabled) {              /* 放行状态: 什么都不做, 也不占锁 */
             Sleep(250);
             continue;
@@ -3891,10 +3901,14 @@ static DWORD WINAPI Worker(LPVOID p)
         long patched = g_host->patch_modules();
 
         /* 标题栏自动隐藏的兜底心跳 (见 CaptionPumpProc): 不依赖 WM_TIMER */
-        if (CreateThread(NULL, 0, CaptionPumpProc, NULL, 0, NULL))
+        InterlockedExchange(&g_captionRunning, 1);
+        g_hCaption = CreateThread(NULL, 0, CaptionPumpProc, NULL, 0, NULL);
+        if (g_hCaption)
             HookLog("caption pump started (250ms, WM_BYPASS_CAP)");
-        else
+        else {
+            InterlockedExchange(&g_captionRunning, 0);
             HookLog("WARNING: caption pump thread failed (err=%lu)", GetLastError());
+        }
 
         {
             char desk[128];
@@ -3923,8 +3937,12 @@ static DWORD WINAPI Worker(LPVOID p)
     }
 
     for (;;) {
-        BOOL off = (GetFileAttributesA(g_offPath) != INVALID_FILE_ATTRIBUTES);
+        BOOL off;
         int  fixedCount = 0;
+
+        if (InterlockedCompareExchange(&g_workerRunning, 0, 0) == 0) break;
+
+        off = (GetFileAttributesA(g_offPath) != INVALID_FILE_ATTRIBUTES);
 
         InterlockedExchange(&g_disabled, off ? 1 : 0);
 
@@ -4223,6 +4241,56 @@ static void AssignReals(const HrHost* host)
     real_CreateProcessW     = (PFN_CreateProcessW)host->real.CreateProcessW;
 }
 
+/* P2b-1: unload-aware wrappers around the three busiest hooks.
+   - g_coreDisabled: while the Core is draining, new calls go straight to the
+     original (no Core code runs).
+   - g_inHookCount: before_unload refuses to unload while one of these is on
+     the stack.  P2b-2 extends this to the remaining hooks. */
+static BOOL WINAPI Hook_SetWindowPos(HWND h, HWND after,
+                                     int x, int y, int cx, int cy, UINT flags)
+{
+    BOOL r;
+
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_SetWindowPos ? real_SetWindowPos(h, after, x, y, cx, cy, flags) : FALSE;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_SetWindowPos(h, after, x, y, cx, cy, flags);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
+static BOOL WINAPI Hook_ShowWindow(HWND h, int cmd)
+{
+    BOOL r;
+
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
+        return real_ShowWindow ? real_ShowWindow(h, cmd) : FALSE;
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_ShowWindow(h, cmd);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
+static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd,
+                                       LPSECURITY_ATTRIBUTES pa,
+                                       LPSECURITY_ATTRIBUTES ta, BOOL inh,
+                                       DWORD flags, LPVOID env, LPCWSTR cwd,
+                                       LPSTARTUPINFOW si,
+                                       LPPROCESS_INFORMATION pi)
+{
+    BOOL r;
+
+    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0)) {
+        return real_CreateProcessW
+               ? real_CreateProcessW(app, cmd, pa, ta, inh, flags, env, cwd, si, pi)
+               : FALSE;
+    }
+    InterlockedIncrement(&g_inHookCount);
+    r = Impl_CreateProcessW(app, cmd, pa, ta, inh, flags, env, cwd, si, pi);
+    InterlockedDecrement(&g_inHookCount);
+    return r;
+}
+
 static void FillHookTable(HrHooks* h)
 {
     memset(h, 0, sizeof(*h));
@@ -4265,6 +4333,65 @@ static void FillHookTable(HrHooks* h)
     h->InitiateSystemShutdownExW = SH_Hook_InitiateSystemShutdownExW;
 }
 
+/* P2b-1: unload handshake.
+   Phase 1 is read-only: any failure returns 0 without touching anything.
+   Phase 2 is irreversible: disable the Core, stop its threads, then return 1.
+   The Loader only FreeLibrary()s after 1. */
+static int __cdecl Core_BeforeUnload(void)
+{
+    DWORD w;
+
+    /* ---- phase 1: read-only checks ---- */
+    if (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0) {
+        Sleep(10);
+        if (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0) {
+            HookLog("[Core] unload refused: %ld guarded hooks still executing",
+                    (long)InterlockedCompareExchange(&g_inHookCount, 0, 0));
+            return 0;
+        }
+    }
+    if (InterlockedCompareExchange(&g_workerRunning, 0, 0) == 0 && g_hWorker) {
+        HookLog("[Core] unload refused: worker already stopping");
+        return 0;
+    }
+
+    /* ---- phase 2: irreversible ---- */
+    InterlockedExchange(&g_coreDisabled, 1);
+    InterlockedExchange(&g_workerRunning, 0);
+    InterlockedExchange(&g_captionRunning, 0);
+
+    if (g_hWorker) {
+        w = WaitForSingleObject(g_hWorker, 3000);
+        if (w != WAIT_OBJECT_0) {
+            HookLog("[Core] unload failed: worker did not stop in 3s (wait=%ld)",
+                    (long)w);
+            return 0;
+        }
+        CloseHandle(g_hWorker);
+        g_hWorker = NULL;
+    }
+    if (g_hCaption) {
+        w = WaitForSingleObject(g_hCaption, 3000);
+        if (w != WAIT_OBJECT_0) {
+            HookLog("[Core] unload failed: caption pump did not stop in 3s (wait=%ld)",
+                    (long)w);
+            return 0;
+        }
+        CloseHandle(g_hCaption);
+        g_hCaption = NULL;
+    }
+    /* The VD thread also executes Core code every 500ms; stopping only the
+       Worker would crash right after FreeLibrary.  (P2b-1 includes it for
+       that reason; subclasses/timers/window classes are P2b-2.) */
+    if (!VD_StopWait(3000)) {
+        HookLog("[Core] unload failed: VD thread did not stop in 3s");
+        return 0;
+    }
+
+    HookLog("[Core] before_unload: worker + caption + vd stopped (P2b-1)");
+    return 1;
+}
+
 __declspec(dllexport) int __cdecl Core_Init(const HrHost* host, HrCoreApi* api)
 {
     if (!host || !api) return 0;
@@ -4301,7 +4428,7 @@ __declspec(dllexport) int __cdecl Core_Init(const HrHost* host, HrCoreApi* api)
     api->size        = sizeof(*api);
     api->build_id    = __DATE__ " " __TIME__;
     api->on_frame    = NULL;
-    api->before_unload = NULL;      /* P2 */
+    api->before_unload = Core_BeforeUnload;   /* P2b-1 */
     FillHookTable(&api->hooks);
 
     /* 崩溃取证 (只记录, 继续调用宿主原来的过滤器) */
@@ -4310,13 +4437,13 @@ __declspec(dllexport) int __cdecl Core_Init(const HrHost* host, HrCoreApi* api)
     HookLog("[build] core=%s built=%s %s pid=%lu",
             HR_CORE_NAME, __DATE__, __TIME__, (unsigned long)g_pid);
 
-    {
-        HANDLE th = CreateThread(NULL, 0, Worker, NULL, 0, NULL);
-        if (!th) {
-            HookLog("[Core] Worker thread failed (err=%lu)", GetLastError());
-            return 0;
-        }
-        CloseHandle(th);
+    /* Worker 句柄要留着: before_unload 要等它退出 (P2b) */
+    InterlockedExchange(&g_workerRunning, 1);
+    g_hWorker = CreateThread(NULL, 0, Worker, NULL, 0, NULL);
+    if (!g_hWorker) {
+        InterlockedExchange(&g_workerRunning, 0);
+        HookLog("[Core] Worker thread failed (err=%lu)", GetLastError());
+        return 0;
     }
     return 1;
 }
