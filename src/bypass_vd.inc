@@ -720,7 +720,8 @@ static int VD_StopWait(DWORD ms)
     if (!g_vdThread) return 1;
     w = WaitForSingleObject(g_vdThread, ms);
     if (w != WAIT_OBJECT_0)
-        return 0;                  /* 句柄保留: 下一次 reload 继续等/被阶段 1 拒绝 */
+        return 0;                  /* handle kept: the next reload waits again /
+                                      phase 1 refuses while "already stopping" */
     CloseHandle(g_vdThread);
     g_vdThread = NULL;
     return 1;
@@ -781,8 +782,9 @@ static HWND WINAPI Hook_CreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name
     if (!real) return NULL;
 
     hw = real(exStyle, cls, name, style, x, y, w, h, parent, menu, inst, param);
-    /* 0x28 的倒计时窗 (class=ShutDownDlg) 建出来就藏掉: 关机已经被拦了,
-       再弹一个"系统将在 N 秒后关闭"只会让人以为工具坏了。 */
+    /* Hide the 0x28 countdown window (class=ShutDownDlg) as soon as it is
+       created: shutdown is already blocked, and a visible "shutting down in N
+       seconds" dialog only makes the tool look broken. */
     if (hw && SH_SuppressDialog(hw, cls)) return hw;
     /* still hidden here (dwStyle has no WS_VISIBLE in ScreenRender.exe), so
        moving it now means it can never flash on the wrong desktop.

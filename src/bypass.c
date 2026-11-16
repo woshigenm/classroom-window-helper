@@ -5005,9 +5005,9 @@ static void OnScreenGuardToggle(HWND hwnd)
     /* 守卫逻辑在注入的 DLL 里: 打开时确保它已经进了 Student.exe 等进程 */
     if (g_screenGuard) RunInjector(hwnd, TRUE);
 
-    /* ⚠ 中文只能写在**格式串**里: AppendLog 只把格式串从 UTF-8 转成 ACP,
-       而 %s 的实参按 ACP 处理 —— 直接把 "开"/"关" 当参数传会变成
-       "寮€/鍏?" 这种乱码 (UTF-8 字节被当成 GBK 显示)。 */
+    /* ⚠ 中文只能写在**格式串**里：AppendLog 只把格式串从 UTF-8 转成 ACP，
+       %s 的实参按 ACP 处理 —— 直接把中文当参数传入会变成乱码
+       （UTF-8 字节被当成 GBK 显示）。 */
     if (g_screenGuard) {
         AppendLog(hwnd, "\r\n[Screen] 屏幕监控守卫 -> 开 (bin\\bypass_screen.ini)\r\n"
                         "[Screen] 第一次抓屏存成定格帧, 之后老师端只看到这张静止画面\r\n");
