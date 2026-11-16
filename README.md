@@ -38,7 +38,8 @@
 ```bat
 make.bat              :: 主程序 + DLL + 注入器 + lpe 载荷
 make.bat bypass       :: 只编主程序
-make.bat hook32       :: 只编 DLL + 注入器
+make.bat core         :: 只编 Core（热重载用，不动 Loader）
+make.bat hook32       :: 编 DLL + 注入器
 make.bat lpe          :: 只编 / 铺开 bin\lpe\
 make.bat test         :: bin\hooktest32.exe
 make.bat wmodetest    :: bin\wmode_test.exe
@@ -190,14 +191,35 @@ enabled=1
 
 | 改动 | 重编 | 重启课堂客户端 |
 |---|---|---|
-| 改 `Hook_*` 的拦截逻辑 | Core | 否 —— 用「重载 Core」热换 |
-| 加一个新的拦截点（新的 inline hook / IAT dispatcher） | Loader + Core | 是（Loader 占着 DLL 名，不能热换） |
-| 只改主界面 / 托盘 / 文档 | `bypass.exe` | 否 |
+| 改 `Hook_*` 的拦截逻辑（含 `bypass_vd/screen/shut.inc`） | `make.bat core` | 否 —— 用「重载 Core」热换 |
+| 加一个新的拦截点（新的 inline hook / IAT dispatcher） | `make.bat hook32` | 是（Loader 占着 DLL 名，不能热换） |
+| 只改主界面 / 托盘 / 文档 | `make.bat bypass` | 否 |
+
+> 只改 Core 时用 **`make.bat core`**（只重编 `bypass_hook_core.dll`）。用 `hook32` 会把
+> `bypass_hook32.dll` 也重链一遍，文件时间变了，之后「检查当前状态」会把仍在运行的旧
+> Loader 报成 `OLD` 并建议重启——代码没变，但判据是「磁盘上那份」，会误导。
 
 #### 热重载 Core
 
-主界面底部「**重载 Core**」按钮，或托盘右键 →「重载 Core（热更新）」。它走
-命名管道 `\\.\pipe\bypass_core_ctl_<pid>`：
+**用法**（改 Core 逻辑的标准流程）：
+
+1. 改 `src\bypass_hook.c`（或 `bypass_vd/screen/shut.inc`）；
+2. `make.bat core` → 只更新 `bin\bypass_hook_core.dll`；
+3. 课堂客户端保持运行，点主界面底部「**重载 Core**」或托盘「**重载 Core（热更新）**」；
+4. 看日志确认：
+   ```
+   [Loader] before_unload ok; draining (count=0)
+   [Loader] drained; unloading ...\core_cache\core.<pid>.<n>.dll
+   [Loader] core loaded: ... build=Nov 17 2026 00:12:34 hash=xxxxxxxx
+   ```
+   `build=` 变了 = 新 Core 真的生效了；
+5. 点「检查当前状态」确认 `core <hash> (current)`，并抽查 hook 是否还在工作
+   （`blocked SwitchDesktop` / `suppressed SetWindowsHookEx` 之类应继续出现）。
+
+> 只改**主程序界面**（`bypass.c`）不涉及重载：重编 `bypass.exe`，退出重开即可，
+> 课堂进程里的 Loader/Core 不动。
+
+它走命名管道 `\\.\pipe\bypass_core_ctl_<pid>`：
 
 - **目标进程**：按已知课堂进程名（`RELOAD_TARGETS`：`Student.exe`、`MultiClient.exe`、
   `MultiRender.exe`、`ScreenRender.exe`、`ScreenRecord.exe`、`SharedDesktop.exe`、
@@ -215,6 +237,27 @@ enabled=1
   | `err refused-by-core` | 阶段 1 拒绝（还有 hook 在跑 / 线程还在停），什么都没动 | `nothing reloaded` |
   | 其他 `err` | 失败，什么都没动（`--no-rollback` 时可能只剩半套） | `nothing reloaded` |
   | `err hooks-busy (core disabled)` / `err coreDead` | **进程半禁用，终态** | `Core disabled, restart the process` |
+
+**没有 UI 时**（脚本 / 运维）直接发管道命令，命令只有三种：`status`、`reload`、
+`reload norollback`（调试用，失败不回滚）：
+
+```powershell
+function Send-Ctl([int]$procId, [string]$msg) {
+    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', "bypass_core_ctl_$procId",
+                [System.IO.Pipes.PipeDirection]::InOut)
+    $pipe.Connect(3000)                                   # Loader 忙时会抛超时，重试即可
+    $b = [Text.Encoding]::ASCII.GetBytes($msg)
+    $pipe.Write($b, 0, $b.Length); $pipe.Flush()
+    $buf = New-Object byte[] 1024; $n = $pipe.Read($buf, 0, 1024)
+    $pipe.Dispose()
+    [Text.Encoding]::ASCII.GetString($buf, 0, $n).Trim()
+}
+
+Send-Ctl 7424 'status'    # ok core=... seq=1 dead=0 hash=xxxxxxxx cache=...
+Send-Ctl 7424 'reload'    # ok seq=2 cache=...   /  err refused-by-core  /  err coreDead
+```
+
+进程 PID 按名字找（`Get-Process Student.exe`）。管道名带 PID，所以多开时逐个发。
 
 #### 版本自检：内容哈希，不再看链接时间
 

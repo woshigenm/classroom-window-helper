@@ -62,6 +62,11 @@ bypass: $(BIN)/bypass.exe
 
 hook32: $(BIN)/bypass_hook32.dll $(BIN)/bypass_hook_core.dll $(BIN)/inject32.exe
 
+# Hot-reload workflow: only the Core (never touches bypass_hook32.dll, so the
+# running Loader is still "the disk file" and 检查当前状态 does not flag it OLD).
+#     make.bat core  ->  click 重载 Core
+core: $(BIN)/bypass_hook_core.dll
+
 # WalletService auto-elevation payload: bin\lpe\ (self-contained folder)
 lpe: lpebroker
 	@if not exist "$(LPEOUT)" mkdir "$(LPEOUT)"
