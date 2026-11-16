@@ -51,9 +51,9 @@ LIBS64   := -lgdi32 -lcomctl32 -ladvapi32 -lshell32 -luser32 -lshlwapi -lwinmm -
 # 32-bit components (must be static for the injected DLL)
 CFLAGS32 := -std=gnu11 -O2 -Wall
 DLLFLAGS := -shared -Wl,--kill-at -static -static-libgcc
-DLLLIBS  := -lpsapi -lole32 -ladvapi32
+DLLLIBS  := -lpsapi -lole32 -ladvapi32 -lgdi32
 
-.PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest hangwintest clean rebuild check
+.PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest hangwintest screentest clean rebuild check
 
 # 主程序 + DLL + 注入器 + 自动提权载荷（自测程序按需单独编）
 all: bypass hook32 lpe
@@ -86,6 +86,9 @@ vdtest: $(BIN)/vd_pin_test.exe
 # 不会卡死 enforcer (tests/hangwin_test.c)
 hangwintest: $(BIN)/hangwin_test.exe
 
+# 屏幕监控守卫自测载体 (tests/screenguard_test.c)
+screentest: $(BIN)/screenguard_test.exe
+
 # ---- outputs -------------------------------------------------
 
 $(BIN):
@@ -108,6 +111,9 @@ $(BIN)/wmode_test.exe: tests/wmode_test.c | $(BIN)
 
 $(BIN)/hangwin_test.exe: tests/hangwin_test.c | $(BIN)
 	"$(CC64)" $(CFLAGS32) "tests/hangwin_test.c" -o "$@"
+
+$(BIN)/screenguard_test.exe: tests/screenguard_test.c | $(BIN)
+	"$(CC32)" $(CFLAGS32) "tests/screenguard_test.c" -o "$@" -lgdi32 -luser32
 
 $(BIN)/vd_pin_test.exe: tests/vd_pin_test.c | $(BIN)
 	"$(CC32)" $(CFLAGS32) "tests/vd_pin_test.c" -o "$@" -lole32 -luuid -ladvapi32

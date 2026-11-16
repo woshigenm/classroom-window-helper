@@ -1,0 +1,209 @@
+/* ============================================================
+ *  screenguard_test.c -- 屏幕监控守卫的自测载体
+ *
+ *  模仿 StudentLogic.dll 的真实抓屏路径 (REA/Ghidra 实证):
+ *      CreateDCW(L"DISPLAY") -> CreateCompatibleDC/Bitmap
+ *      -> BitBlt(..., SRCCOPY|CAPTUREBLT) -> GetDIBits
+ *
+ *  流程:
+ *    1) 用颜色 A 填满自己的窗口;
+ *    2) 抓一屏, 记指纹;
+ *    3) 换成颜色 B, 再抓一屏, 记指纹;
+ *    4) 两次指纹相同 = 第二次抓到的还是"定格帧"(守卫生效);
+ *       不同 = 抓到的是实时桌面。
+ *
+ *  用法: screenguard_test.exe [--inject <bypass_hook32.dll>] [<inject32.exe>]
+ *  配合 tests\screenguard_test.ps1 使用 (它会写 bin\bypass_screen.ini)。
+ * ============================================================ */
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define RENDER_CLASS "MultiRenderScreenGuardTest"
+
+static HWND   g_win;
+static COLORREF g_color;
+
+static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC  dc = BeginPaint(h, &ps);
+        RECT rc;
+        HBRUSH br;
+
+        GetClientRect(h, &rc);
+        br = CreateSolidBrush(g_color);
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static void Pump(DWORD ms)
+{
+    DWORD end = GetTickCount() + ms;
+
+    while ((LONG)(end - GetTickCount()) > 0) {
+        MSG msg;
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        Sleep(10);
+    }
+}
+
+static int RunInjector(const char* injector, const char* dll)
+{
+    char cmd[1024];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD rc;
+
+    _snprintf(cmd, sizeof(cmd) - 1, "\"%s\" --pid %lu \"%s\"",
+              injector, (unsigned long)GetCurrentProcessId(), dll);
+    cmd[sizeof(cmd) - 1] = '\0';
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        printf("inject: CreateProcess failed err=%lu\n", (unsigned long)GetLastError());
+        return 0;
+    }
+    WaitForSingleObject(pi.hProcess, 15000);
+    GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    printf("inject: exit=%lu\n", (unsigned long)rc);
+    return rc == 0;
+}
+
+/* 和 StudentLogic.dll 的 FUN_10025610 一样的抓屏顺序 */
+static DWORD CaptureChecksum(int w, int h)
+{
+    HDC        disp;
+    HDC        mem;
+    HBITMAP    bm;
+    HGDIOBJ    old;
+    BYTE*      bits;
+    BITMAPINFO bmi;
+    DWORD      sum = 0x811C9DC5u;
+    int        i;
+
+    disp = CreateDCW(L"DISPLAY", NULL, NULL, NULL);
+    if (!disp) return 0;
+    mem = CreateCompatibleDC(disp);
+    bm  = CreateCompatibleBitmap(disp, w, h);
+    old = SelectObject(mem, bm);
+
+    BitBlt(mem, 0, 0, w, h, disp, 0, 0, SRCCOPY | CAPTUREBLT);
+
+    bits = (BYTE*)calloc(1, (size_t)w * (size_t)h * 4);
+    if (bits) {
+        memset(&bmi, 0, sizeof(bmi));
+        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth       = w;
+        bmi.bmiHeader.biHeight      = -h;
+        bmi.bmiHeader.biPlanes      = 1;
+        bmi.bmiHeader.biBitCount    = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        GetDIBits(mem, bm, 0, (UINT)h, bits, &bmi, DIB_RGB_COLORS);
+        for (i = 0; i < w * h * 4; i += 997)
+            sum = (sum ^ bits[i]) * 16777619u;
+        free(bits);
+    }
+
+    SelectObject(mem, old);
+    DeleteObject(bm);
+    DeleteDC(mem);
+    DeleteDC(disp);
+    return sum;
+}
+
+int main(int argc, char** argv)
+{
+    const char* dll = NULL;
+    const char* injector = NULL;
+    WNDCLASSA wc;
+    MSG msg;
+    int sw, sh, i;
+    DWORD sumA, sumB;
+    int frozen;
+
+    for (i = 1; i < argc; i++) {
+        if (!_stricmp(argv[i], "--inject") && i + 1 < argc) dll = argv[++i];
+        else if (!injector) injector = argv[i];
+    }
+
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = GetModuleHandleA(NULL);
+    wc.hCursor       = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = RENDER_CLASS;
+    if (!RegisterClassA(&wc)) { printf("RegisterClass failed\n"); return 1; }
+
+    g_color = RGB(10, 40, 90);
+    sw = GetSystemMetrics(SM_CXSCREEN);
+    sh = GetSystemMetrics(SM_CYSCREEN);
+    g_win = CreateWindowExA(0, RENDER_CLASS, "screenguard test",
+                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                            sw / 6, sh / 6, sw / 2, sh / 2,
+                            NULL, NULL, wc.hInstance, NULL);
+    if (!g_win) { printf("CreateWindow failed\n"); return 2; }
+    ShowWindow(g_win, SW_SHOW);
+    UpdateWindow(g_win);
+    Pump(400);
+
+    if (dll) {
+        char buf[MAX_PATH];
+        if (!injector) {
+            char exe[MAX_PATH] = "";
+            char* p;
+            GetModuleFileNameA(NULL, exe, sizeof(exe));
+            p = strrchr(exe, '\\');
+            if (p) *(p + 1) = '\0';
+            _snprintf(buf, sizeof(buf) - 1, "%sinject32.exe", exe);
+            injector = buf;
+        }
+        if (!RunInjector(injector, dll))
+            printf("WARNING: injector failed, continuing as baseline\n");
+        Pump(1800);          /* Worker 起来 + 读一次 ini */
+    }
+
+    /* 颜色 A -> 第一次抓屏 (守卫会把它存成定格帧) */
+    g_color = RGB(10, 40, 90);
+    InvalidateRect(g_win, NULL, TRUE);
+    Pump(300);
+    sumA = CaptureChecksum(sw, sh);
+    printf("capture#1 (color A) -> %08lx\n", (unsigned long)sumA);
+    Pump(300);
+
+    /* 换成颜色 B -> 第二次抓屏 */
+    g_color = RGB(200, 30, 30);
+    InvalidateRect(g_win, NULL, TRUE);
+    Pump(300);
+    sumB = CaptureChecksum(sw, sh);
+    printf("capture#2 (color B) -> %08lx\n", (unsigned long)sumB);
+
+    frozen = (sumA == sumB) ? 1 : 0;
+    printf("SUMMARY first=%08lx second=%08lx frozen=%d\n",
+           (unsigned long)sumA, (unsigned long)sumB, frozen);
+    printf("VERDICT %s\n", frozen ? "FROZEN (2nd capture is the cached frame)"
+                                  : "LIVE (2nd capture shows the new color)");
+
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    DestroyWindow(g_win);
+    return 0;   /* 退出码恒 0: 判据在 SUMMARY, 由脚本读 */
+}

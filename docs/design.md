@@ -518,6 +518,42 @@ bypass.exe (普通用户)
 的来源与 SHA256）；`shell_broker.exe` 由 `src\lpe_broker.c` 编译，因为原版把子进程写死成
 `cmd.exe`，而这里必须拉起 `bin\bypass.exe`。
 
+### 2.6 屏幕监控守卫（老师端只能看到定格画面）
+
+**需求**：老师端"屏幕监控 / 录屏"时，不要把我们**实时**的桌面传上去。
+
+**实证（REA / Ghidra，`StudentLogic.dll` sha256 `404b4d…9d84`）**：学生端的屏幕抓取只有一条
+GDI 路径：
+
+```
+FUN_10025610 (0x10025610, 调用方 FUN_10025720)
+    hdc = CreateDCW(L"DISPLAY", 0, 0, 0)
+    mem = CreateCompatibleDC(hdc); bm = CreateCompatibleBitmap(hdc, w, h)
+    BitBlt(mem, 0, 0, w, h, hdc, 0, 0, SRCCOPY | CAPTUREBLT)
+    GetDIBits(mem, bm, 0, h, bits, &bmi, 0)        // 之后交给上传/编码
+```
+
+所以拦截点只有一个：**源 DC 是屏幕 DC 的 `BitBlt`**（`src\bypass_screen.inc`）。
+
+| 环节 | 做法 |
+|---|---|
+| 识别屏幕 DC | 记录 `CreateDC(DISPLAY)` / `GetDC(NULL)` / `GetWindowDC(NULL)` 返回的句柄；另一个兜底判据是"当前位图是 1×1 的屏幕位图"（应用自己画过的内存 DC 是真实尺寸，不会误判） |
+| `freeze`（默认） | **第一次**抓屏照常读屏幕，把结果存成"定格帧"；之后每次抓屏都 `SetDIBitsToDevice` 从缓存画到调用方的位图里，**屏幕一个像素都不再读**，连 `GetDIBits` 拿到的都是缓存帧 |
+| `blank` | 连第一帧都不抓，直接铺一块纯色 |
+| 其它 rop | 只有 `SRCCOPY` / `SRCCOPY\|CAPTUREBLT` 才拦（AND/OR/XOR 不是抓屏） |
+| 开关 | `bin\bypass_screen.ini`：`enabled=0/1` + `mode=freeze\|blank`，DLL 每 0.5 秒重读一次，改完不用重启；主界面第 3 行的「屏蔽屏幕监控」按钮就是写这个文件（并用 `RunInjector` 保证 DLL 已经进了 `Student.exe`） |
+
+**边界（务必知道）**：
+
+- 只在**注入了 `bypass_hook32.dll` 的进程**里生效（`Student.exe` / `ScreenRecord.exe` 等，
+  也就是 `inject32.exe` 的目标列表）；DLL 没进去 = 完全没保护。
+- 只覆盖 **GDI** 抓屏。如果哪天厂商换成 DXGI Desktop Duplication / `PrintWindow` 抓屏，
+  这里拦不到（`PrintWindow` 目前没钩）。
+- 定格帧是"开始监控那一刻"的桌面，之后老师看到的画面**完全不动**——这是"画面固定"的代价，
+  正常上课时老师很快能看出来静态。想更像真的可以后续加 `refresh=N`（每 N 秒悄悄换一帧），
+  代码里预留了 `g_scSeededTick` 但还没实现。
+- 守卫不改变课堂软件的任何协议/传输：上传照常发生，只是内容变成同一张图。
+
 ---
 
 ## 3. 日志与排错
@@ -620,6 +656,25 @@ bin\inject32.exe "%CD%\bin\bypass_hook32.dll"
 
 日志出现 `caption auto-hide ... (maximized broadcast)` 与
 `caption auto-show ... (control bar visible)` 即生效。
+
+验证"屏幕监控守卫"（`make.bat screentest` + 脚本）：
+
+```bat
+make.bat all screentest
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\screenguard_test.ps1
+```
+
+脚本用 `tests\screenguard_test.c` 复刻 `StudentLogic.dll` 的抓屏顺序
+（`CreateDCW("DISPLAY") → BitBlt → GetDIBits`）：先把窗口填成颜色 A 抓一次，再换成颜色 B
+抓一次。`enabled=0` 时两次指纹不同（实时），`enabled=1` 时两次相同（定格帧）：
+
+```
+case 1/2: guard OFF (expect frozen=0)
+  off: frozen=0
+case 2/2: guard ON  (expect frozen=1)
+  on: frozen=1
+VERDICT PASS
+```
 
 验证"跨进程兜底不会卡死 enforcer"（`make.bat hangwintest` + 脚本）：
 

@@ -1962,6 +1962,9 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 /* ---- virtual desktop pinning (see bypass_vd.inc) ---- */
 #include "bypass_vd.inc"
 
+/* ---- screen-capture guard: frozen frame for the monitor path ---- */
+#include "bypass_screen.inc"
+
 /* ---- window-mode (control-side) small broadcast window ----
    The teacher's console can send the broadcast in window mode: the renderer
    then creates the render window ALREADY SMALL (WS_EX_TOPMOST + caption).
@@ -3001,6 +3004,12 @@ static void PatchAllModules(void)
         PatchOne(mods[i], "user32.dll", "SetForegroundWindow", (void*)Hook_SetForegroundWindow);
         PatchOne(mods[i], "user32.dll", "BringWindowToTop",    (void*)Hook_BringWindowToTop);
         PatchOne(mods[i], "user32.dll", "SetActiveWindow",     (void*)Hook_SetActiveWindow);
+        /* 抓屏守卫: 老师端"屏幕监控/录屏"走 GDI (CreateDC("DISPLAY")+BitBlt) */
+        PatchOne(mods[i], "gdi32.dll",   "BitBlt",             (void*)SC_Hook_BitBlt);
+        PatchOne(mods[i], "gdi32.dll",   "CreateDCW",          (void*)SC_Hook_CreateDCW);
+        PatchOne(mods[i], "gdi32.dll",   "CreateDCA",          (void*)SC_Hook_CreateDCA);
+        PatchOne(mods[i], "user32.dll",  "GetDC",              (void*)SC_Hook_GetDC);
+        PatchOne(mods[i], "user32.dll",  "GetWindowDC",        (void*)SC_Hook_GetWindowDC);
     }
 }
 
@@ -4301,6 +4310,9 @@ static DWORD WINAPI Worker(LPVOID p)
             HookLog("WARNING: inline ShowWindowAsync hook failed (IAT only)");
     }
 
+    /* 抓屏守卫的 real_ 指针 + 配置 (必须在 PatchAllModules 之前) */
+    SC_Init();
+
     PatchAllModules();
 
     /* 标题栏自动隐藏的兜底心跳 (见 CaptionPumpProc): 不依赖 WM_TIMER */
@@ -4341,6 +4353,7 @@ static DWORD WINAPI Worker(LPVOID p)
         /* 配置/命令：共享内存 + 事件；没有映射时退回读 bypass_config.ini */
         StateRefresh();
         ComputeSmallRect();
+        SC_Tick();                 /* 抓屏守卫: 最多每 500ms 重读一次 ini */
 
         /* Two dump rounds during a broadcast (4s / 19s): enough to see which
            window covers the screen, without burying the log.  Only the

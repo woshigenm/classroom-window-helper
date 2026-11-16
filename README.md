@@ -42,6 +42,7 @@ make.bat test         :: bin\hooktest32.exe
 make.bat wmodetest    :: bin\wmode_test.exe
 make.bat vdtest       :: bin\vd_pin_test.exe
 make.bat hangwintest  :: bin\hangwin_test.exe（跨进程兜底测试用的"不泵消息"受害者）
+make.bat screentest   :: bin\screenguard_test.exe（屏幕监控守卫自测载体）
 make.bat clean | rebuild | check
 ```
 
@@ -108,6 +109,25 @@ classroom-window-helper\
   会自动退回 UAC，属设计内行为。链路细节 / 编码约定 / broker 令牌见 [`lpe/README.md`](lpe/README.md)。
 - 提权与 DLL 日志合并成一个文件 `bin\bypass_hook.log`（启动器每次启动重写，broker 拉起的
   实例不重写，链路日志连续）。`--elevate-selftest` 只把 Base64 载荷写到 `%TEMP%`，不启动任何东西。
+
+### 5.4 屏幕监控守卫（`bin\bypass_screen.ini`）
+
+主界面第 3 行按钮「屏蔽屏幕监控」。开了之后，老师端的"屏幕监控/录屏"只能看到**一张定格画面**，
+我们实时的桌面不再上传。
+
+```ini
+; bin\bypass_screen.ini（点按钮自动生成，DLL 每 0.5 秒重读，改完不用重启）
+enabled=1
+mode=freeze     ; freeze=第一帧当定格帧（默认） / blank=固定纯色
+```
+
+- 原理：学生端抓屏只有一条 GDI 路径（`StudentLogic.dll` 的 `CreateDCW("DISPLAY") → BitBlt →
+  GetDIBits`，REA/Ghidra 实证），注入的 DLL 钩住 `BitBlt`：**第一次**抓屏存一帧，之后每次抓屏
+  都从缓存画出来，屏幕一个像素都不再读。
+- 生效前提：`bypass_hook32.dll` 已经在 `Student.exe` / `ScreenRecord.exe` 里（点按钮会自动
+  调注入器；你也可以看日志里的 `[Screen] guard ON/OFF`）。
+- 只覆盖 GDI 抓屏；换成 DXGI / `PrintWindow` 抓屏就拦不到。定格后画面完全不动，老师端容易
+  看出是静态图——这是"画面固定"的固有代价（详见 `docs\design.md` 2.6）。
 
 ## 6. 安全与回退
 

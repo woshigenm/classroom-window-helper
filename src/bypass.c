@@ -138,6 +138,7 @@
 #define ID_BTN_CHECK_STATUS 1007
 #define ID_BTN_EXIT         1009
 #define ID_BTN_SMALLSTICKY  1015
+#define ID_BTN_SCREENGUARD  1016    /* 屏幕监控守卫: 老师端只看到定格画面 */
 #define ID_CHK_TRAY         1020    /* 广播窗最小化: 任务栏(真最小化) / 收起(托盘) */
 #define ID_LOG_OUTPUT       1100
 #define ID_STATUS_BAR       1200
@@ -177,9 +178,10 @@
 
 #define ROW1_Y          78      /* button row 1 y */
 #define ROW2_Y          130     /* button row 2 y */
-#define CHK_Y           184     /* "broadcast minimize" checkbox y */
-#define LOGLBL_Y        222     /* log label y */
-#define LOG_Y           246     /* log area y */
+#define ROW3_Y          182     /* button row 3 y (screen guard, full width) */
+#define CHK_Y           236     /* "broadcast minimize" checkbox y */
+#define LOGLBL_Y        264     /* log label y */
+#define LOG_Y           288     /* log area y */
 
 #define UI_BG           RGB(24, 26, 32)      /* window background */
 #define UI_TITLE_BG     RGB(18, 20, 26)      /* title bar background */
@@ -379,6 +381,10 @@ static const BTNDEF g_btnDefs[] = {
     { ID_BTN_SMALLSTICKY, L"持续保持小窗", L"开关: 开=注入并持续压制; 关=写 bypass_hook.off 全部放行",
       UI_GRAY_BTN,    UI_GRAY_HV,    UI_GRAY_DN,    0, L"Ctrl+Alt+T" },
 
+    /* ---- 第 3 行: 屏幕监控守卫 (整行) ---- */
+    { ID_BTN_SCREENGUARD, L"屏蔽屏幕监控", L"开关: 开=老师端只能看到定格画面(不传实时桌面); 关=正常",
+      UI_SUCCESS,     RGB(60,170,110), RGB(40,140,90), 0, NULL },
+
     /* ---- 底部按钮 (不参与网格布局) ---- */
     { ID_BTN_CHECK_STATUS,L"检查当前状态", L"只读诊断: 权限/驱动/进程/配置/当前桌面",
       UI_GRAY_BTN,    UI_GRAY_HV,    UI_GRAY_DN,    0, NULL },
@@ -397,6 +403,8 @@ static RECT   g_rcTitleMin = { 0, 0, 0, 0 };
 static RECT   g_rcTitleClose = { 0, 0, 0, 0 };
 static int    g_hoverTitle = 0;      /* 0 = none, 1 = min, 2 = close */
 static BOOL   g_titleTracking = FALSE;
+/* 屏幕监控守卫 (bin\bypass_screen.ini, 由注入的 DLL 在 0.5s 内读到) */
+static BOOL   g_screenGuard = FALSE;
 
 /* DPI awareness (Per-Monitor V2, no manifest needed) */
 static UINT g_dpi    = 96;
@@ -3693,6 +3701,10 @@ static void DrawCustomButton(const DRAWITEMSTRUCT* dis) {
     if (dis->CtlID == ID_BTN_SMALLSTICKY) {
         text = g_smallWinRun ? L"持续保持小窗: 开" : L"持续保持小窗: 关";
         fill = g_smallWinRun ? UI_SUCCESS : UI_GRAY_BTN;
+    } else if (dis->CtlID == ID_BTN_SCREENGUARD) {
+        text = g_screenGuard ? L"屏蔽屏幕监控: 开  (老师端只看到定格画面)"
+                             : L"屏蔽屏幕监控: 关";
+        fill = g_screenGuard ? UI_SUCCESS : UI_GRAY_BTN;
     } else {
         if (dis->itemState & ODS_SELECTED)      fill = def->dn;
         else if (st->hover)                     fill = def->hv;
@@ -3799,6 +3811,9 @@ static void LayoutControls(HWND hwnd) {
         }
         hCtl = GetDlgItem(hwnd, ID_CHK_TRAY);
         if (hCtl) MoveWindow(hCtl, S(UI_PAD), S(CHK_Y), S(300), S(24), TRUE);
+        hCtl = GetDlgItem(hwnd, ID_BTN_SCREENGUARD);
+        if (hCtl) MoveWindow(hCtl, S(UI_PAD), S(ROW3_Y),
+                             S(BTN2_W) * 2 + S(BTN_GAP), S(BTN_H), TRUE);
     }
 
     logTop    = S(LOG_Y);
@@ -3868,6 +3883,13 @@ void CreateControls(HWND hwnd) {
             hwnd, (HMENU)(INT_PTR)ids2[i], hInstance, NULL);
         SetWindowSubclass(hBtn, BtnProc, (UINT_PTR)ids2[i], 0);
     }
+
+    /* row 3: 屏幕监控守卫 (整行宽按钮) */
+    hBtn = CreateWindowW(L"BUTTON", L"",
+        WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+        S(UI_PAD), S(ROW3_Y), S(BTN2_W) * 2 + S(BTN_GAP), S(BTN_H),
+        hwnd, (HMENU)(INT_PTR)ID_BTN_SCREENGUARD, hInstance, NULL);
+    SetWindowSubclass(hBtn, BtnProc, (UINT_PTR)ID_BTN_SCREENGUARD, 0);
 
     /* log output (border painted by WM_PAINT) */
     g_hwndLog = CreateWindowW(L"EDIT", L"",
@@ -4288,6 +4310,93 @@ void OnSmallStickyToggle(HWND hwnd) {
             "(渲染进程不用重启; 想重新接管请再点一次「持续保持小窗」)\r\n");
     } else {
         StartSmallWin(hwnd);
+    }
+}
+
+/* ===== 屏幕监控守卫 =====
+   老师端的"屏幕监控/录屏"在学生端走 GDI (REA/Ghidra 实证 StudentLogic.dll
+   FUN_10025610: CreateDCW("DISPLAY") -> BitBlt -> GetDIBits)。注入的 DLL
+   钩住 BitBlt: 第一次抓屏存一帧当"定格帧", 之后每次抓屏都从缓存画出来,
+   屏幕一个像素都不再读。这里只负责开关 (写 ini) 和保证 DLL 已注入。 */
+static void ScreenGuardPath(char* out, DWORD size)
+{
+    char dir[MAX_PATH];
+
+    if (!out || size < 2) return;
+    out[0] = '\0';
+    if (!GetModuleFileNameA(NULL, dir, sizeof(dir))) return;
+    PathRemoveFileSpecA(dir);
+    PathCombineA(out, dir, "bypass_screen.ini");
+}
+
+static void ScreenGuardLoad(void)
+{
+    char  path[MAX_PATH];
+    char  line[160];
+    FILE* f;
+
+    g_screenGuard = FALSE;
+    ScreenGuardPath(path, sizeof(path));
+    f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        char* eq = strchr(line, '=');
+        char* v;
+
+        if (!eq) continue;
+        *eq = '\0';
+        v = eq + 1;
+        while (*v == ' ' || *v == '\t') v++;
+        if (!_stricmp(line, "enabled"))
+            g_screenGuard = (atoi(v) != 0) ? TRUE : FALSE;
+    }
+    fclose(f);
+}
+
+static void ScreenGuardSave(void)
+{
+    char  path[MAX_PATH];
+    char  tmp[MAX_PATH];
+    FILE* f;
+
+    ScreenGuardPath(path, sizeof(path));
+    if (!path[0]) return;
+    _snprintf(tmp, sizeof(tmp) - 1, "%s.tmp", path);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "; 屏幕监控守卫: 注入的 bypass_hook32.dll 读取本文件 (0.5 秒内生效)\r\n");
+    fprintf(f, ";   enabled=1    老师端只能看到\"定格画面\", 不传实时桌面\r\n");
+    fprintf(f, ";   mode=freeze  第一次抓屏作为定格帧 (默认) / blank = 固定纯色\r\n");
+    fprintf(f, "enabled=%d\r\n", g_screenGuard ? 1 : 0);
+    fprintf(f, "mode=freeze\r\n");
+    fclose(f);
+
+    /* 原子替换: DLL 每 0.5 秒读一次, 不能让它读到写了一半的文件 */
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        DeleteFileA(tmp);
+}
+
+static void OnScreenGuardToggle(HWND hwnd)
+{
+    g_screenGuard = g_screenGuard ? FALSE : TRUE;
+    ScreenGuardSave();
+
+    /* 守卫逻辑在注入的 DLL 里: 打开时确保它已经进了 Student.exe 等进程 */
+    if (g_screenGuard) RunInjector(hwnd, TRUE);
+
+    AppendLog(hwnd, "\r\n[Screen] 屏幕监控守卫 -> %s (bin\\bypass_screen.ini)\r\n"
+                    "[Screen] %s\r\n",
+              g_screenGuard ? "开" : "关",
+              g_screenGuard
+                  ? "第一次抓屏存成定格帧, 之后老师端只看到这张静止画面"
+                  : "恢复正常上传");
+    UpdateStatus(hwnd, g_screenGuard ? "Status: screen guard ON (frozen frame)"
+                                     : "Status: screen guard OFF");
+    {
+        HWND b = GetDlgItem(hwnd, ID_BTN_SCREENGUARD);
+        if (b) InvalidateRect(b, NULL, TRUE);
     }
 }
 
@@ -5292,6 +5401,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_BTN_SMALLSTICKY:
                     OnSmallStickyToggle(hwnd);
                     break;
+                case ID_BTN_SCREENGUARD:
+                    OnScreenGuardToggle(hwnd);
+                    break;
                 case ID_CHK_TRAY: {
                     BOOL tb = (IsDlgButtonChecked(hwnd, ID_CHK_TRAY) == BST_CHECKED);
                     WriteMinimizeMode(tb);
@@ -5331,7 +5443,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_GETMINMAXINFO: {
             MINMAXINFO* mmi = (MINMAXINFO*)lParam;
             mmi->ptMinTrackSize.x = S(712);
-            mmi->ptMinTrackSize.y = S(560);
+            mmi->ptMinTrackSize.y = S(616);
             return 0;
         }
 
@@ -5541,6 +5653,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* 配置 + 共享状态（必须在注入 DLL 之前） */
     StateInit();
+    ScreenGuardLoad();          /* 屏幕监控守卫: 读 bin\bypass_screen.ini */
 
     /* this run only: truncate before any DLL starts appending.
        An instance spawned by the elevation chain must NOT truncate - the
@@ -5616,7 +5729,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         WINDOW_TITLE,
         WS_POPUP | WS_THICKFRAME | WS_CAPTION | WS_SYSMENU |
         WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, S(712), S(692),
+        CW_USEDEFAULT, CW_USEDEFAULT, S(712), S(748),
         NULL, NULL, hInstance, NULL);
 
     if (!hwnd) {
