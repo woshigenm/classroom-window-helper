@@ -314,6 +314,9 @@ static int SH_BlockW(const WCHAR* app, const WCHAR* cmd, const char* api)
 
 static BOOL WINAPI SH_Hook_ExitWindowsEx(UINT flags, DWORD reason)
 {
+    if (CORE_DISABLED())
+        return real_ExitWindowsEx ? real_ExitWindowsEx(flags, reason) : FALSE;
+
     if (SH_On()) {
         char what[96];
         const char* kind = "logoff";
@@ -336,6 +339,7 @@ static BOOL WINAPI SH_Hook_ExitWindowsEx(UINT flags, DWORD reason)
 
 static UINT WINAPI SH_Hook_WinExec(LPCSTR cmd, UINT show)
 {
+    if (CORE_DISABLED()) return real_WinExec ? real_WinExec(cmd, show) : 0;
     if (SH_BlockA(NULL, cmd, "WinExec")) return 33;   /* > 31 = success */
     return real_WinExec ? real_WinExec(cmd, show) : 0;
 }
@@ -343,6 +347,9 @@ static UINT WINAPI SH_Hook_WinExec(LPCSTR cmd, UINT show)
 static HINSTANCE WINAPI SH_Hook_ShellExecuteA(HWND owner, LPCSTR op, LPCSTR file,
                                               LPCSTR args, LPCSTR dir, INT show)
 {
+    if (CORE_DISABLED())
+        return real_ShellExecuteA ? real_ShellExecuteA(owner, op, file, args, dir, show)
+                                  : (HINSTANCE)0;
     if (SH_BlockA(file, args, "ShellExecuteA"))
         return (HINSTANCE)33;
     return real_ShellExecuteA ? real_ShellExecuteA(owner, op, file, args, dir, show)
@@ -352,6 +359,9 @@ static HINSTANCE WINAPI SH_Hook_ShellExecuteA(HWND owner, LPCSTR op, LPCSTR file
 static HINSTANCE WINAPI SH_Hook_ShellExecuteW(HWND owner, LPCWSTR op, LPCWSTR file,
                                               LPCWSTR args, LPCWSTR dir, INT show)
 {
+    if (CORE_DISABLED())
+        return real_ShellExecuteW ? real_ShellExecuteW(owner, op, file, args, dir, show)
+                                  : (HINSTANCE)0;
     if (SH_BlockW(file, args, "ShellExecuteW"))
         return (HINSTANCE)33;
     return real_ShellExecuteW ? real_ShellExecuteW(owner, op, file, args, dir, show)

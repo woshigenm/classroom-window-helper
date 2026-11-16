@@ -4476,12 +4476,13 @@ static void ReportReloadResult(HWND hwnd, const char* exe, DWORD pid,
     if (strstr(resp, "core disabled") || strstr(resp, "coreDead")) {
         (*dead)++;
         /* 阶段 2 已经执行过 (before_unload 返回 1) 但 drain 没等到: 进程里
-           11 个包装 hook 直通, 22 个未包装 hook 仍跑完整逻辑 —— 不是“已直通”。 */
+           17 个 hook 直通 (11 个 HOOK_ENTER 包装 + 6 个 inline), 其余 16 个只走
+           IAT 的入口仍跑完整逻辑 —— 不是“已直通”。 */
         AppendLog(hwnd, "[Core] %s pid=%lu: %s\r\n"
                         "       WARNING: process disabled (partially bypassed):\r\n"
-                        "         window/show/process-create wrappers are passthrough,\r\n"
-                        "         shutdown/shell/WinExec hooks still run their logic\r\n"
-                        "         while the shutdown guard is on.\r\n"
+                        "         window/show/process-create/shell/ExitWindowsEx hooks\r\n"
+                        "         are passthrough, but the screen guard and\r\n"
+                        "         InitiateSystemShutdown* hooks still run.\r\n"
                         "         Restart that classroom process to recover.\r\n",
                   exe, (unsigned long)pid, resp);
         return;

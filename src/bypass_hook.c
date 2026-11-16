@@ -85,6 +85,16 @@ static HANDLE        g_hCaption;
 
 #define HOOK_LEAVE() \
     do { volatile LONG* _c = HR_IN_HOOKS(); if (_c) InterlockedDecrement(_c); } while (0)
+
+/* ② Every inline-hooked entry must pass through once the Core is disabled.
+   phase 2 failed (or is in progress) => StateClose() already released
+   g_stateView/g_stateMap/g_stateEvent and the Worker/caption/VD threads are
+   gone; a hook that keeps running "full logic" here is only safe by accident.
+   The 11 HOOK_ENTER wrappers already do this; the remaining 6 inline hooks
+   (ShowWindowAsync, CreateProcessA, WinExec, ExitWindowsEx, ShellExecuteA/W)
+   now do the same explicitly.  Reads only a volatile LONG: negligible cost on
+   paths that are not hot (window show / process create / shell / shutdown). */
+#define CORE_DISABLED() (InterlockedCompareExchange(&g_coreDisabled, 0, 0) != 0)
 static DWORD  g_pid;
 static HMODULE g_self;
 static volatile LONG g_disabled;
@@ -2461,6 +2471,9 @@ static BOOL WINAPI Impl_ShowWindow(HWND h, int cmd)
 
 static BOOL WINAPI Hook_ShowWindowAsync(HWND h, int cmd)
 {
+    if (CORE_DISABLED())
+        return real_ShowWindowAsync ? real_ShowWindowAsync(h, cmd) : TRUE;
+
     if (!g_disabled && IsTargetWindow(h) && cmd != SW_SHOW && cmd != SW_SHOWNORMAL &&
         InterlockedIncrement(&g_showLogs) <= 20)
         HookLog("showwinasync hwnd=%p cmd=%d", (void*)h, cmd);
@@ -2707,6 +2720,11 @@ static BOOL WINAPI Hook_CreateProcessA(LPCSTR app, LPSTR cmd,
     char         cmdbuf[2048];
     BOOL         isBroadcast = FALSE;
     BOOL         ok;
+
+    if (CORE_DISABLED())
+        return real_CreateProcessA ? real_CreateProcessA(app, cmd, pa, ta, inh,
+                                                         flags, env, cwd, si, pi)
+                                   : FALSE;
 
     /* 远程关机守卫: SYS_RunCommand("shutdown -s -t 1") 最终走到这里。
        返回"成功"但不建进程, 控制端就不会把它当成失败重发。 */

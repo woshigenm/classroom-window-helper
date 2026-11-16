@@ -59,6 +59,45 @@ static LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcA(h, m, w, l);
 }
 
+static const char* g_probeTimes;
+
+/* P3/reentry test: at the given millisecond offsets call WinExec with a
+   shutdown-looking but *nonexistent* executable:
+       C:\nonexistent\shutdown.exe -s -t 1
+   While the shutdown guard is active the Core recognises the command (base
+   name "shutdown" + a /s-style flag) and blocks it: WinExec returns 33 and
+   "[Guard] blocked WinExec" is logged.  Once the Core is disabled (failed
+   phase 2) the hook must pass through, so the real WinExec runs - the file
+   does not exist, so it returns 0 and nothing happens.  No shutdown can ever
+   be scheduled by this probe. */
+static DWORD WINAPI ProbeThread(LPVOID p)
+{
+    static const char kProbe[] = "C:\\nonexistent\\shutdown.exe -s -t 1";
+    char  times[128];
+    char* s;
+    DWORD t0 = GetTickCount();
+
+    (void)p;
+    _snprintf(times, sizeof(times) - 1, "%s", g_probeTimes ? g_probeTimes : "");
+    times[sizeof(times) - 1] = '\0';
+
+    s = times;
+    while (s && *s) {
+        char* comma = strchr(s, ',');
+        DWORD at = (DWORD)atoi(s);
+
+        if (comma) *comma = '\0';
+        while ((DWORD)(GetTickCount() - t0) < at) Sleep(20);
+        {
+            UINT rc = WinExec(kProbe, SW_HIDE);
+            printf("probe winexec t=%lu ret=%u\n", (unsigned long)at, (unsigned)rc);
+            fflush(stdout);
+        }
+        s = comma ? (comma + 1) : NULL;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     const char* pidfile = NULL;
@@ -77,6 +116,7 @@ int main(int argc, char** argv)
         else if (!_stricmp(argv[i], "--crash-after") && i + 1 < argc) crashAfter = atoi(argv[++i]);
         else if (!_stricmp(argv[i], "--window")) makeWindow = 1;
         else if (!_stricmp(argv[i], "--hammer-show")) hammerShow = 1;
+        else if (!_stricmp(argv[i], "--probe-winexec") && i + 1 < argc) g_probeTimes = argv[++i];
         else if (!injector) injector = argv[i];
     }
 
@@ -141,6 +181,11 @@ int main(int argc, char** argv)
         Sleep((DWORD)crashAfter);
         /* 未处理异常: 走 Loader 的 UEF 转发器 -> Core 的 CrashFilter 记录 */
         RaiseException(0xE0000001u, 0, 0, NULL);
+    }
+
+    if (g_probeTimes && g_probeTimes[0]) {
+        HANDLE th = CreateThread(NULL, 0, ProbeThread, NULL, 0, NULL);
+        if (th) CloseHandle(th);
     }
 
     if (seconds < 1) seconds = 1;

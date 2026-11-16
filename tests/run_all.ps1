@@ -108,6 +108,13 @@ Run-Suite 'shutdown guard' {
         Out-Host
 }
 
+# Re-entrancy / disabled-Core semantics: after a failed phase 2 the 6 inline
+# hooks that used to skip the g_coreDisabled check must pass through.
+Run-Suite 'reentry (disabled Core passthrough)' {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'reentry_test.ps1') |
+        Out-Host
+}
+
 Run-Suite 'version self-check (content hash)' {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'version_test.ps1') |
         Out-Host

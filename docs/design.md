@@ -682,7 +682,8 @@ bypass_hook_core.dll (Core)
 
 1. Loader 收到 `reload`；把新 Core 复制到 `core.<pid>.<seq>.dll`（新序号）。
 2. **`g_table` 仍指向旧 Core 时**调用旧 Core 的 `before_unload()`：
-   - Core 先置 `g_coreDisabled = 1`：新进来的 hook 直接直通，不再进拦截逻辑；
+   - Core 先置 `g_coreDisabled = 1`：新进来的调用在**包装 / inline hook 入口**直通
+     （33 个 dispatcher 里 17 个如此，剩下 16 个只走 IAT，见 2.9 末尾）；
    - 停 Worker / caption pump / VD 线程（每个 3 秒超时，超时返回 0）；
    - 等 `g_inHookCount == 0`（3 秒超时，超时返回 0）；
    - 把状态写进 blob，返回 1。
@@ -724,7 +725,8 @@ P2b = 上面第 2 步的十项真正实现。
 
 阶段 2（不可逆清理）：
 
-1. `g_coreDisabled = 1`（新调用直通）；
+1. `g_coreDisabled = 1`（新调用在包装 / inline 入口直通；16 个只走 IAT 的入口继续拦截，
+   见 2.9 末尾）；
 2. 停 Worker / caption / VD，各自 3 秒超时；
 3. `RemoveWindowSubclass` / `KillTimer` / `UnregisterClass`；
 4. 等 `g_inHookCount == 0`（3 秒超时）；
@@ -733,8 +735,9 @@ P2b = 上面第 2 步的十项真正实现。
 
 > 阶段 2 某一步超时返回 0 时，Core 已经置了 `g_coreDisabled`、可能停了一半线程——
 > 这是不可逆操作开始后的固有风险。阶段 1 的检查目的就是把这种情况压到接近零；
-> Loader 收到 0 时不卸载，旧 Core 进入**半禁用**状态：11 个包装 hook 直通，
-> 22 个未包装 hook 仍会跑完整逻辑——**不是“全部直通”**（见 2.9 末尾）。
+> Loader 收到 0 时不卸载，旧 Core 进入**半禁用**状态：17 个入口（11 个 `HOOK_ENTER`
+> 包装 + 6 个 inline）直通，16 个只走 IAT 的入口仍会跑完整逻辑——**不是“全部直通”**
+> （见 2.9 末尾）。
 
 P2b 测试矩阵：正常重载 / Worker 卡住（`SuspendThread`）/ `g_inHookCount` 卡住
 （hook 里 `Sleep(5000)`）/ 窗口未销毁 / 连续重载 3 次 / 阶段 1 失败后关闭窗口再次重载。
@@ -848,23 +851,33 @@ Loader 装了两类钩子：8 个 inline hook（改函数入口）、33 个 IAT 
 | 8 个 inline（`ShowWindow`、`ShowWindowAsync`、`WinExec`、`CreateProcessW/A`、`ExitWindowsEx`、`ShellExecuteA/W`） | 重入 `L_*` → 计数 → `Hook_*` | 安全，但会跑 Core 代码 |
 | 25 个 IAT-only（`SetWindowPos`、`SetWindowLong*`、`MoveWindow`、`SwitchDesktop`…） | 直接走 user32/kernel32 原函数 | 不经过 dispatcher，不计数 |
 
-其中 8 个 inline 里**只有 `ShowWindow` 和 `CreateProcessW` 在入口查 `g_coreDisabled`**
-（走 `HOOK_ENTER`）；另外 6 个不查，但它们只读模块全局和 `bypass_shut.ini`，
-不碰 `g_stateView` / `g_sub` 等 Worker 资源，所以半禁用期间重入不会 UAF。
+重入本身在正常情况下是良性的：8 个 inline hook 的入口都在 disabled 期直通（见下），
+计数只会 1→2→1→0，drain 不受影响。
 
-这条不对称是 `g_unloading` 时机论证的前提：`before_unload` 之所以可以安全地不检查
-`g_coreDisabled`，正因为它不调任何 hook 函数（只用裸 Win32 + `real_*`）。
-**以后要在 `before_unload` 里调 hook 函数，必须走 `real_*` 或先查 `g_coreDisabled`。**
+**① 持锁重入审计（P3 补充）**：Core 里 5 把锁全是 `CRITICAL_SECTION`
+（`g_subCs` / `g_envCs` / `g_geoSs` / `g_vdCs` / `g_scCs`），Windows 的 CS 对同一线程可
+重入，所以「重入另一个也拿同一把锁的 hook」不会死锁。逐个体检 8 个 inline hook：
+没有一个是**持锁时调用 inline hook 目标**；`Hook_CreateProcessA/W` 确实把 `g_envCs`
+跨过 `real_CreateProcessX`（环境变量必须只在那次调用期间生效），这是有界争用（另一个
+CreateProcess 会等这次创建完成），不是死锁。唯一同线程阻塞是 `VD_PinNow`（`ShowWindow`
+路径）：`VD_WaitReady` 最多自旋 500ms + `WaitForSingleObject(g_vdAck, 250)`，都远小于
+drain 的 3 秒预算。
 
 **半禁用的准确语义（阶段 2 失败 / drain 超时）**
 
-| 类别 | 行为 |
-|---|---|
-| 11 个包装 hook（`ShowWindow`、`CreateProcessW`、`SetWindowPos`、`SetWindowLongW/A`、`SetWindowLongPtrW/A`、`MoveWindow`、`SwitchDesktop`、`ShowCursor`、`SetCursor`） | 入口查 `g_coreDisabled`/`g_unloading` → **直通** |
-| 22 个未包装（`ShowWindowAsync`、`CreateProcessA`、`WinExec`、`ExitWindowsEx`、`ShellExecuteA/W` 等） | **继续跑完整逻辑**（关机/外壳类还要看 `SH_On` 守卫开关） |
+33 个 dispatcher 里的分布（P3 起）：
 
-也就是说「重载失败」≠「hook 停了」：窗口保护可能已失效，但关机/进程创建拦截仍在。
-UI、日志、README 都按这个描述，不写“已直通”。`g_coreDead` 是该状态下的终态。
+| 类别 | 数量 | disabled 期行为 |
+|---|---|---|
+| `HOOK_ENTER` 包装 | 11 | 入口查 `g_coreDisabled` → **直通** |
+| inline hook 里原先没包装的 | 6 | 显式查 `CORE_DISABLED()` → **直通** |
+| 窗口状态/焦点（`SetWindowPlacement`、`CreateWindowExW`、`SetForegroundWindow`、`BringWindowToTop`、`SetActiveWindow`、`SetWindowsHookExA/W`） | 7 | 跑完整逻辑 |
+| 抓屏守卫（`BitBlt`、`CreateDCW`、`CreateDCA`、`GetDC`、`GetWindowDC`） | 5 | 跑完整逻辑 |
+| 关机入口（`InitiateSystemShutdownA/W/ExA/ExW`） | 4 | 跑完整逻辑（守卫开时仍拦） |
+
+也就是说「重载失败」≠「hook 停了」：窗口显示、进程创建、外壳、`ExitWindowsEx` 都直通了，
+但**抓屏冻结仍在**、`InitiateSystemShutdown*` 仍被拦。UI、日志、README 都按这个描述，
+不写“已直通”。`g_coreDead` 是该状态下的终态。
 
 **UI 入口（主程序 / 托盘）**
 
@@ -1168,7 +1181,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1 -NoBuild -
 ```
 
 `run_all.ps1` 先构建 `all / fakecores / testcores / corehost / uitest / wmodetest /
-screentest / shuttest`，然后依次跑 10 个套件：
+screentest / shuttest`，然后依次跑 11 个套件：
 
 | 套件 | 覆盖 |
 |---|---|
@@ -1180,6 +1193,7 @@ screentest / shuttest`，然后依次跑 10 个套件：
 | screenguard | 冻结首帧 |
 | foreign_fix | 跨进程兜底不卡死 enforcer |
 | shutguard | 关机/重启拦截 |
+| reentry | 阶段 2 失败后 6 个 inline hook 直通（半禁用期的 hook 语义） |
 | version | P3 自检：current / OLD+「重载」/ 磁盘重写不给建议 |
 | multi | 4 进程一次点击、管道并发、慢 reload 期间的状态检查、崩溃隔离 |
 

@@ -49,7 +49,7 @@ make.bat fakecores | testcores | corehost   :: 失败注入用的假/坏 Core、
 make.bat clean | rebuild | check
 ```
 
-跑全部回归（构建 + 10 个套件，任一失败退出码非 0）：
+跑全部回归（构建 + 11 个套件，任一失败退出码非 0）：
 
 ```bat
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1
@@ -247,25 +247,31 @@ enabled=1
 
 `before_unload` 返回 1 之后才置 `g_unloading=1`，然后 Loader 做权威 drain（3 秒）。
 如果这时还有调用卡在 hook 里（Core 撒谎：返回 1 却没停线程），Loader 保持 `g_unloading=1`、
-置 `g_coreDead=1`、**不卸载**，进程就停在半禁用状态：
+置 `g_coreDead=1`、**不卸载**，进程就停在半禁用状态。33 个 dispatcher 里：
 
-- **直通**（11 个包装 hook 入口查 `g_coreDisabled`）：窗口显示类、`CreateProcessW` 等；
-- **仍跑完整逻辑**（不查）：`ShowWindowAsync`、`CreateProcessA`、`WinExec`、
-  `ExitWindowsEx`、`ShellExecuteA/W`（关机/外壳类只在关机守卫开启时真正拦截），
-  以及 25 个 IAT-only 里没有包装的那部分。
+| 类别 | 数量 | disabled 期行为 |
+|---|---|---|
+| 11 个 `HOOK_ENTER` 包装 | 11 | 直通 |
+| 6 个 inline hook（`ShowWindowAsync`、`CreateProcessA`、`WinExec`、`ExitWindowsEx`、`ShellExecuteA/W`） | 6 | 直通（P3 起显式查 `g_coreDisabled`） |
+| 窗口状态/焦点：`SetWindowPlacement`、`CreateWindowExW`、`SetForegroundWindow`、`BringWindowToTop`、`SetActiveWindow`、`SetWindowsHookExA/W` | 7 | 跑完整逻辑 |
+| 抓屏守卫：`BitBlt`、`CreateDCW`、`CreateDCA`、`GetDC`、`GetWindowDC` | 5 | 跑完整逻辑 |
+| 关机入口：`InitiateSystemShutdownA/W/ExA/ExW` | 4 | 跑完整逻辑（关机守卫开时仍拦） |
 
-所以「重载失败」不等于「hook 停了」：窗口保护可能没了，但关机拦截还在。日志里会打
+所以「重载失败」不等于「hook 停了」：窗口显示、进程创建、外壳、`ExitWindowsEx` 都直通了，
+但**抓屏冻结仍在**、`InitiateSystemShutdown*` 仍被拦。日志会打
 `process disabled (partially bypassed)` + 具体说明。`g_coreDead` 是终态（进程全局、
 没有重置路径），只能**重启该课堂进程**或重新注入。
 
-> 为什么是 11 个包装 / 22 个不包装：8 个 inline hook 里只有 `ShowWindow`、
-> `CreateProcessW` 走 `HOOK_ENTER` 的 `g_coreDisabled` 检查，另外 6 个只碰模块全局和
-> `bypass_shut.ini`，重入不会碰到 Worker 资源（`g_stateView` / `g_sub` 等），所以不需要
-> 检查。这也是 `before_unload` 里**不调用任何 hook 函数**的原因——它只用
-> `real_SetWindowLongPtrW`、`StateClose` 这类裸 Win32。
+> 那 16 个不进 `g_coreDisabled` 检查的入口都只读模块全局 / `bypass_shut.ini`，不碰
+> `StateClose` 释放过的 `g_stateView` / `g_stateMap` / `g_stateEvent`（机械检查覆盖）。
+> 给 6 个 inline hook 加检查的原因是：**inline hook 的调用会重入 Core**，而它们当时没有
+> 任何 gate；剩下 16 个只走 IAT，且只读全局，保留拦截更安全（关机拦截、抓屏冻结）。
 
-> 另外一条不对称：Loader 故意**不 patch Core 模块自己的 IAT**。Core 内部调 25 个
-> IAT-only 函数直接走原函数（不会重入 dispatcher），只有 8 个 inline hook 会重入。
+> `before_unload` 里**不调用任何 hook 函数**——它只用 `real_SetWindowLongPtrW`、
+> `StateClose` 这类裸 Win32，所以上面这张表不影响卸载时序。
+
+> 另外一条不对称：Loader 故意**不 patch Core 模块自己的 IAT**。Core 内部调 IAT-only
+> 函数直接走原函数（不会重入 dispatcher），只有 8 个 inline hook 会重入。
 
 #### 回退
 
