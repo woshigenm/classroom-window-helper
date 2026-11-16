@@ -45,14 +45,20 @@ make.bat clean | rebuild | check
 ```
 
 - 工具链：32 位 `i686-w64-mingw32-gcc`（课堂软件全是 32 位，主程序也用 32 位编），
-  自动探测 RedPanda-Cpp / `C:\mingw32`。
+  `make.bat` / `Makefile` 自动探测 RedPanda-Cpp 与 `C:\mingw32`；直接
+  `mingw32-make` 也能编（Makefile 自己把工具链目录导出到 PATH，gcc 才找得到
+  `cc1 / as / ld / collect2`）。
 - DLL 必须 `-static -static-libgcc`（脚本已带），否则目标进程 `LoadLibraryW` 返回 0。
+- **编码**：源码和文档统一 UTF-8（无 BOM），`.bat` 保持纯 ASCII（cmd 按 OEM 代码页解析）。
+  用 GBK/ANSI 另存会把中文注释和日志文案变成问号，编译器不报错；仓库根的
+  `.editorconfig` 已经把编码固定住，编辑器会自己遵守。
 - `bin\` 在 `.gitignore` 里；要随仓库发布就用 GitHub Release 附件。
 
 ## 4. 目录结构
 
 ```
 classroom-window-helper\
+├─ .editorconfig                编码 / 换行约定（UTF-8，.bat 纯 ASCII）
 ├─ make.bat  Makefile          构建入口（工具链自动探测）
 ├─ src\                        交付组件源码
 │   ├─ bypass.c                主程序：界面 / 托盘 / 注入调度

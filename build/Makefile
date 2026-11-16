@@ -1,15 +1,18 @@
 # ============================================================
-#  Convenience wrapper - run GNU Make from build\ as well.
-#  The real build rules are in ..\Makefile.
+#  Convenience wrapper: run the build from build\ as well.
 #
 #     cd build
-#     "C:\Program Files\RedPanda-Cpp\mingw64\bin\mingw32-make.exe"
+#     mingw32-make            (or make.bat, which also finds the toolchain)
+#
+#  Everything is delegated to ..\make.bat: it discovers the toolchain and
+#  exports it to PATH (gcc needs cc1 / as / ld / collect2 from its own bin
+#  directory, which is why a bare "gcc -o" fails on a fresh machine).
+#  No build logic here on purpose, so the target list cannot go stale.
 # ============================================================
 
-# 不用 $(MAKE)：cmd 传进来的 argv[0] 可能自带双引号，再包一层会变成 ""path""。
-MAKE_EXE := C:/Program Files/RedPanda-Cpp/mingw64/bin/mingw32-make.exe
+TARGETS := all bypass hook32 lpe lpebroker test wmodetest vdtest clean rebuild check
 
-.PHONY: all bypass hook32 test clean rebuild check
+.PHONY: $(TARGETS)
 
-all bypass hook32 test clean rebuild check:
-	"$(MAKE_EXE)" -C .. $@
+$(TARGETS):
+	@cmd /c "..\make.bat $@"

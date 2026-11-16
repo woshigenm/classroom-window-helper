@@ -1,0 +1,31 @@
+root = true
+
+# 统一 UTF-8（无 BOM）。源码里的中文是 UTF-8 字面量，运行时用
+# MultiByteToWideChar(CP_UTF8) 转成 ACP —— 用 GBK/ANSI 保存会把注释和
+# 日志文案整段变成问号，而且编译器不报错，只能靠人肉发现。
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{c,h,inc}]
+indent_size = 4
+
+# cmd.exe 按 OEM 代码页解析 .bat：这里保持纯 ASCII 才不会有乱码，
+# 需要中文说明请写进 .md / 注释用的 C 文件。
+[*.bat]
+end_of_line = crlf
+
+# PowerShell 5.1 只有在带 BOM 时才按 UTF-8 读脚本；这些脚本目前是纯 ASCII，
+# 一旦要加中文，请存成「UTF-8 with BOM」。
+[*.ps1]
+end_of_line = crlf
+
+[*.md]
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab

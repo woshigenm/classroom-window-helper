@@ -1,40 +1,47 @@
 # ============================================================
-#  bypass_tool - GNU Make build
+#  classroom-window-helper - GNU Make build
 #
 #  Usage (make is not on PATH by default):
-#     make.bat                  -> all (bypass + hook32)
-#     make.bat bypass
-#     make.bat hook32
-#     make.bat test
+#     make.bat                  -> all (bypass + hook32 + lpe)
+#     make.bat bypass / hook32 / lpe
+#     make.bat test / wmodetest / vdtest
 #     make.bat clean / rebuild / check
 #
 #  or add the toolchain to PATH first:
-#     set PATH=C:\Program Files\RedPanda-Cpp\mingw64\bin;%PATH%
+#     set PATH=C:\mingw32\bin;%PATH%
 #     mingw32-make
 #
 #  All compiled outputs go to bin\ (gitignored).
 #  The .bat scripts in build\ remain supported and are the reference.
-#  Toolchain (as found on the target machine):
-#     32-bit  C:\Program Files (x86)\RedPanda-Cpp\mingw32\bin (i686-w64-mingw32-gcc 15.3.0)
-#     64-bit  optional; when absent the main program is built 32-bit as well
-#             (the delivered bin\bypass.exe is x86 anyway).
-#  Override explicitly when you have a 64-bit gcc:
-#     make.bat CC64="C:/path/to/x86_64-w64-mingw32-gcc.exe"
+#  Toolchain: 32-bit i686-w64-mingw32-gcc.  It is auto-detected below (same
+#  order as make.bat); override with MINGW32=... or make.bat CC32=...
+#  64-bit gcc is optional: without it the main program is built 32-bit too
+#  (the delivered bin\bypass.exe is x86 anyway).
 # ============================================================
 
-MINGW32 := C:/Program Files (x86)/RedPanda-Cpp/mingw32/bin
+# 32-bit toolchain: first existing candidate wins (keep in sync with make.bat).
+MINGW32 := $(shell if exist "C:\Program Files (x86)\RedPanda-Cpp\mingw32\bin\i686-w64-mingw32-gcc.exe" echo C:/Program Files (x86)/RedPanda-Cpp/mingw32/bin)
+ifeq ($(strip $(MINGW32)),)
+MINGW32 := $(shell if exist "C:\Program Files\RedPanda-Cpp\mingw32\bin\i686-w64-mingw32-gcc.exe" echo C:/Program Files/RedPanda-Cpp/mingw32/bin)
+endif
+ifeq ($(strip $(MINGW32)),)
+MINGW32 := $(shell if exist "C:\mingw32\bin\i686-w64-mingw32-gcc.exe" echo C:/mingw32/bin)
+endif
+ifeq ($(strip $(MINGW32)),)
+$(error 32-bit MinGW not found - run make.bat, or pass MINGW32=<bin dir>)
+endif
 
 CC32  := $(MINGW32)/i686-w64-mingw32-gcc.exe
 CC64  ?= $(CC32)
-MAKE  := $(MINGW32)/mingw32-make.exe
 BIN   := bin
 
-# WalletService auto-elevation payload (see lpe\README.txt):
+# WalletService auto-elevation payload (see lpe\README.md):
 #   bin\lpe\ = trigger.ps1 + vendored PoC binaries + shell_broker.exe (ours)
 LPEOUT := $(BIN)/lpe
 LPEPAY := lpe/payload
 
-# gcc ???????????? PATH ????????? cc1/as/ld/collect2???.bat ?????????????????? set PATH??????
+# gcc 还要在 PATH 里找到自己的 cc1 / as / ld / collect2，所以工具链目录必须
+# 导出成 PATH —— 直接用 mingw32-make 跑（不经 make.bat）时尤其重要。
 export PATH := $(MINGW32);$(PATH)
 
 # 64-bit main program (GUI subsystem)
@@ -48,7 +55,7 @@ DLLLIBS  := -lpsapi -lole32 -ladvapi32
 
 .PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest clean rebuild check
 
-# ?????????????????? + DLL + ?????????????????????????????????
+# 主程序 + DLL + 注入器 + 自动提权载荷（自测程序按需单独编）
 all: bypass hook32 lpe
 
 bypass: $(BIN)/bypass.exe
@@ -106,8 +113,8 @@ $(LPEOUT)/shell_broker.exe: src/lpe_broker.c | $(BIN)
 
 # ---- housekeeping --------------------------------------------
 
-# ??? clean ????????? bin\ ?????????????????????????????????????????????
-#    ????????? `make.bat all` ?????????????????????????????????????????????????????? clean???
+# 只删 bin\ 里的编译产物（三个交付文件也在内），不碰运行期配置和日志。
+#    想恢复就重新 `make.bat all`；正在运行的 bypass.exe 会锁住文件，先退出。
 clean:
 	-@del /q "$(BIN)\bypass.exe" "$(BIN)\bypass_hook32.dll" "$(BIN)\inject32.exe" 2>nul
 	-@del /q "$(BIN)\hooktest32.exe" 2>nul
@@ -118,7 +125,7 @@ clean:
 
 rebuild: clean all
 
-# ??????????????????????????????????????????????????????
+# 打印两个工具链版本，顺便确认上面的路径探测是否命中。
 check:
 	@"$(CC64)" --version | findstr /i "gcc.exe"
 	@"$(CC32)" --version | findstr /i "gcc.exe"
