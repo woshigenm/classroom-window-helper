@@ -780,6 +780,12 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
 - **Loader 侧权威 drain**：`before_unload` 返回 1、`g_unloading=1` 之后，Loader
   再等共享计数归零（最多 3s）才 `FreeLibrary`；超时返回 `err hooks-busy`
   且不卸载。
+- **★ 新 Core 发布后必须把 `g_unloading` 复位成 0**（`LoadCoreFrom` 里、`g_table`
+  指向新 Core 之后）。这条漏了会造成：重载"成功"但**所有** dispatcher / inline hook
+  永久直通，只有 Core 的 Worker 还在工作。真实客户端上的现象：`SwitchDesktop` 不再被
+  拦（桌面被切到 `NetTeachingDesktop`）、`lpDesktop` 不再被清、新窗口不再强制 window
+  mode、`SetWindowsHookEx` 不再被抑制（输入可能被锁）。`tests\reload_hooks_test.ps1`
+  就是这条的回归（重载前后各探一次 `WH_MOUSE_LL`：必须都被抑制、返回 `(HHOOK)1`）。
 - **异常过滤器链上移 Loader**：`LoaderUefForward` 是永不更新的转发器；
   `uef_push(CoreUef)` 压栈并只在第一次 `SetUnhandledExceptionFilter(转发器)`，
   `uef_pop()` 弹栈、栈空时恢复系统原过滤器。Core 的 `CrashFilter` 只记录并返回
@@ -1202,7 +1208,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1 -NoBuild -
 ```
 
 `run_all.ps1` 先构建 `all / fakecores / testcores / corehost / uitest / wmodetest /
-screentest / shuttest`，然后依次跑 11 个套件：
+screentest / shuttest`，然后依次跑 12 个套件：
 
 | 套件 | 覆盖 |
 |---|---|
@@ -1215,6 +1221,7 @@ screentest / shuttest`，然后依次跑 11 个套件：
 | foreign_fix | 跨进程兜底不卡死 enforcer |
 | shutguard | 关机/重启拦截 |
 | reentry | 阶段 2 失败后 6 个 inline hook 直通（半禁用期的 hook 语义） |
+| reload_hooks | 重载成功后 hook 立即恢复（g_unloading 复位；WH_MOUSE_LL 探针） |
 | version | P3 自检：current / OLD+「重载」/ 磁盘重写不给建议 |
 | multi | 4 进程一次点击、管道并发、慢 reload 期间的状态检查、崩溃隔离 |
 

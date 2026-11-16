@@ -115,6 +115,13 @@ Run-Suite 'reentry (disabled Core passthrough)' {
         Out-Host
 }
 
+# After a successful reload every dispatcher/inline hook must be live again
+# (g_unloading reset).  Probes WH_MOUSE_LL before/after the reload.
+Run-Suite 'hooks live after reload' {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'reload_hooks_test.ps1') |
+        Out-Host
+}
+
 Run-Suite 'version self-check (content hash)' {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'version_test.ps1') |
         Out-Host

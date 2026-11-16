@@ -49,7 +49,7 @@ make.bat fakecores | testcores | corehost   :: 失败注入用的假/坏 Core、
 make.bat clean | rebuild | check
 ```
 
-跑全部回归（构建 + 11 个套件，任一失败退出码非 0）：
+跑全部回归（构建 + 12 个套件，任一失败退出码非 0）：
 
 ```bat
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1

@@ -60,6 +60,47 @@ static LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l)
 }
 
 static const char* g_probeTimes;
+static const char* g_probeLLTimes;
+
+/* P3/reload test: at the given millisecond offsets install a WH_MOUSE_LL hook.
+   While the Core is live it suppresses SetWindowsHookExW and returns
+   (HHOOK)0x1; if the Loader's dispatchers are stuck in drain passthrough
+   (the g_unloading / reload bug) the real hook is installed and a real handle
+   comes back.  The proc only calls CallNextHookEx, so even a real install keeps
+   the mouse working; it is unhooked immediately. */
+static LRESULT CALLBACK ProbeLLProc(int code, WPARAM w, LPARAM l)
+{
+    return CallNextHookEx(NULL, code, w, l);
+}
+
+static DWORD WINAPI ProbeLLThread(LPVOID p)
+{
+    char  times[128];
+    char* s;
+    DWORD t0 = GetTickCount();
+
+    (void)p;
+    _snprintf(times, sizeof(times) - 1, "%s", g_probeLLTimes ? g_probeLLTimes : "");
+    times[sizeof(times) - 1] = '\0';
+
+    s = times;
+    while (s && *s) {
+        char* comma = strchr(s, ',');
+        DWORD at = (DWORD)atoi(s);
+
+        if (comma) *comma = '\0';
+        while ((DWORD)(GetTickCount() - t0) < at) Sleep(20);
+        {
+            HHOOK hk = SetWindowsHookExW(WH_MOUSE_LL, ProbeLLProc, NULL, 0);
+
+            printf("probe llhook t=%lu ret=%p\n", (unsigned long)at, (void*)hk);
+            fflush(stdout);
+            if (hk && hk != (HHOOK)(ULONG_PTR)0x1) UnhookWindowsHookEx(hk);
+        }
+        s = comma ? (comma + 1) : NULL;
+    }
+    return 0;
+}
 
 /* P3/reentry test: at the given millisecond offsets call WinExec with a
    shutdown-looking but *nonexistent* executable:
@@ -117,6 +158,7 @@ int main(int argc, char** argv)
         else if (!_stricmp(argv[i], "--window")) makeWindow = 1;
         else if (!_stricmp(argv[i], "--hammer-show")) hammerShow = 1;
         else if (!_stricmp(argv[i], "--probe-winexec") && i + 1 < argc) g_probeTimes = argv[++i];
+        else if (!_stricmp(argv[i], "--probe-llhook") && i + 1 < argc) g_probeLLTimes = argv[++i];
         else if (!injector) injector = argv[i];
     }
 
@@ -185,6 +227,10 @@ int main(int argc, char** argv)
 
     if (g_probeTimes && g_probeTimes[0]) {
         HANDLE th = CreateThread(NULL, 0, ProbeThread, NULL, 0, NULL);
+        if (th) CloseHandle(th);
+    }
+    if (g_probeLLTimes && g_probeLLTimes[0]) {
+        HANDLE th = CreateThread(NULL, 0, ProbeLLThread, NULL, 0, NULL);
         if (th) CloseHandle(th);
     }
 

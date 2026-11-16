@@ -1446,6 +1446,13 @@ static BOOL LoadCoreFrom(const char* src, char* outPath, size_t outCap,
 
     InterlockedExchangePointer((PVOID volatile*)&g_table, (PVOID)&g_core);
 
+    /* ★ 新 Core 已发布: 必须解除 drain 期间的直通。
+       少了这一步, 重载成功后**所有** dispatcher / inline hook 永久直通
+       (只有 Core 的 Worker 还在工作) —— 真实客户端上的现象是: SwitchDesktop
+       不再被拦(桌面被切到 NetTeachingDesktop)、lpDesktop 不再被清、新窗口
+       不再强制 window mode、SetWindowsHookEx 不再被抑制。 */
+    InterlockedExchange(&g_unloading, 0);
+
     if (outPath && outCap) {
         _snprintf(outPath, outCap - 1, "%s", cachePath);
         outPath[outCap - 1] = '\0';
