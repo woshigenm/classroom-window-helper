@@ -758,11 +758,24 @@ P2b 测试矩阵：正常重载 / Worker 卡住（`SuspendThread`）/ `g_inHookC
   `caption pump started`、`vd: thread started`）都在 `before_unload` 之前出现，
   重载后 `still mapped` 不报错、新 Core 加载、宿主存活。
 
-P2b-2 剩余：其余 22 个 hook 的守卫（或把 `g_inHookCount` 上移到 Loader 的
-33 个 dispatcher，按构造覆盖全部）、`RemoveWindowSubclass`、`KillTimer`、
-`UnregisterClass`、`StateClose`（共享内存句柄）。`g_prevUef` 建议改由 Loader
-持有（`HrHost` 加 `uef_push`/`uef_pop`，ABI 升 3），新 Core 重新注册，旧 Core
-的过滤器在卸载前摘掉。
+P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
+`StateClose`（共享内存句柄）。`g_prevUef` 已上移。
+
+**P2b-2 已实现的部分（ABI 3）**：
+
+- **`g_inHookCount` 上移 Loader**：33 个 dispatcher 统一
+  `g_unloading ? 直通 : 计数 + 调用 Core + 减计数`。`HrHost.in_hook_count`
+  指向 Loader 的计数，`before_unload` 读的就是“所有 hook 都不在执行”。
+  `g_unloading` 从 `before_unload` 前一直保持到新 Core 发布，期间的调用全部直通。
+- **Loader 侧权威 drain**：`before_unload` 返回 1 后，Loader 再等
+  `g_inHookCount == 0`（最多 3s）才 `FreeLibrary`；超时返回 `err hooks-busy`
+  且不卸载。
+- **异常过滤器链上移 Loader**：`LoaderUefForward` 是永不更新的转发器；
+  `uef_push(CoreUef)` 压栈并只在第一次 `SetUnhandledExceptionFilter(转发器)`，
+  `uef_pop()` 弹栈、栈空时恢复系统原过滤器。Core 的 `CrashFilter` 只记录并返回
+  `EXCEPTION_CONTINUE_SEARCH`，不再持有“前一个”指针。
+- 测试补了 **“重载后 CoreUef 仍被调用”**：宿主在重载后 `RaiseException`，日志里
+  必须出现该 pid 的 `!! crash`（如果链还指向已卸载的旧 Core，就不会有这行）。
 
 ---
 

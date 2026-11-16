@@ -31,7 +31,7 @@
 
 #include <windows.h>
 
-#define HR_ABI_VERSION   2       /* v2: blob_put/blob_get added */
+#define HR_ABI_VERSION   3       /* v3: in_hook_count + uef_push/pop */
 #define HR_CORE_NAME     "bypass_hook_core.dll"
 #define HR_LOADER_NAME   "bypass_hook32.dll"
 #define HR_CORE_INIT     "Core_Init"
@@ -141,6 +141,11 @@ typedef struct HrReals {
 typedef int (*HR_BLOB_PUT)(const char* key, const void* data, unsigned int size);
 typedef int (*HR_BLOB_GET)(const char* key, void* out, unsigned int* size);
 
+/* P2b: the Loader owns the hook refcount and the UnhandledExceptionFilter
+   chain, so a Core can be unloaded without leaving pointers into it. */
+typedef LPTOP_LEVEL_EXCEPTION_FILTER (*HR_UEF_PUSH_FN)(LPTOP_LEVEL_EXCEPTION_FILTER);
+typedef LPTOP_LEVEL_EXCEPTION_FILTER (*HR_UEF_POP_FN)(void);
+
 typedef struct HrHost {
     unsigned int abi_version;
     unsigned int size;
@@ -150,6 +155,9 @@ typedef struct HrHost {
     HR_PATCH_FN  patch_modules;
     HR_BLOB_PUT  blob_put;
     HR_BLOB_GET  blob_get;
+    volatile LONG* in_hook_count;   /* Loader's count of all dispatcher calls */
+    HR_UEF_PUSH_FN uef_push;
+    HR_UEF_POP_FN  uef_pop;
     HrReals      real;
 } HrHost;
 

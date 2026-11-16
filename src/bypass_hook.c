@@ -4172,7 +4172,8 @@ static void ComputeSmallRect(void)
    有它就能判断崩的是不是我们的 DLL、崩在哪个地址。
    ★ 必须继续调用宿主原来的 UnhandledExceptionFilter: 直接覆盖会让应用自己的
      崩溃上报/清理逻辑失效 (SDL/渲染器可能自己设过)。 */
-static LPTOP_LEVEL_EXCEPTION_FILTER g_prevUef;
+/* (P2b) 异常过滤器链由 Loader 持有: Core 通过 host->uef_push/uef_pop 注册,
+   卸载后不会留下指向本模块的“前一个”指针。 */
 
 /* 崩溃路径专用日志: 绝不能走 HookLog —— g_logCs 是非递归锁, 而异常很可能
    正好发生在"已经持有它"的那个线程里 (WriteFile/_vsnprintf 里 AV)。那时再去
@@ -4212,8 +4213,8 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
         line[sizeof(line) - 1] = '\0';
         CrashLog(line);
     }
-    if (g_prevUef && g_prevUef != CrashFilter)
-        return g_prevUef(ep);
+    /* 链由 Loader 的 UEF 转发器负责 (P2b): Core 卸载后不会再留下指向本模块的
+       “前一个过滤器”指针。这里只记录, 然后让转发器继续往下走。 */
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -4425,16 +4426,19 @@ static void FillHookTable(HrHooks* h)
    Phase 1 is read-only: any failure returns 0 without touching anything.
    Phase 2 is irreversible: disable the Core, stop its threads, then return 1.
    The Loader only FreeLibrary()s after 1. */
+#define HR_HOOKS_RUNNING() \
+    ((g_host && g_host->in_hook_count) ? *g_host->in_hook_count : 0)
+
 static int __cdecl Core_BeforeUnload(void)
 {
     DWORD w;
 
     /* ---- phase 1: read-only checks ---- */
-    if (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0) {
+    if (HR_HOOKS_RUNNING() > 0) {
         Sleep(10);
-        if (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0) {
-            HookLog("[Core] unload refused: %ld guarded hooks still executing",
-                    (long)InterlockedCompareExchange(&g_inHookCount, 0, 0));
+        if (HR_HOOKS_RUNNING() > 0) {
+            HookLog("[Core] unload refused: %ld hooks still executing",
+                    (long)HR_HOOKS_RUNNING());
             return 0;
         }
     }
@@ -4477,17 +4481,21 @@ static int __cdecl Core_BeforeUnload(void)
     }
 
     /* ★ 阶段 1 通过到 g_coreDisabled=1 之间可能刚进来一个 hook:
-       线程停完后必须再等一次引用计数归零 (P2b-1 补的竞态窗口)。 */
+       线程停完后必须再等一次引用计数归零 (P2b-1 补的竞态窗口)。
+       P2b-2: 计数在 Loader 的 33 个 dispatcher 里, 覆盖全部 hook。 */
     {
         int i;
-        for (i = 0; i < 50 && InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0; i++)
+        for (i = 0; i < 50 && HR_HOOKS_RUNNING() > 0; i++)
             Sleep(1);
-        if (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0) {
+        if (HR_HOOKS_RUNNING() > 0) {
             HookLog("[Core] unload failed: %ld hooks still executing after thread stop",
-                    (long)InterlockedCompareExchange(&g_inHookCount, 0, 0));
+                    (long)HR_HOOKS_RUNNING());
             return 0;
         }
     }
+
+    /* 异常过滤器链: 摘掉本 Core 的 CrashFilter (Loader 持有转发器) */
+    if (g_host && g_host->uef_pop) g_host->uef_pop();
 
     HookLog("[Core] before_unload: worker + caption + vd stopped (P2b-1)");
     return 1;
@@ -4532,8 +4540,8 @@ __declspec(dllexport) int __cdecl Core_Init(const HrHost* host, HrCoreApi* api)
     api->before_unload = Core_BeforeUnload;   /* P2b-1 */
     FillHookTable(&api->hooks);
 
-    /* 崩溃取证 (只记录, 继续调用宿主原来的过滤器) */
-    g_prevUef = SetUnhandledExceptionFilter(CrashFilter);
+    /* 崩溃取证: 注册到 Loader 的过滤器链 (P2b); 旧 Core 卸载时 uef_pop */
+    if (g_host->uef_push) g_host->uef_push(CrashFilter);
 
     HookLog("[build] core=%s built=%s %s pid=%lu",
             HR_CORE_NAME, __DATE__, __TIME__, (unsigned long)g_pid);

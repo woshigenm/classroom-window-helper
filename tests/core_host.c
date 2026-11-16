@@ -46,12 +46,14 @@ int main(int argc, char** argv)
     const char* dll = NULL;
     const char* injector = NULL;
     int seconds = 30;
+    int crashAfter = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
         if (!_stricmp(argv[i], "--pidfile") && i + 1 < argc) pidfile = argv[++i];
         else if (!_stricmp(argv[i], "--inject") && i + 1 < argc) dll = argv[++i];
         else if (!_stricmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
+        else if (!_stricmp(argv[i], "--crash-after") && i + 1 < argc) crashAfter = atoi(argv[++i]);
         else if (!injector) injector = argv[i];
     }
 
@@ -81,6 +83,12 @@ int main(int argc, char** argv)
 
     printf("pid=%lu ready\n", (unsigned long)GetCurrentProcessId());
     fflush(stdout);
+
+    if (crashAfter > 0) {
+        Sleep((DWORD)crashAfter);
+        /* 未处理异常: 走 Loader 的 UEF 转发器 -> Core 的 CrashFilter 记录 */
+        RaiseException(0xE0000001u, 0, 0, NULL);
+    }
 
     if (seconds < 1) seconds = 1;
     if (seconds > 300) seconds = 300;

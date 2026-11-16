@@ -62,6 +62,8 @@ static struct {
 } g_cur;
 static volatile LONG  g_coreDead;   /* still-mapped detected: never reload again */
 static int            g_seq;
+static volatile LONG  g_inHookCount; /* all dispatcher calls (Loader-owned) */
+static volatile LONG  g_unloading;   /* dispatchers passthrough while draining */
 static CRITICAL_SECTION g_blobCs;
 static int            g_blobCsReady;
 
@@ -167,99 +169,183 @@ static const HrCoreApi* Tbl(void)
 
 static BOOL WINAPI L_SetWindowPos(HWND h, HWND a, int x, int y, int cx, int cy, UINT f)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SetWindowPos(h, a, x, y, cx, cy, f);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SetWindowPos(h, a, x, y, cx, cy, f);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetWindowPos ? real_SetWindowPos(h, a, x, y, cx, cy, f) : FALSE;
 }
 
 static LONG WINAPI L_SetWindowLongW(HWND h, int i, LONG v)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SetWindowLongW(h, i, v);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    LONG _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SetWindowLongW(h, i, v);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetWindowLongW ? real_SetWindowLongW(h, i, v) : 0;
 }
 
 static LONG WINAPI L_SetWindowLongA(HWND h, int i, LONG v)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SetWindowLongA(h, i, v);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    LONG _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SetWindowLongA(h, i, v);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetWindowLongA ? real_SetWindowLongA(h, i, v) : 0;
 }
 
 static LONG_PTR WINAPI L_SetWindowLongPtrW(HWND h, int i, LONG_PTR v)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SetWindowLongPtrW32(h, i, v);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    LONG_PTR _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SetWindowLongPtrW32(h, i, v);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetWindowLongPtrW ? real_SetWindowLongPtrW(h, i, v) : 0;
 }
 
 static LONG_PTR WINAPI L_SetWindowLongPtrA(HWND h, int i, LONG_PTR v)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SetWindowLongPtrA32(h, i, v);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    LONG_PTR _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SetWindowLongPtrA32(h, i, v);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetWindowLongPtrA ? real_SetWindowLongPtrA(h, i, v) : 0;
 }
 
 static BOOL WINAPI L_MoveWindow(HWND h, int x, int y, int cx, int cy, BOOL r)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.MoveWindow(h, x, y, cx, cy, r);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.MoveWindow(h, x, y, cx, cy, r);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_MoveWindow ? real_MoveWindow(h, x, y, cx, cy, r) : FALSE;
 }
 
 static BOOL WINAPI L_SetWindowPlacement(HWND h, const WINDOWPLACEMENT* wp)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SetWindowPlacement(h, wp);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SetWindowPlacement(h, wp);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetWindowPlacement ? real_SetWindowPlacement(h, wp) : FALSE;
 }
 
 static BOOL WINAPI L_ShowWindow(HWND h, int c)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.ShowWindow(h, c);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.ShowWindow(h, c);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_ShowWindow ? real_ShowWindow(h, c) : FALSE;
 }
 
 static BOOL WINAPI L_ShowWindowAsync(HWND h, int c)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.ShowWindowAsync(h, c);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.ShowWindowAsync(h, c);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_ShowWindowAsync ? real_ShowWindowAsync(h, c) : FALSE;
 }
 
 static int WINAPI L_ShowCursor(BOOL b)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.ShowCursor(b);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    int _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.ShowCursor(b);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_ShowCursor ? real_ShowCursor(b) : 0;
 }
 
 static HCURSOR WINAPI L_SetCursor(HCURSOR c)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SetCursor(c);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    HCURSOR _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SetCursor(c);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetCursor ? real_SetCursor(c) : NULL;
 }
 
 static BOOL WINAPI L_SwitchDesktop(HDESK d)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SwitchDesktop(d);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SwitchDesktop(d);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SwitchDesktop ? real_SwitchDesktop(d) : FALSE;
 }
 
 static HHOOK WINAPI L_SetWindowsHookExA(int id, HOOKPROC p, HINSTANCE m, DWORD t)
 {
-    const HrCoreApi* h = Tbl();
-    if (h) return h->hooks.SetWindowsHookExA(id, p, m, t);
+    const HrCoreApi* h = g_unloading ? NULL : Tbl();
+    HHOOK _hr;
+    if (h) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = h->hooks.SetWindowsHookExA(id, p, m, t);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetWindowsHookExA ? real_SetWindowsHookExA(id, p, m, t) : NULL;
 }
 
 static HHOOK WINAPI L_SetWindowsHookExW(int id, HOOKPROC p, HINSTANCE m, DWORD t)
 {
-    const HrCoreApi* h = Tbl();
-    if (h) return h->hooks.SetWindowsHookExW(id, p, m, t);
+    const HrCoreApi* h = g_unloading ? NULL : Tbl();
+    HHOOK _hr;
+    if (h) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = h->hooks.SetWindowsHookExW(id, p, m, t);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetWindowsHookExW ? real_SetWindowsHookExW(id, p, m, t) : NULL;
 }
 
@@ -267,38 +353,68 @@ static HWND WINAPI L_CreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR name, DWORD 
                                      int x, int y, int w, int h, HWND parent,
                                      HMENU menu, HINSTANCE inst, LPVOID param)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.CreateWindowExW(ex, cls, name, st, x, y, w, h,
-                                           parent, menu, inst, param);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    HWND _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.CreateWindowExW(ex, cls, name, st, x, y, w, h,
+                                     parent, menu, inst, param);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_CreateWindowExW ? real_CreateWindowExW(ex, cls, name, st, x, y, w, h,
                                                        parent, menu, inst, param) : NULL;
 }
 
 static BOOL WINAPI L_SetForegroundWindow(HWND h)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SetForegroundWindow(h);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SetForegroundWindow(h);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetForegroundWindow ? real_SetForegroundWindow(h) : FALSE;
 }
 
 static BOOL WINAPI L_BringWindowToTop(HWND h)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.BringWindowToTop(h);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.BringWindowToTop(h);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_BringWindowToTop ? real_BringWindowToTop(h) : FALSE;
 }
 
 static HWND WINAPI L_SetActiveWindow(HWND h)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.SetActiveWindow(h);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    HWND _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.SetActiveWindow(h);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_SetActiveWindow ? real_SetActiveWindow(h) : NULL;
 }
 
 static BOOL WINAPI L_ExitWindowsEx(UINT f, DWORD r)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.ExitWindowsEx(f, r);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.ExitWindowsEx(f, r);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_ExitWindowsEx ? real_ExitWindowsEx(f, r) : FALSE;
 }
 
@@ -307,8 +423,14 @@ static BOOL WINAPI L_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBUTES
                                     LPVOID env, LPCSTR cwd, LPSTARTUPINFOA si,
                                     LPPROCESS_INFORMATION pi)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.CreateProcessA(app, cmd, pa, ta, inh, fl, env, cwd, si, pi);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.CreateProcessA(app, cmd, pa, ta, inh, fl, env, cwd, si, pi);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_CreateProcessA ? real_CreateProcessA(app, cmd, pa, ta, inh, fl,
                                                      env, cwd, si, pi) : FALSE;
 }
@@ -318,59 +440,107 @@ static BOOL WINAPI L_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUT
                                     LPVOID env, LPCWSTR cwd, LPSTARTUPINFOW si,
                                     LPPROCESS_INFORMATION pi)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.CreateProcessW(app, cmd, pa, ta, inh, fl, env, cwd, si, pi);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.CreateProcessW(app, cmd, pa, ta, inh, fl, env, cwd, si, pi);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_CreateProcessW ? real_CreateProcessW(app, cmd, pa, ta, inh, fl,
                                                      env, cwd, si, pi) : FALSE;
 }
 
 static UINT WINAPI L_WinExec(LPCSTR cmd, UINT show)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.WinExec(cmd, show);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    UINT _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.WinExec(cmd, show);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_WinExec ? real_WinExec(cmd, show) : 0;
 }
 
 static BOOL WINAPI L_BitBlt(HDC d, int x, int y, int w, int h, HDC s, int sx, int sy, DWORD rop)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.BitBlt(d, x, y, w, h, s, sx, sy, rop);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.BitBlt(d, x, y, w, h, s, sx, sy, rop);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_BitBlt ? real_BitBlt(d, x, y, w, h, s, sx, sy, rop) : FALSE;
 }
 
 static HDC WINAPI L_CreateDCW(LPCWSTR drv, LPCWSTR dev, LPCWSTR port, const DEVMODEW* dm)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.CreateDCW(drv, dev, port, dm);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    HDC _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.CreateDCW(drv, dev, port, dm);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_CreateDCW ? real_CreateDCW(drv, dev, port, dm) : NULL;
 }
 
 static HDC WINAPI L_CreateDCA(LPCSTR drv, LPCSTR dev, LPCSTR port, const DEVMODE* dm)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.CreateDCA(drv, dev, port, dm);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    HDC _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.CreateDCA(drv, dev, port, dm);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_CreateDCA ? real_CreateDCA(drv, dev, port, dm) : NULL;
 }
 
 static HDC WINAPI L_GetDC(HWND h)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.GetDC(h);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    HDC _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.GetDC(h);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_GetDC ? real_GetDC(h) : NULL;
 }
 
 static HDC WINAPI L_GetWindowDC(HWND h)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.GetWindowDC(h);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    HDC _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.GetWindowDC(h);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_GetWindowDC ? real_GetWindowDC(h) : NULL;
 }
 
 static HINSTANCE WINAPI L_ShellExecuteA(HWND o, LPCSTR op, LPCSTR file,
                                         LPCSTR args, LPCSTR dir, INT show)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.ShellExecuteA(o, op, file, args, dir, show);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    HINSTANCE _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.ShellExecuteA(o, op, file, args, dir, show);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_ShellExecuteA ? real_ShellExecuteA(o, op, file, args, dir, show)
                               : (HINSTANCE)0;
 }
@@ -378,24 +548,42 @@ static HINSTANCE WINAPI L_ShellExecuteA(HWND o, LPCSTR op, LPCSTR file,
 static HINSTANCE WINAPI L_ShellExecuteW(HWND o, LPCWSTR op, LPCWSTR file,
                                         LPCWSTR args, LPCWSTR dir, INT show)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.ShellExecuteW(o, op, file, args, dir, show);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    HINSTANCE _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.ShellExecuteW(o, op, file, args, dir, show);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_ShellExecuteW ? real_ShellExecuteW(o, op, file, args, dir, show)
                               : (HINSTANCE)0;
 }
 
 static BOOL WINAPI L_InitiateSystemShutdownA(LPSTR m, LPSTR msg, DWORD to, BOOL f, BOOL r)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.InitiateSystemShutdownA(m, msg, to, f, r);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.InitiateSystemShutdownA(m, msg, to, f, r);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_InitiateSystemShutdownA
            ? real_InitiateSystemShutdownA(m, msg, to, f, r) : FALSE;
 }
 
 static BOOL WINAPI L_InitiateSystemShutdownW(LPWSTR m, LPWSTR msg, DWORD to, BOOL f, BOOL r)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.InitiateSystemShutdownW(m, msg, to, f, r);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.InitiateSystemShutdownW(m, msg, to, f, r);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_InitiateSystemShutdownW
            ? real_InitiateSystemShutdownW(m, msg, to, f, r) : FALSE;
 }
@@ -403,8 +591,14 @@ static BOOL WINAPI L_InitiateSystemShutdownW(LPWSTR m, LPWSTR msg, DWORD to, BOO
 static BOOL WINAPI L_InitiateSystemShutdownExA(LPSTR m, LPSTR msg, DWORD to, BOOL f,
                                                BOOL r, DWORD why)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.InitiateSystemShutdownExA(m, msg, to, f, r, why);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.InitiateSystemShutdownExA(m, msg, to, f, r, why);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_InitiateSystemShutdownExA
            ? real_InitiateSystemShutdownExA(m, msg, to, f, r, why) : FALSE;
 }
@@ -412,8 +606,14 @@ static BOOL WINAPI L_InitiateSystemShutdownExA(LPSTR m, LPSTR msg, DWORD to, BOO
 static BOOL WINAPI L_InitiateSystemShutdownExW(LPWSTR m, LPWSTR msg, DWORD to, BOOL f,
                                                BOOL r, DWORD why)
 {
-    const HrCoreApi* t = Tbl();
-    if (t) return t->hooks.InitiateSystemShutdownExW(m, msg, to, f, r, why);
+    const HrCoreApi* t = g_unloading ? NULL : Tbl();
+    BOOL _hr;
+    if (t) {
+        InterlockedIncrement(&g_inHookCount);
+        _hr = t->hooks.InitiateSystemShutdownExW(m, msg, to, f, r, why);
+        InterlockedDecrement(&g_inHookCount);
+        return _hr;
+    }
     return real_InitiateSystemShutdownExW
            ? real_InitiateSystemShutdownExW(m, msg, to, f, r, why) : FALSE;
 }
@@ -945,6 +1145,75 @@ static void BlobRestore(void)
     LeaveCriticalSection(&g_blobCs);
 }
 
+/* ---------------- exception-filter chain (P2b, Loader-owned) ---------------- */
+
+#define HR_UEF_MAX 8
+static LPTOP_LEVEL_EXCEPTION_FILTER g_uefStack[HR_UEF_MAX];
+static volatile LONG                g_uefTop;
+static LPTOP_LEVEL_EXCEPTION_FILTER g_uefSystem;
+static CRITICAL_SECTION             g_uefCs;
+static int                          g_uefCsReady;
+
+/* Never updated (Loader code): safe to remain in the chain across Core
+   reloads.  Calls the Core filters newest-first, then returns SEARCH so the
+   system's previous filter still runs. */
+static LONG WINAPI LoaderUefForward(PEXCEPTION_POINTERS p)
+{
+    LONG i;
+
+    if (!g_uefCsReady) return EXCEPTION_CONTINUE_SEARCH;
+    EnterCriticalSection(&g_uefCs);
+    for (i = g_uefTop - 1; i >= 0; i--) {
+        LPTOP_LEVEL_EXCEPTION_FILTER f = g_uefStack[i];
+        LONG                         r;
+
+        if (!f || f == LoaderUefForward) continue;
+        r = f(p);
+        if (r != EXCEPTION_CONTINUE_SEARCH) {
+            LeaveCriticalSection(&g_uefCs);
+            return r;
+        }
+    }
+    LeaveCriticalSection(&g_uefCs);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LPTOP_LEVEL_EXCEPTION_FILTER UefPush(LPTOP_LEVEL_EXCEPTION_FILTER f)
+{
+    LONG i;
+
+    if (!g_uefCsReady || !f) return NULL;
+    EnterCriticalSection(&g_uefCs);
+    i = g_uefTop;
+    if (i >= HR_UEF_MAX) {
+        LeaveCriticalSection(&g_uefCs);
+        return NULL;
+    }
+    g_uefStack[i] = f;
+    InterlockedExchange(&g_uefTop, i + 1);
+    if (i == 0) g_uefSystem = SetUnhandledExceptionFilter(LoaderUefForward);
+    LeaveCriticalSection(&g_uefCs);
+    return LoaderUefForward;      /* Core does not chain through it directly */
+}
+
+static LPTOP_LEVEL_EXCEPTION_FILTER UefPop(void)
+{
+    LONG i;
+
+    if (!g_uefCsReady) return NULL;
+    EnterCriticalSection(&g_uefCs);
+    i = g_uefTop - 1;
+    if (i < 0) {
+        LeaveCriticalSection(&g_uefCs);
+        return NULL;
+    }
+    g_uefStack[i] = NULL;
+    InterlockedExchange(&g_uefTop, i);
+    if (i == 0) SetUnhandledExceptionFilter(g_uefSystem);
+    LeaveCriticalSection(&g_uefCs);
+    return g_uefSystem;
+}
+
 static void FillHost(HrHost* host)
 {
     memset(host, 0, sizeof(*host));
@@ -956,6 +1225,9 @@ static void FillHost(HrHost* host)
     host->patch_modules = PatchAllModules;
     host->blob_put    = BlobPut;
     host->blob_get    = BlobGet;
+    host->in_hook_count = &g_inHookCount;
+    host->uef_push    = UefPush;
+    host->uef_pop     = UefPop;
 
     host->real.SetWindowPos        = (void*)real_SetWindowPos;
     host->real.SetWindowLongW      = (void*)real_SetWindowLongW;
@@ -1122,11 +1394,31 @@ static int DoReload(int noRollback, char* resp, size_t cap)
     _snprintf(prev, sizeof(prev) - 1, "%s", g_cur.path);
     prev[sizeof(prev) - 1] = '\0';
 
+    /* all dispatchers become passthrough: the refcount can drain even if the
+       host keeps calling into the hooks while the Core shuts down */
+    InterlockedExchange(&g_unloading, 1);
+
     /* table still points at the old Core: let it drain while its hooks are
        still reachable (Core sets its own disabled flag internally). */
     if (!g_core.before_unload()) {
+        InterlockedExchange(&g_unloading, 0);
         _snprintf(resp, cap - 1, "err refused-by-core\n");
         return 0;
+    }
+
+    /* Loader-side drain: authoritative, covers all 33 dispatchers, not just
+       the hooks the Core knows about. */
+    {
+        int i;
+        for (i = 0; i < 3000 && InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0; i++)
+            Sleep(1);
+        if (InterlockedCompareExchange(&g_inHookCount, 0, 0) > 0) {
+            InterlockedExchange(&g_unloading, 0);
+            HookLog("[Loader] reload refused: %ld hooks still executing",
+                    (long)InterlockedCompareExchange(&g_inHookCount, 0, 0));
+            _snprintf(resp, cap - 1, "err hooks-busy\n");
+            return 0;
+        }
     }
 
     /* ★ 快照必须在 before_unload 成功**之后**拍: P2b 的 before_unload 会把
@@ -1290,6 +1582,9 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
 
         InitializeCriticalSection(&g_blobCs);
         g_blobCsReady = 1;
+
+        InitializeCriticalSection(&g_uefCs);
+        g_uefCsReady = 1;
 
         th = CreateThread(NULL, 0, Manager, NULL, 0, NULL);
         if (th) CloseHandle(th);

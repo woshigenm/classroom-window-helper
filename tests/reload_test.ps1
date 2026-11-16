@@ -187,5 +187,47 @@ try {
     Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
 }
 
-"VERDICT " + $(if ($pass) { 'PASS (cache/reload/rollback/still-mapped)' } else { 'FAIL' })
+# P2b-2: the UEF chain must call the NEW Core after a reload.  The host raises
+# an unhandled exception 6 s in (after a reload at ~1.5 s); the new Core's
+# CrashFilter must log "!! crash" for that pid.  A dangling chain would crash
+# without that line.
+$host3 = $null
+$pid3 = 0
+try {
+    Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
+    $from3 = if (Test-Path $log) { (Get-Item $log).Length } else { 0 }
+    $host3 = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
+        -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll',
+                        '--crash-after', '6000', '--seconds', '30')
+    for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    if (!(Test-Path $pidfile)) { throw "crash host did not write its pidfile" }
+    $pid3 = [int](Get-Content $pidfile -Raw).Trim()
+    Start-Sleep -Milliseconds 1500
+    $r = Send-Ctl $pid3 'reload'
+    "--- UEF chain after reload ---"
+    "  reload   : $r"
+    if ($r -notmatch '^ok seq=') { $pass = $false }
+
+    $deadline = (Get-Date).AddSeconds(12)
+    while ((Get-Date) -lt $deadline -and
+           (Get-Process -Id $pid3 -ErrorAction SilentlyContinue)) {
+        Start-Sleep -Milliseconds 200
+    }
+    $gone = -not (Get-Process -Id $pid3 -ErrorAction SilentlyContinue)
+    $lines = Log-New $from3
+    $crash = @($lines -split "`r?`n" |
+               Where-Object { $_ -match '!! crash' -and $_ -match "\[pid $pid3\]" })
+    "  crash    : " + $(if ($gone -and $crash.Count -gt 0) {
+                              'ok (logged by the new Core)' } else { 'FAIL' })
+    if (!($gone -and $crash.Count -gt 0)) { $pass = $false }
+} finally {
+    if ($host3 -and !$host3.HasExited) { Stop-Process -Id $host3.Id -Force -ErrorAction SilentlyContinue }
+    if ($pid3 -gt 0) {
+        $hp = Get-Process -Id $pid3 -ErrorAction SilentlyContinue
+        if ($hp) { Stop-Process -Id $hp.Id -Force -ErrorAction SilentlyContinue }
+    }
+    Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
+}
+
+"VERDICT " + $(if ($pass) { 'PASS (cache/reload/rollback/still-mapped/uef)' } else { 'FAIL' })
 if (-not $pass) { exit 1 }
