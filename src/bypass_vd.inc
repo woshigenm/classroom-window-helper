@@ -785,8 +785,10 @@ static HWND WINAPI Hook_CreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name
        再弹一个"系统将在 N 秒后关闭"只会让人以为工具坏了。 */
     if (hw && SH_SuppressDialog(hw, cls)) return hw;
     /* still hidden here (dwStyle has no WS_VISIBLE in ScreenRender.exe), so
-       moving it now means it can never flash on the wrong desktop */
-    if (hw && !g_disabled) VD_PinNow(hw, "create");
+       moving it now means it can never flash on the wrong desktop.
+       CORE_DISABLED: the dialog hider above is shutdown safety (keep it);
+       the desktop pinning is window logic (pass through). */
+    if (hw && !CORE_DISABLED() && !g_disabled) VD_PinNow(hw, "create");
     return hw;
 }
 
@@ -795,13 +797,14 @@ static BOOL WINAPI Hook_SetForegroundWindow(HWND h)
     typedef BOOL (WINAPI *PFN)(HWND);
     static PFN real;
 
+    if (!real) real = (PFN)(void*)VD_User32Proc("SetForegroundWindow");
+    if (CORE_DISABLED()) return real ? real(h) : FALSE;
     if (!g_disabled && VD_NoActivate(h)) {
         if (VD_LogWanted(h, VD_LOG_FG, VD_LOG_MS))
             HookLog("vd: suppressed SetForegroundWindow(hwnd=%p) - pinned desktop "
                     "is not the current one", (void*)h);
         return TRUE;
     }
-    if (!real) real = (PFN)(void*)VD_User32Proc("SetForegroundWindow");
     return real ? real(h) : FALSE;
 }
 
@@ -810,12 +813,13 @@ static BOOL WINAPI Hook_BringWindowToTop(HWND h)
     typedef BOOL (WINAPI *PFN)(HWND);
     static PFN real;
 
+    if (!real) real = (PFN)(void*)VD_User32Proc("BringWindowToTop");
+    if (CORE_DISABLED()) return real ? real(h) : FALSE;
     if (!g_disabled && VD_NoActivate(h)) {
         if (VD_LogWanted(h, VD_LOG_BRING, VD_LOG_MS))
             HookLog("vd: suppressed BringWindowToTop(hwnd=%p)", (void*)h);
         return TRUE;
     }
-    if (!real) real = (PFN)(void*)VD_User32Proc("BringWindowToTop");
     return real ? real(h) : FALSE;
 }
 
@@ -824,11 +828,12 @@ static HWND WINAPI Hook_SetActiveWindow(HWND h)
     typedef HWND (WINAPI *PFN)(HWND);
     static PFN real;
 
+    if (!real) real = (PFN)(void*)VD_User32Proc("SetActiveWindow");
+    if (CORE_DISABLED()) return real ? real(h) : NULL;
     if (!g_disabled && VD_NoActivate(h)) {
         if (VD_LogWanted(h, VD_LOG_ACTIVE, VD_LOG_MS))
             HookLog("vd: suppressed SetActiveWindow(hwnd=%p)", (void*)h);
         return NULL;
     }
-    if (!real) real = (PFN)(void*)VD_User32Proc("SetActiveWindow");
     return real ? real(h) : NULL;
 }

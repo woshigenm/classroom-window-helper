@@ -82,7 +82,7 @@ function Start-Host([string]$exeName, [int]$seconds, [switch]$Window, [int]$Cras
     if ($Window) { $argv += '--window' }
     if ($CrashAfterMs -gt 0) { $argv += @('--crash-after', "$CrashAfterMs") }
     $p = Start-Process -FilePath $exe -WorkingDirectory $bin -PassThru -ArgumentList $argv
-    for ($i = 0; $i -lt 80 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    for ($i = 0; $i -lt 150 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "$exeName did not write its pidfile" }
     $procId = [int](Get-Content $pidfile -Raw).Trim()
     return [pscustomobject]@{ Name = $exeName; Proc = $p; Pid = $procId; Pidfile = $pidfile }

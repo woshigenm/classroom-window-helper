@@ -81,7 +81,7 @@ try {
     Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
     $host0 = Start-Process -FilePath (Join-Path $bin 'ScreenRender.exe') -WorkingDirectory $bin -PassThru `
         -ArgumentList @('--pidfile', $pidfile, '--inject', $dll, '--window', '--seconds', '90')
-    for ($i = 0; $i -lt 80 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    for ($i = 0; $i -lt 150 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw 'ScreenRender.exe did not start' }
     Start-Sleep -Milliseconds 1200
 

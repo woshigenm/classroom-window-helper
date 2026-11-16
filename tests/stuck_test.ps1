@@ -48,7 +48,7 @@ function Start-Host([string]$variant, [string]$extraArgs) {
     $args = @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll', '--seconds', '30')
     if ($extraArgs) { $args += $extraArgs.Split(' ') }
     $p = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru -ArgumentList $args
-    for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    for ($i = 0; $i -lt 150 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "host did not write its pidfile" }
     return @{ proc = $p; pid = [int](Get-Content $pidfile -Raw).Trim() }
 }

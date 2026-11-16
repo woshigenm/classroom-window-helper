@@ -252,20 +252,29 @@ enabled=1
 | 类别 | 数量 | disabled 期行为 |
 |---|---|---|
 | 11 个 `HOOK_ENTER` 包装 | 11 | 直通 |
-| 6 个 inline hook（`ShowWindowAsync`、`CreateProcessA`、`WinExec`、`ExitWindowsEx`、`ShellExecuteA/W`） | 6 | 直通（P3 起显式查 `g_coreDisabled`） |
-| 窗口状态/焦点：`SetWindowPlacement`、`CreateWindowExW`、`SetForegroundWindow`、`BringWindowToTop`、`SetActiveWindow`、`SetWindowsHookExA/W` | 7 | 跑完整逻辑 |
+| 6 个 inline hook（`ShowWindowAsync`、`CreateProcessA`、`WinExec`、`ExitWindowsEx`、`ShellExecuteA/W`） | 6 | 直通 |
+| 窗口状态/焦点：`SetWindowPlacement`、`CreateWindowExW`、`SetForegroundWindow`、`BringWindowToTop`、`SetActiveWindow` | 5 | 直通（`CreateWindowExW` 只保留隐藏 ShutDownDlg 这条关机安全逻辑） |
 | 抓屏守卫：`BitBlt`、`CreateDCW`、`CreateDCA`、`GetDC`、`GetWindowDC` | 5 | 跑完整逻辑 |
 | 关机入口：`InitiateSystemShutdownA/W/ExA/ExW` | 4 | 跑完整逻辑（关机守卫开时仍拦） |
+| 输入锁：`SetWindowsHookExA/W`（拦 `WH_MOUSE_LL`/`WH_KEYBOARD_LL`） | 2 | 跑完整逻辑（输入不被锁） |
 
-所以「重载失败」不等于「hook 停了」：窗口显示、进程创建、外壳、`ExitWindowsEx` 都直通了，
-但**抓屏冻结仍在**、`InitiateSystemShutdown*` 仍被拦。日志会打
-`process disabled (partially bypassed)` + 具体说明。`g_coreDead` 是终态（进程全局、
-没有重置路径），只能**重启该课堂进程**或重新注入。
+所以 disabled 期**只剩安全类 hook 在跑**：抓屏冻结 + 关机入口拦截 + 低层输入钩子抑制，
+其余全部直通。「重载失败」不等于「hook 停了」：窗口显示/焦点/摆放、进程创建、外壳、
+`ExitWindowsEx` 都直通了，但抓屏冻结仍在、`InitiateSystemShutdown*` 仍被拦、
+输入锁仍被抑制。日志会打 `process disabled (partially bypassed)` + 具体说明。
+`g_coreDead` 是终态（进程全局、没有重置路径），只能**重启该课堂进程**或重新注入。
 
-> 那 16 个不进 `g_coreDisabled` 检查的入口都只读模块全局 / `bypass_shut.ini`，不碰
+> `SetWindowsHookExA/W` 故意不放通：它挡的是客户端锁键盘/鼠标的通道，属于安全类；
+> disabled 期放通等于可能被锁输入，比“点窗口没反应”严重。
+
+> 那 11 个不进 `g_coreDisabled` 检查的入口都只读模块全局 / `bypass_shut.ini`，不碰
 > `StateClose` 释放过的 `g_stateView` / `g_stateMap` / `g_stateEvent`（机械检查覆盖）。
-> 给 6 个 inline hook 加检查的原因是：**inline hook 的调用会重入 Core**，而它们当时没有
-> 任何 gate；剩下 16 个只走 IAT，且只读全局，保留拦截更安全（关机拦截、抓屏冻结）。
+> 保留它们是为了在「已经半废」的状态下多留一层保护（抓屏冻结 + 关机拦截）——
+> 这两类都不会重入 Core，也不会访问被释放的资源。
+
+> 8 个 inline hook 的直通不变式中，只有 `WinExec` 有自动测试（`tests\reentry_test.ps1`）；
+> 其余 5 个 inline hook 和 7 个窗口状态/焦点 hook 靠代码审查（难构造零副作用探针）。
+> 改这些入口时必须确认 `CORE_DISABLED()` 仍在函数最前面。
 
 > `before_unload` 里**不调用任何 hook 函数**——它只用 `real_SetWindowLongPtrW`、
 > `StateClose` 这类裸 Win32，所以上面这张表不影响卸载时序。

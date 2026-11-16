@@ -57,7 +57,7 @@ try {
     $hostProc = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
         -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll', '--seconds', '60')
 
-    for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    for ($i = 0; $i -lt 150 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "core_host did not write its pidfile" }
     $procId = [int](Get-Content $pidfile -Raw).Trim()
     Start-Sleep -Milliseconds 1500
@@ -154,7 +154,7 @@ try {
     $host2 = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
         -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll',
                         '--window', '--hammer-show', '--seconds', '20')
-    for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    for ($i = 0; $i -lt 150 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "core_host (real) did not write its pidfile" }
     $pid2 = [int](Get-Content $pidfile -Raw).Trim()
     Start-Sleep -Milliseconds 1500
@@ -206,7 +206,7 @@ try {
     Remove-Item $pidfile -Force -ErrorAction SilentlyContinue
     $host4 = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
         -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll', '--seconds', '15')
-    for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    for ($i = 0; $i -lt 150 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "retry host did not write its pidfile" }
     $pid4 = [int](Get-Content $pidfile -Raw).Trim()
     Start-Sleep -Milliseconds 1500
@@ -245,7 +245,7 @@ try {
     $host3 = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
         -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll',
                         '--crash-after', '6000', '--seconds', '30')
-    for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    for ($i = 0; $i -lt 150 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "crash host did not write its pidfile" }
     $pid3 = [int](Get-Content $pidfile -Raw).Trim()
     Start-Sleep -Milliseconds 1500

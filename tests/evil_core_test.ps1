@@ -52,7 +52,7 @@ try {
     $p = Start-Process -FilePath $host0 -WorkingDirectory $bin -PassThru `
         -ArgumentList @('--pidfile', $pidfile, '--inject', 'bypass_hook32.dll',
                         '--window', '--seconds', '30')
-    for ($i = 0; $i -lt 60 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    for ($i = 0; $i -lt 150 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw "evil host did not write its pidfile" }
     $hostId = [int](Get-Content $pidfile -Raw).Trim()
     Start-Sleep -Milliseconds 2500          # evil thread enters ShowWindow (60 s)

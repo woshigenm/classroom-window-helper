@@ -4476,13 +4476,14 @@ static void ReportReloadResult(HWND hwnd, const char* exe, DWORD pid,
     if (strstr(resp, "core disabled") || strstr(resp, "coreDead")) {
         (*dead)++;
         /* 阶段 2 已经执行过 (before_unload 返回 1) 但 drain 没等到: 进程里
-           17 个 hook 直通 (11 个 HOOK_ENTER 包装 + 6 个 inline), 其余 16 个只走
-           IAT 的入口仍跑完整逻辑 —— 不是“已直通”。 */
+           22 个入口直通 (11 个 HOOK_ENTER 包装 + 6 个 inline + 5 个窗口状态/焦点),
+           只剩 11 个安全类入口在跑 (抓屏 5 + InitiateSystemShutdown* 4 + 输入锁 2)。 */
         AppendLog(hwnd, "[Core] %s pid=%lu: %s\r\n"
                         "       WARNING: process disabled (partially bypassed):\r\n"
-                        "         window/show/process-create/shell/ExitWindowsEx hooks\r\n"
-                        "         are passthrough, but the screen guard and\r\n"
-                        "         InitiateSystemShutdown* hooks still run.\r\n"
+                        "         everything is passthrough except the safety hooks:\r\n"
+                        "         screen guard (BitBlt, CreateDCW/A, GetDC, GetWindowDC),\r\n"
+                        "         InitiateSystemShutdownA/W/ExA/ExW and\r\n"
+                        "         SetWindowsHookExA/W (input stays live) still run.\r\n"
                         "         Restart that classroom process to recover.\r\n",
                   exe, (unsigned long)pid, resp);
         return;

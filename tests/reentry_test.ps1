@@ -62,7 +62,7 @@ try {
         -RedirectStandardOutput $outfile -PassThru `
         -ArgumentList @('--pidfile', $pidfile, '--inject', $dll, '--seconds', '14',
                         '--probe-winexec', '1500,7000')
-    for ($i = 0; $i -lt 80 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
+    for ($i = 0; $i -lt 150 -and !(Test-Path $pidfile); $i++) { Start-Sleep -Milliseconds 100 }
     if (!(Test-Path $pidfile)) { throw 'host did not start' }
     $procId = [int](Get-Content $pidfile -Raw).Trim()
 

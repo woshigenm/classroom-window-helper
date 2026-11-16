@@ -2222,6 +2222,8 @@ static BOOL WINAPI Hook_SetWindowPlacement(HWND h, const WINDOWPLACEMENT* wp)
 {
     WINDOWPLACEMENT tmp;
 
+    if (CORE_DISABLED()) return real_SetWindowPlacement(h, wp);
+
     /* virtual desktop: SetWindowPlacement can show *and activate* a window
        without going through ShowWindow(), so it needs the same treatment.
        Handled before the broadcast-window logic so the window-mode small
@@ -2568,6 +2570,9 @@ static BOOL WINAPI Impl_SwitchDesktop(HDESK desk)
    留在自己的桌面上时, 这个钩子就是"看得见却点不动"的原因。
    窗口模式开启时, 直接不安装 (返回一个假句柄), 让它以为自己成功了。 */
 static HHOOK WINAPI Hook_SetWindowsHookExA(int id, HOOKPROC fn, HINSTANCE h, DWORD tid){
+    /* NOT gated by CORE_DISABLED: suppressing WH_MOUSE_LL / WH_KEYBOARD_LL is
+       input safety (the classroom client locks keyboard/mouse this way), the
+       same category as the screen guard and the shutdown hooks. */
     if (!g_disabled &&
         WindowModeOn() &&
         (id == WH_MOUSE_LL || id == WH_KEYBOARD_LL)) {
@@ -2581,6 +2586,7 @@ static HHOOK WINAPI Hook_SetWindowsHookExA(int id, HOOKPROC fn, HINSTANCE h, DWO
 
 static HHOOK WINAPI Hook_SetWindowsHookExW(int id, HOOKPROC fn, HINSTANCE h, DWORD tid)
 {
+    /* input safety, see the A version */
     if (!g_disabled &&
         WindowModeOn() &&
         (id == WH_MOUSE_LL || id == WH_KEYBOARD_LL)) {

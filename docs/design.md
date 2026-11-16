@@ -683,7 +683,7 @@ bypass_hook_core.dll (Core)
 1. Loader 收到 `reload`；把新 Core 复制到 `core.<pid>.<seq>.dll`（新序号）。
 2. **`g_table` 仍指向旧 Core 时**调用旧 Core 的 `before_unload()`：
    - Core 先置 `g_coreDisabled = 1`：新进来的调用在**包装 / inline hook 入口**直通
-     （33 个 dispatcher 里 17 个如此，剩下 16 个只走 IAT，见 2.9 末尾）；
+     （33 个 dispatcher 里 22 个如此，剩下 11 个只走 IAT，见 2.9 末尾）；
    - 停 Worker / caption pump / VD 线程（每个 3 秒超时，超时返回 0）；
    - 等 `g_inHookCount == 0`（3 秒超时，超时返回 0）；
    - 把状态写进 blob，返回 1。
@@ -725,7 +725,7 @@ P2b = 上面第 2 步的十项真正实现。
 
 阶段 2（不可逆清理）：
 
-1. `g_coreDisabled = 1`（新调用在包装 / inline 入口直通；16 个只走 IAT 的入口继续拦截，
+1. `g_coreDisabled = 1`（新调用在包装 / inline 入口直通；11 个只走 IAT 的安全类入口继续拦截，
    见 2.9 末尾）；
 2. 停 Worker / caption / VD，各自 3 秒超时；
 3. `RemoveWindowSubclass` / `KillTimer` / `UnregisterClass`；
@@ -735,8 +735,8 @@ P2b = 上面第 2 步的十项真正实现。
 
 > 阶段 2 某一步超时返回 0 时，Core 已经置了 `g_coreDisabled`、可能停了一半线程——
 > 这是不可逆操作开始后的固有风险。阶段 1 的检查目的就是把这种情况压到接近零；
-> Loader 收到 0 时不卸载，旧 Core 进入**半禁用**状态：17 个入口（11 个 `HOOK_ENTER`
-> 包装 + 6 个 inline）直通，16 个只走 IAT 的入口仍会跑完整逻辑——**不是“全部直通”**
+> Loader 收到 0 时不卸载，旧 Core 进入**半禁用**状态：22 个入口（11 个 `HOOK_ENTER`
+> 包装 + 6 个 inline + 5 个窗口状态/焦点）直通，11 个安全类入口（抓屏 5 + 关机 4 + 输入锁 2）仍会跑完整逻辑——**不是“全部直通”**
 > （见 2.9 末尾）。
 
 P2b 测试矩阵：正常重载 / Worker 卡住（`SuspendThread`）/ `g_inHookCount` 卡住
@@ -838,8 +838,13 @@ P2b-2 剩余：`RemoveWindowSubclass`、`KillTimer`、`UnregisterClass`、
   （见「多实例与并发」）。`g_initDepth` 只包住 `VD_Start` 和 caption 创建两段。
 - **`g_coreDead` 是 Core 契约的最终防御**：恶意 Core（`before_unload` 返回 1 但
   不停线程/不置 disabled）触发 drain 超时后，Loader 保持 `g_unloading=1`、置
-  `g_coreDead=1`、不卸载；该进程之后所有 reload 都返回 `err coreDead`，只能
-  重启或重新注入。
+  `g_coreDead=1`、**不 `FreeLibrary`**，该进程之后所有 reload 都返回 `err coreDead`，
+  只能重启或重新注入。
+  coreDead 之后的准确状态：dispatcher 在 `g_unloading=1` 时对所有调用直通（**Loader
+  不再把任何外部调用转进 Core**）；但 Core 模块**保持映射**（drain 超时后本来就不卸载），
+  所以 Core 自己的线程（Worker / caption / VD）如果还活着，会继续在自己模块里跑——
+  它们用的是 `real_*`，不经过 dispatcher。结果：安全（模块没被卸，不会 UAF），
+  但不干净（窗口可能还在被这个僵尸 Core 调整），终态，恢复只能重启进程。
 
 **8 vs 25 不对称：Core 内部调用 hook 函数时谁重入**
 
@@ -870,14 +875,30 @@ drain 的 3 秒预算。
 | 类别 | 数量 | disabled 期行为 |
 |---|---|---|
 | `HOOK_ENTER` 包装 | 11 | 入口查 `g_coreDisabled` → **直通** |
-| inline hook 里原先没包装的 | 6 | 显式查 `CORE_DISABLED()` → **直通** |
-| 窗口状态/焦点（`SetWindowPlacement`、`CreateWindowExW`、`SetForegroundWindow`、`BringWindowToTop`、`SetActiveWindow`、`SetWindowsHookExA/W`） | 7 | 跑完整逻辑 |
+| inline hook 里原先没包装的（`ShowWindowAsync`、`CreateProcessA`、`WinExec`、`ExitWindowsEx`、`ShellExecuteA/W`） | 6 | 显式查 `CORE_DISABLED()` → **直通** |
+| 窗口状态/焦点（`SetWindowPlacement`、`CreateWindowExW`、`SetForegroundWindow`、`BringWindowToTop`、`SetActiveWindow`） | 5 | **直通**（`CreateWindowExW` 例外：只保留「隐藏 ShutDownDlg 倒计时窗」这条关机安全逻辑，桌面钉住直通） |
 | 抓屏守卫（`BitBlt`、`CreateDCW`、`CreateDCA`、`GetDC`、`GetWindowDC`） | 5 | 跑完整逻辑 |
 | 关机入口（`InitiateSystemShutdownA/W/ExA/ExW`） | 4 | 跑完整逻辑（守卫开时仍拦） |
+| 输入锁（`SetWindowsHookExA/W` 拦 `WH_MOUSE_LL` / `WH_KEYBOARD_LL`） | 2 | 跑完整逻辑 |
 
-也就是说「重载失败」≠「hook 停了」：窗口显示、进程创建、外壳、`ExitWindowsEx` 都直通了，
-但**抓屏冻结仍在**、`InitiateSystemShutdown*` 仍被拦。UI、日志、README 都按这个描述，
-不写“已直通”。`g_coreDead` 是该状态下的终态。
+也就是 disabled 期只剩**安全类 hook** 在跑：抓屏冻结、关机入口拦截、低层输入钩子抑制；
+其余（窗口显示/焦点/摆放、进程创建、外壳、`ExitWindowsEx`）全部直通。
+`SetWindowsHookEx` 故意留在安全侧：它挡的是客户端锁键盘/鼠标的通道，
+disabled 期放通等于可能被锁输入，比“点窗口没反应”严重。
+
+「重载失败」≠「hook 停了」：窗口操作类都直通了，但**抓屏冻结仍在**、
+`InitiateSystemShutdown*` 仍被拦、**输入锁仍被抑制**。UI、日志、README 都按这个描述，
+文案里「still run」的三类必须穷举（不能只说“screen guard”）。`g_coreDead` 是该状态下的终态。
+
+**直通不变式的测试覆盖（known gap）**
+
+8 个 inline hook 的「disabled 期直通」里，只有 `WinExec` 有自动测试
+（`tests\reentry_test.ps1`：守卫开着时 `ret=33` + `[Guard] blocked WinExec`，
+半禁用时 `ret=2`（`ERROR_FILE_NOT_FOUND`）+ 无新拦截行）。其余 5 个
+（`ShowWindowAsync`/`CreateProcessA`/`ExitWindowsEx`/`ShellExecuteA/W`）和 7 个
+窗口状态/焦点 hook **只有代码审查覆盖**：`ExitWindowsEx`/`ShellExecute` 构造零副作用
+探针很难，`ShowWindowAsync` 需要目标进程泵消息。改动这 12 个入口时必须人工确认
+`CORE_DISABLED()` 仍在函数最前面。
 
 **UI 入口（主程序 / 托盘）**
 
