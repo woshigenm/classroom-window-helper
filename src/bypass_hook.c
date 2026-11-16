@@ -91,6 +91,7 @@ static char g_offPath[MAX_PATH];
 static char g_logPath[MAX_PATH];
 static char g_configPath[MAX_PATH];  /* bypass_config.ini */
 static char g_dllPath[MAX_PATH];     /* 本 DLL 的完整路径, 只用于日志诊断 */
+static char g_dllBase[MAX_PATH];     /* 本 DLL 的文件名 (换名部署时也要认得自己) */
 
 /* 共享状态 (Local\BypassTool_State_v1) + 配置回退 */
 static HANDLE       g_stateMap;
@@ -176,7 +177,7 @@ static BOOL IsInjectAtBirth(const char* app, const char* cmd)
         "MultiClient.exe", "ScreenRender.exe", "MultiRender.exe",
         "SharedDesktop.exe", "AudioRender.exe", NULL
     };
-    char       base[64];
+    char       base[MAX_PATH];
     char*      slash;
     const char *p, *c;
     int        i;
@@ -185,9 +186,14 @@ static BOOL IsInjectAtBirth(const char* app, const char* cmd)
 
     /* app 优先: 它是真实 exe 路径; cmd 可能被 "cmd /c ..." 之类包了一层。
        cmd 解析必须处理引号, 否则 "C:\Program Files\...\MultiClient.exe"
-       会在 Program 后的空格处截断 —— 正式安装几乎都在 Program Files 下。 */
+       会在 Program 后的空格处截断 —— 正式安装几乎都在 Program Files 下。
+       ★ 只拷 "文件名的最后一段": 以前把整条路径塞进 base[64], 正式安装路径
+         早就超过 63 字节, 截断后变成 "MultiClient.e" 之类 -> 匹配失败 ->
+         该进程不再"挂起创建", MultiClient 的 SwitchDesktop 竞态又回来了。 */
     if (app && app[0]) {
-        _snprintf(base, sizeof(base) - 1, "%s", app);
+        slash = strrchr(app, '\\');
+        slash = slash ? slash + 1 : (char*)app;
+        _snprintf(base, sizeof(base) - 1, "%s", slash);
         base[sizeof(base) - 1] = '\0';
     } else if (cmd && cmd[0]) {
         p = cmd;
@@ -204,12 +210,12 @@ static BOOL IsInjectAtBirth(const char* app, const char* cmd)
         if ((size_t)(c - p) >= sizeof(base)) return FALSE;
         memcpy(base, p, (size_t)(c - p));
         base[c - p] = '\0';
+        /* 命令行里是完整路径: 同样只留文件名 */
+        slash = strrchr(base, '\\');
+        if (slash) memmove(base, slash + 1, strlen(slash + 1) + 1);
     } else {
         return FALSE;
     }
-
-    slash = strrchr(base, '\\');
-    if (slash) memmove(base, slash + 1, strlen(slash + 1) + 1);
 
     for (i = 0; names[i]; i++)
         if (_stricmp(base, names[i]) == 0) return TRUE;
@@ -225,6 +231,33 @@ static CRITICAL_SECTION g_logCs;
 static int              g_logCsReady;
 static HANDLE           g_logH = INVALID_HANDLE_VALUE;
 static DWORD            g_logWrites;
+
+/* BYPASS_BROADCAST 是**本进程环境块**里的一个瞬时变量 (给刚创建的子进程当
+   "我是广播渲染器"的身份证)。它必须串行化并恢复原值: 两个线程同时
+   CreateProcess 时, 后一个会把前一个刚设好的值一起继承过去 (非广播子进程
+   被误判成渲染器); 直接把变量清成 NULL 还会把宿主自己设的值冲掉。 */
+static CRITICAL_SECTION g_envCs;
+static int              g_envCsReady;
+
+/* 1 = 已经设好, 结束时用 BroadcastEnvRestore 还原; 0 = 没设 (原值过长) */
+static int BroadcastEnvSet(char* prev, size_t cch, int* had)
+{
+    DWORD n;
+
+    if (!prev || cch < 2) return 0;
+    if (had) *had = 0;
+    prev[0] = '\0';
+    n = GetEnvironmentVariableA("BYPASS_BROADCAST", prev, (DWORD)cch);
+    if (n >= (DWORD)cch) return 0;          /* 原值太长: 不要冒险覆盖 */
+    if (n > 0 && had) *had = 1;
+    SetEnvironmentVariableA("BYPASS_BROADCAST", "1");
+    return 1;
+}
+
+static void BroadcastEnvRestore(const char* prev, int had)
+{
+    SetEnvironmentVariableA("BYPASS_BROADCAST", had ? prev : NULL);
+}
 
 static void HookLog(const char* fmt, ...)
 {
@@ -259,10 +292,10 @@ static void HookLog(const char* fmt, ...)
                       (unsigned)st.wSecond, (unsigned)st.wMilliseconds,
                       (unsigned long)g_pid, buf);
     }
-    if (n < 0) n = (int)strlen(line);
+    /* ★ 先补结尾 0 再算长度: _snprintf 被截断时不写结尾 0, 那时 strlen 会越界读 */
     line[sizeof(line) - 1] = '\0';
+    if (n < 0) n = (int)strlen(line);
     if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
-
     /* ★ 必须用 FILE_APPEND_DATA + 单次 WriteFile:
        这个日志是 3~4 个进程 (Student/MultiClient/ScreenRender) 同时写的。
        以前各进程用 fopen(...,"a") + fprintf — CRT 的 "a" 是"先 seek 到末尾再写",
@@ -278,9 +311,12 @@ static void HookLog(const char* fmt, ...)
         g_logH = INVALID_HANDLE_VALUE;
     }
     if (g_logH == INVALID_HANDLE_VALUE) {
+        /* ★ 必须带 FILE_SHARE_DELETE: 3~4 个进程都持有句柄, 少了它,
+           用户/工具删日志时会遇到共享冲突, 下面"文件没了就重开"的自愈
+           分支就永远走不到。 */
         g_logH = CreateFileA(g_logPath, FILE_APPEND_DATA,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     }
     if (g_logH != INVALID_HANDLE_VALUE)
         WriteFile(g_logH, line, (DWORD)n, &wrote, NULL);
@@ -308,7 +344,10 @@ static BOOL GetPidImage(DWORD pid, char* out, int n)
     char   full[MAX_PATH];
     DWORD  sz = sizeof(full);
 
-    if (n > 0) out[0] = '\0';
+    if (!out || n < 2) return FALSE;
+    /* 失败时也留一个可读的占位符 (以前写空串, 取证日志里的进程名变成空白) */
+    out[0] = '?';
+    out[1] = '\0';
     hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hp) return FALSE;
     if (!QueryFullProcessImageNameA(hp, 0, full, &sz)) {
@@ -374,8 +413,15 @@ static BOOL IsClassroomPid(DWORD pid)
 
     {
         char img[MAX_PATH];
-        BOOL yes = GetPidImage(pid, img, sizeof(img)) && IsClassroomExe(img);
-        LONG slot = InterlockedIncrement(&next) & 15;
+        BOOL yes;
+        LONG slot;
+
+        /* ★ 取不到镜像名 (进程刚创建 / 受保护) 时不能缓存成"不是课堂进程":
+           以前那一瞬间的失败会被永久记住, 之后这个 pid 的跨进程窗口保护
+           全都不生效。拿不到就本次按"否"处理, 下次再问。 */
+        if (!GetPidImage(pid, img, sizeof(img))) return FALSE;
+        yes = IsClassroomExe(img);
+        slot = InterlockedIncrement(&next) & 15;
         cachePid[slot] = pid;
         cacheRes[slot] = yes ? 1 : 2;
         return yes;
@@ -415,6 +461,13 @@ static BOOL IsBroadcastWindow(HWND h)
     if (!h || !IsWindow(h)) return FALSE;
     GetClassNameA(h, cls, sizeof(cls));
     if (IsRenderWindowClass(cls)) return TRUE;
+    /* ★ 渲染器进程里还有它自己的对话框 / 提示 / 影子窗口: 那些不是广播画面,
+       不能套上"几何归用户 / 不许隐藏 / 强制样式"这一套 (#32770 是对话框)。
+       (进程级兜底保留给"注入晚了、类名还没认出来"的渲染窗。) */
+    if (!_stricmp(cls, "#32770") || !_stricmp(cls, "#32768") ||
+        !_stricmp(cls, "tooltips_class32") || !_stricmp(cls, "SysShadow") ||
+        !_stricmp(cls, "ForegroundStaging") || !_strnicmp(cls, "IME", 3))
+        return FALSE;
     return IsRendererImage(g_ownImage);
 }
 
@@ -824,7 +877,11 @@ static BOOL EnsureSubclassed(HWND h)
 
     GetWindowThreadProcessId(h, &pid);
     if (pid != g_pid) return FALSE;          /* 只能改自己进程的窗口过程 */
-    if (SubOldProc(h)) return TRUE;          /* 已装过 */
+    /* ★ 判断"装过没有"必须看窗口**当前实际的过程指针**, 不能信 g_sub[] 里的
+       旧记录: HWND 数值会被系统复用 —— 旧广播窗销毁后, 新窗口很可能拿到
+       同一个数值, 表里的陈旧条目会让这里误判"已经装过"而直接返回 TRUE,
+       于是新窗口永远不再子类化 (几何/最小尺寸保护静默失效, 日志里没有痕迹)。 */
+    if ((WNDPROC)GetWindowLongPtrW(h, GWLP_WNDPROC) == SubclassProc) return TRUE;
 
     /* ★ 只接管"广播画面"窗口。进程里其它顶层窗口 (StudentHelperWnd 工具条、
        虚拟桌面面板、提示框) 保持原样 —— 以前把它们也子类化, 再叠上
@@ -1216,7 +1273,10 @@ static void HandleIconicTransition(HWND h, BOOL iconNow)
     if (!iconWas) return;
 
     RemovePropA(h, PROP_ICONIC);
-    if (!GetPropA(h, PROP_CAPHIDE)) CaptionApply(h, TRUE);
+    /* 从最小化恢复: 非"模拟最大化"状态下, 被自动隐藏的标题栏要还回来
+       (最大化状态保持隐藏是对的, CaptionTick 会按鼠标位置决定何时露出)。 */
+    if (!GetPropA(h, PROP_USERMAX) && GetPropA(h, PROP_CAPHIDE))
+        CaptionApply(h, TRUE);
     if (GetPropA(h, PROP_USERMAX)) {
         RECT mr;
         MaxRectFor(h, &mr);
@@ -2051,17 +2111,22 @@ static BOOL ShouldRestyle(HWND h, LONG_PTR val)
    ★ 接管过的窗口不能清 WS_MAXIMIZE: 用户刚点了最大化, 渲染器又把它缓存的
      旧样式写回来时, 如果我们顺手把 WS_MAXIMIZE 摘掉, 窗口就会从最大化
      "掉"回普通大小 —— 这正是"拖大/最大化后被自动拉回"的一条路径。 */
-static LONG_PTR SanitizeStyle(HWND h, LONG_PTR val)
+static LONG_PTR SanitizeStyle(HWND h, LONG_PTR val, BOOL* skip)
 {
+    if (skip) *skip = FALSE;
     /* ★ 模拟最大化不使用 WS_MAXIMIZE。应用每轮都会把缓存的旧样式写回来,
        有时还带着 WS_MAXIMIZE —— 一旦放行, 窗口就变成"样式是最大化、几何
        是小窗", 标题栏按钮/命中测试全错位 (经典卡死)。这里一律剥掉。 */
     val &= ~(LONG_PTR)(WS_POPUP | WS_MAXIMIZE);
     if (LooksManaged(h)) {
         /* ★ 最小化期间不要改样式: 任何非客户区变化 (哪怕只是补 CAPTION)
-           都可能让系统立刻把窗口"还原" —— 这是 "点最小化又被拉回来" 的另一条路径。 */
-        if (IsIconic(h))
+           都可能让系统立刻把窗口"还原" —— 这是 "点最小化又被拉回来" 的另一条路径。
+           ⚠ 连"写回同样的值"也不行: SetWindowLong 仍会派发
+             WM_STYLECHANGING/CHANGED, 所以这里让调用方直接跳过 real_SetWindowLong。 */
+        if (IsIconic(h)) {
+            if (skip) *skip = TRUE;
             return GetWindowLongPtrW(h, GWL_STYLE);
+        }
         /* "收起"(隐藏)期间不能让应用通过样式写回 WS_VISIBLE 把窗口显示出来 */
         if (GetPropA(h, PROP_PARKED))
             val &= ~(LONG_PTR)WS_VISIBLE;
@@ -2083,7 +2148,9 @@ static LONG WINAPI Hook_SetWindowLongW(HWND h, int idx, LONG val)
 {
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (idx == GWL_STYLE && (LooksManaged(h) || ShouldRestyle(h, val))) {
-            val = (LONG)SanitizeStyle(h, (LONG_PTR)val);
+            BOOL skip = FALSE;
+            LONG_PTR sv = SanitizeStyle(h, (LONG_PTR)val, &skip);
+            if (!skip) val = (LONG)sv;
         } else if (idx == GWL_EXSTYLE) {
             val &= ~(LONG)WS_EX_TOPMOST;
         }
@@ -2095,7 +2162,9 @@ static LONG WINAPI Hook_SetWindowLongA(HWND h, int idx, LONG val)
 {
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (idx == GWL_STYLE && (LooksManaged(h) || ShouldRestyle(h, val))) {
-            val = (LONG)SanitizeStyle(h, (LONG_PTR)val);
+            BOOL skip = FALSE;
+            LONG_PTR sv = SanitizeStyle(h, (LONG_PTR)val, &skip);
+            if (!skip) val = (LONG)sv;
         } else if (idx == GWL_EXSTYLE) {
             val &= ~(LONG)WS_EX_TOPMOST;
         }
@@ -2107,7 +2176,9 @@ static LONG_PTR WINAPI Hook_SetWindowLongPtrW(HWND h, int idx, LONG_PTR val)
 {
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (idx == GWL_STYLE && (LooksManaged(h) || ShouldRestyle(h, val))) {
-            val = SanitizeStyle(h, val);
+            BOOL skip = FALSE;
+            LONG_PTR sv = SanitizeStyle(h, val, &skip);
+            if (!skip) val = sv;
         } else if (idx == GWL_EXSTYLE) {
             val &= ~(LONG_PTR)WS_EX_TOPMOST;
         }
@@ -2119,7 +2190,9 @@ static LONG_PTR WINAPI Hook_SetWindowLongPtrA(HWND h, int idx, LONG_PTR val)
 {
     if (!g_disabled && IsTargetWindow(h) && IsBroadcastWindow(h)) {
         if (idx == GWL_STYLE && (LooksManaged(h) || ShouldRestyle(h, val))) {
-            val = SanitizeStyle(h, val);
+            BOOL skip = FALSE;
+            LONG_PTR sv = SanitizeStyle(h, val, &skip);
+            if (!skip) val = sv;
         } else if (idx == GWL_EXSTYLE) {
             val &= ~(LONG_PTR)WS_EX_TOPMOST;
         }
@@ -2203,10 +2276,14 @@ static BOOL WINAPI Hook_SetWindowPlacement(HWND h, const WINDOWPLACEMENT* wp)
            这里把 rcNormalPosition 换成当前矩形, 只保留 showCmd 语义。 */
         if (IsManaged(h)) {
             RECT cr;
-            /* 隐藏中的窗口: 允许它重新显示 (否则 Hide 之后再也回不来) */
+            /* 隐藏中的窗口: 允许它重新显示 (否则 Hide 之后再也回不来),
+               但几何仍用**用户矩形** —— 应用缓存的 rcNormalPosition 会把
+               用户拖好的位置/大小又重置回去。 */
             if (!IsWindowVisible(h) &&
                 (tmp.showCmd == SW_SHOWNORMAL || tmp.showCmd == SW_SHOWMAXIMIZED ||
                  tmp.showCmd == SW_RESTORE)) {
+                RECT ur;
+                if (GetUserRect(h, &ur)) tmp.rcNormalPosition = ur;
                 return real_SetWindowPlacement(h, &tmp);
             }
             /* ★ 已经最小化: 应用发起的任何"显示/还原"都要拦 (用户从任务栏
@@ -2255,8 +2332,12 @@ static BOOL WINAPI Hook_SetWindowPlacement(HWND h, const WINDOWPLACEMENT* wp)
         }
 
         nx = g_smallX; ny = g_smallY; nw = g_smallW; nh = g_smallH;
-        if (tmp.showCmd == SW_SHOWMAXIMIZED || tmp.showCmd == SW_MAXIMIZE)
+        if (tmp.showCmd == SW_SHOWMAXIMIZED || tmp.showCmd == SW_MAXIMIZE) {
             tmp.showCmd = SW_SHOWNORMAL;
+            /* 不清这个标志的话, 应用可以"最小化 + WPF_RESTORETOMAXIMIZED"
+               绕过"不许最大化"的规则。 */
+            tmp.flags &= ~(UINT)WPF_RESTORETOMAXIMIZED;
+        }
         rqW = tmp.rcNormalPosition.right - tmp.rcNormalPosition.left;
         rqH = tmp.rcNormalPosition.bottom - tmp.rcNormalPosition.top;
         if (rqW > 0 && rqH > 0) SmallRectFor(rqW, rqH, &nx, &ny, &nw, &nh);
@@ -2422,10 +2503,13 @@ static BOOL WINAPI Hook_ShowWindowAsync(HWND h, int cmd)
     return real_ShowWindowAsync(h, cmd);
 }
 
-/* 渲染器会 ShowCursor(0) 把光标藏掉; 直接无视隐藏请求 */
+/* 渲染器会 ShowCursor(0) 把光标藏掉; 直接无视隐藏请求。
+   ★ 不要用 real_ShowCursor(TRUE) 去"抵消" —— 那会让显示计数只增不减
+     (应用成对调用后仍在 +2N), 跑久了计数很大, 之后连放行 (bypass_hook.off)
+     或系统自己的隐藏都再也藏不住光标。这里直接回报"可见、计数未变"。 */
 static int WINAPI Hook_ShowCursor(BOOL show)
 {
-    if (!g_disabled && !show) return real_ShowCursor(TRUE);
+    if (!g_disabled && !show) return 0;
     return real_ShowCursor(show);
 }
 
@@ -2446,11 +2530,12 @@ static void DesktopName(char* out, int n)
     HDESK d;
     char  buf[128] = "?";
 
+    if (!out || n < 2) return;          /* 以前无条件写 out[0..1], n<2 时越界 */
     out[0] = '?'; out[1] = '\0';
     d = GetThreadDesktop(GetCurrentThreadId());
     if (!d) return;
     if (GetUserObjectInformationA(d, 2 /*UOI_NAME*/, buf, sizeof(buf), NULL))
-        _snprintf(out, n - 1, "%s", buf);
+        _snprintf(out, (size_t)n - 1, "%s", buf);
     out[n - 1] = '\0';
 }
 
@@ -2660,15 +2745,22 @@ static BOOL WINAPI Hook_CreateProcessA(LPCSTR app, LPSTR cmd,
        命令行里的 fullscreen:1 已经被改写成 0, 子进程自己就看不出来了;
        环境变量在参数解析之外, 不会被渲染器当成参数, 最安全。
        子进程里的 DLL 启动时读 BYPASS_BROADCAST=1 -> 不再用尺寸猜窗口。 */
-    if (isBroadcast && !env) SetEnvironmentVariableA("BYPASS_BROADCAST", "1");
-
-    /* ★ 挂起注入: 先建进程但不让它跑, 注入 DLL, 再恢复。
-       这样 MultiClient 的 SwitchDesktop 一定被钩住。
-       调用方自己传了 CREATE_SUSPENDED 时也要注入, 但由它自己恢复。 */
     {
         BOOL suspendedByUs = FALSE;
         BOOL needInject    = FALSE;
+        BOOL envLocked     = FALSE;
+        char envPrev[64];
+        int  envHad        = 0;
 
+        if (isBroadcast && !env && g_envCsReady) {
+            EnterCriticalSection(&g_envCs);
+            envLocked = BroadcastEnvSet(envPrev, sizeof(envPrev), &envHad) ? 1 : 0;
+            if (!envLocked) LeaveCriticalSection(&g_envCs);
+        }
+
+        /* ★ 挂起注入: 先建进程但不让它跑, 注入 DLL, 再恢复。
+           这样 MultiClient 的 SwitchDesktop 一定被钩住。
+           调用方自己传了 CREATE_SUSPENDED 时也要注入, 但由它自己恢复。 */
         if (!g_disabled && pi && IsInjectAtBirth(app, cmd)) {
             needInject = TRUE;
             if (!(flags & CREATE_SUSPENDED)) {
@@ -2677,6 +2769,12 @@ static BOOL WINAPI Hook_CreateProcessA(LPCSTR app, LPSTR cmd,
             }
         }
         ok = real_CreateProcessA(app, cmd, pa, ta, inh, flags, env, cwd, si, pi);
+
+        if (envLocked) {
+            BroadcastEnvRestore(envPrev, envHad);
+            LeaveCriticalSection(&g_envCs);
+        }
+
         if (ok && needInject && pi) {
             if (isBroadcast) MarkForcedChild(pi->dwProcessId);
             TryInjectOwner(pi->dwProcessId);
@@ -2688,7 +2786,6 @@ static BOOL WINAPI Hook_CreateProcessA(LPCSTR app, LPSTR cmd,
         }
     }
 
-    if (isBroadcast && !env) SetEnvironmentVariableA("BYPASS_BROADCAST", NULL);
     return ok;
 }
 
@@ -2751,16 +2848,23 @@ static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd,
     if (!real_CreateProcessW) return FALSE;
 
     /* 同 A 版: 给子进程留"广播渲染器"身份证 (环境变量, 不进参数) */
-    if (isBroadcast && !env) SetEnvironmentVariableA("BYPASS_BROADCAST", "1");
-
-    /* 同 A 版: 挂起 -> 注入 -> 恢复 (app 和 cmd 都要看, 路径可能带空格) */
     {
         BOOL        suspendedByUs = FALSE;
         BOOL        needInject    = FALSE;
+        BOOL        envLocked     = FALSE;
+        char        envPrev[64];
+        int         envHad        = 0;
         char        narrowCmd[1024];
         char        narrowApp[1024];
         const char* cmdA = NULL;
         const char* appA = NULL;
+
+        /* 见 BroadcastEnvSet: 环境变量是进程级的, 必须串行 + 还原原值 */
+        if (isBroadcast && !env && g_envCsReady) {
+            EnterCriticalSection(&g_envCs);
+            envLocked = BroadcastEnvSet(envPrev, sizeof(envPrev), &envHad) ? 1 : 0;
+            if (!envLocked) LeaveCriticalSection(&g_envCs);
+        }
 
         if (cmd && cmd[0]) {
             narrowCmd[0] = '\0';
@@ -2785,6 +2889,12 @@ static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd,
             }
         }
         ok = real_CreateProcessW(app, cmd, pa, ta, inh, flags, env, cwd, si, pi);
+
+        if (envLocked) {
+            BroadcastEnvRestore(envPrev, envHad);
+            LeaveCriticalSection(&g_envCs);
+        }
+
         if (ok && needInject && pi) {
             if (isBroadcast) MarkForcedChild(pi->dwProcessId);
             TryInjectOwner(pi->dwProcessId);
@@ -2795,7 +2905,6 @@ static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd,
         }
     }
 
-    if (isBroadcast && !env) SetEnvironmentVariableA("BYPASS_BROADCAST", NULL);
     return ok;
 }
 
@@ -2912,7 +3021,7 @@ static BOOL HasOurDll(DWORD pid)
     me.dwSize = sizeof(me);
     if (Module32First(snap, &me)) {
         do {
-            if (!_stricmp(me.szModule, "bypass_hook32.dll")) {
+            if (g_dllBase[0] && !_stricmp(me.szModule, g_dllBase)) {
                 found = TRUE;
                 break;
             }
@@ -3027,8 +3136,10 @@ static BOOL CrossBudget(HWND h)
            -1 永远不等于 0, 空槽永远记不下来, 整张表恒为空。 */
         if (free == -1 && (!g_cross[i].h || !IsWindow(g_cross[i].h))) free = i;
     }
-    if (free >= 0) { g_cross[free].h = h; g_cross[free].tries = 1; }
-    return TRUE;
+    if (free >= 0) { g_cross[free].h = h; g_cross[free].tries = 1; return TRUE; }
+    /* 8 格全被活窗口占满: 不能再假装"还有配额", 否则又回到旧注释里那种
+       "几个进程互相抢、readback mismatch" 的循环。这里明确拒绝。 */
+    return FALSE;
 }
 
 /* 已经被我们小窗化过的窗口: 记住它, 之后只管样式(去置顶/去 POPUP),
@@ -3134,76 +3245,108 @@ static void QueuePendingPid(DWORD pid)
 }
 
 /* 每次都记一下目标窗口的矩形; 只要变了就写一行, 不管是谁改的、走没走钩子。
-   这是唯一能抓到"绕过我们全部钩子"的还原路径的办法。 */
-#define MAX_GEO 16
-static struct { HWND h; RECT r; } g_geo[MAX_GEO];
-static volatile LONG g_geoLogs;
+   这是唯一能抓到"绕过我们全部钩子"的还原路径的办法。
 
-/* 用户矩形: 用户最后一次"自己"摆好的位置/大小 (拖完、最大化前、降级后)。
-   最大化/还原时要靠它, 否则系统会把"最大化时的满屏矩形"记成 normal rect,
-   于是一还原就变成满屏 (实测: 还原后 2560x1416)。 */
-static struct { HWND h; RECT r; } g_user[MAX_GEO];
+   ★ 两张表都被 enforcer 线程和各个窗口线程并发读写, 而 RECT 是 4 个 LONG:
+     不加锁时可能读到"新 left + 旧 right"的撕裂矩形, 再被直接拿去
+     SetWindowPos —— 症状就是窗口"闪一下、位置/大小错乱"。统一用 g_geoSs 守。
+   ★ 表满时**轮转覆盖**最久没更新的一格。以前是静默丢弃: Student.exe 的
+     顶层窗口一多 (IsTargetWindow 对自己进程的所有顶层窗口都返回 TRUE),
+     广播窗就永远拿不到槽 -> 没有"用户矩形" -> 还原/最大化整条链路静默失效。 */
+#define MAX_GEO 32
+typedef struct { HWND h; RECT r; } GEOROW;
+static GEOROW           g_geo[MAX_GEO];
+static GEOROW           g_user[MAX_GEO];
+static CRITICAL_SECTION g_geoSs;
+static int              g_geoSsReady;
+static volatile LONG    g_geoLogs;
+static volatile LONG    g_geoNext;
+static volatile LONG    g_userNext;
 
-static void SetUserRect(HWND h, const RECT* r)
+static int GeoSlotLocked(GEOROW* tab, volatile LONG* next, HWND h)
 {
     int i, freeSlot = -1;
 
-    if (!h || !r) return;
     for (i = 0; i < MAX_GEO; i++) {
-        if (g_user[i].h == h) { g_user[i].r = *r; return; }
-        if (freeSlot == -1 && (!g_user[i].h || !IsWindow(g_user[i].h))) freeSlot = i;
+        if (tab[i].h == h) return i;
+        if (freeSlot == -1 && (!tab[i].h || !IsWindow(tab[i].h))) freeSlot = i;
     }
-    if (freeSlot >= 0) { g_user[freeSlot].h = h; g_user[freeSlot].r = *r; }
+    if (freeSlot >= 0) return freeSlot;
+    return (int)(InterlockedIncrement(next) & (MAX_GEO - 1));
+}
+
+static void SetUserRect(HWND h, const RECT* r)
+{
+    GEOROW* row;
+
+    if (!h || !r || !g_geoSsReady) return;
+    EnterCriticalSection(&g_geoSs);
+    row = &g_user[GeoSlotLocked(g_user, &g_userNext, h)];
+    row->h = h;
+    row->r = *r;
+    LeaveCriticalSection(&g_geoSs);
 }
 
 static BOOL GetUserRect(HWND h, RECT* out)
 {
-    int i;
+    int  i;
+    BOOL ok = FALSE;
 
-    if (!h || !out) return FALSE;
+    if (!h || !out || !g_geoSsReady) return FALSE;
+    EnterCriticalSection(&g_geoSs);
     for (i = 0; i < MAX_GEO; i++) {
-        if (g_user[i].h == h &&
-            (g_user[i].r.right - g_user[i].r.left) > 0) {
-            *out = g_user[i].r;
-            return TRUE;
+        if (g_user[i].h == h) {
+            if ((g_user[i].r.right - g_user[i].r.left) > 0) {
+                *out = g_user[i].r;      /* 锁内整块拷, 不会撕裂 */
+                ok = TRUE;
+            }
+            break;
         }
     }
-    return FALSE;
+    LeaveCriticalSection(&g_geoSs);
+    return ok;
 }
 
 static void TrackGeo(HWND h, const RECT* r)
 {
-    int i, freeSlot = -1;
-    for (i = 0; i < MAX_GEO; i++) {
-        if (g_geo[i].h == h) {
-            int ow = g_geo[i].r.right - g_geo[i].r.left;
-            int oh = g_geo[i].r.bottom - g_geo[i].r.top;
-            int nw = r->right - r->left;
-            int nh = r->bottom - r->top;
+    GEOROW* row;
+    RECT    old;
+    BOOL    had = FALSE, changed = FALSE;
 
-            if (ow != nw || oh != nh ||
-                g_geo[i].r.left != r->left || g_geo[i].r.top != r->top) {
-                if (InterlockedIncrement(&g_geoLogs) <= 40)
-                    HookLog("geo hwnd=%p %dx%d@(%d,%d) -> %dx%d@(%d,%d) st=0x%08X managed=%d",
-                            (void*)h, ow, oh, (int)g_geo[i].r.left, (int)g_geo[i].r.top,
-                            nw, nh, (int)r->left, (int)r->top,
-                            (unsigned)GetWindowLongPtrW(h, GWL_STYLE),
-                            (int)IsManaged(h));
-                g_geo[i].r = *r;
-            }
-            return;
-        }
-        if (freeSlot == -1 && (!g_geo[i].h || !IsWindow(g_geo[i].h))) freeSlot = i;
+    if (!h || !r || !g_geoSsReady) return;
+    EnterCriticalSection(&g_geoSs);
+    row = &g_geo[GeoSlotLocked(g_geo, &g_geoNext, h)];
+    if (row->h == h) { old = row->r; had = TRUE; }
+    if (had) {
+        changed = (old.left != r->left || old.top != r->top ||
+                   (old.right - old.left) != (r->right - r->left) ||
+                   (old.bottom - old.top) != (r->bottom - r->top)) ? TRUE : FALSE;
     }
-    if (freeSlot >= 0) { g_geo[freeSlot].h = h; g_geo[freeSlot].r = *r; }
+    row->h = h;
+    row->r = *r;
+    LeaveCriticalSection(&g_geoSs);
+
+    /* 日志(磁盘 IO + 别的锁)必须在锁外做 */
+    if (changed && InterlockedIncrement(&g_geoLogs) <= 40)
+        HookLog("geo hwnd=%p %dx%d@(%d,%d) -> %dx%d@(%d,%d) st=0x%08X managed=%d",
+                (void*)h, (int)(old.right - old.left), (int)(old.bottom - old.top),
+                (int)old.left, (int)old.top,
+                (int)(r->right - r->left), (int)(r->bottom - r->top),
+                (int)r->left, (int)r->top,
+                (unsigned)GetWindowLongPtrW(h, GWL_STYLE), (int)IsManaged(h));
 }
 
 /* 窗口销毁: 清掉几何/用户矩形缓存。不然句柄被系统复用后, 新窗口会拿到
-   上一个广播窗的"用户矩形", 还原/最大化就会摆到错误的位置。 */
+   上一个广播窗的"用户矩形", 还原/最大化就会摆到错误的位置。
+   ★ 顺带清 g_managed / g_cross: IsManaged 会拿"数值相同的句柄 + 渲染器类名"
+    兜底判断, 句柄被复用给另一个渲染窗时就会误判"已经接管过", 新广播窗
+     再也不降级 (同样没有日志痕迹)。 */
 static void ForgetWindowGeom(HWND h)
 {
     int i;
 
+    if (!g_geoSsReady) return;
+    EnterCriticalSection(&g_geoSs);
     for (i = 0; i < MAX_GEO; i++) {
         if (g_user[i].h == h) {
             g_user[i].h = NULL;
@@ -3214,6 +3357,11 @@ static void ForgetWindowGeom(HWND h)
             memset(&g_geo[i].r, 0, sizeof(RECT));
         }
     }
+    for (i = 0; i < MAX_MANAGED; i++)
+        if (g_managed[i] == h) g_managed[i] = NULL;
+    for (i = 0; i < MAX_CROSS; i++)
+        if (g_cross[i].h == h) g_cross[i].h = NULL;
+    LeaveCriticalSection(&g_geoSs);
 }
 
 /* 自我扩散: 扫描所有课堂进程, 给"还没有我们"的注入自己。
@@ -3258,17 +3406,19 @@ static char* StateTrim(char* s)
     return s;
 }
 
-static void StateParseSmall(const char* value, int* w, int* h, int* permille)
+static BOOL StateParseSmall(const char* value, int* w, int* h, int* permille)
 {
     char buf[64];
     char* q;
 
-    *w = *h = *permille = 0;
-    if (!value) return;
+    /* ★ 解析失败时**不要**清空 out: ini 里 small= 经常是空值 (界面里没设
+       固定尺寸时主程序就写空), 以前这里一进来就清零, 把刚刚从共享内存读到
+       的用户尺寸也抹掉了, 于是界面设的尺寸永远不生效。 */
+    if (!value || !w || !h || !permille) return FALSE;
     _snprintf(buf, sizeof(buf) - 1, "%s", value);
     buf[sizeof(buf) - 1] = '\0';
     q = StateTrim(buf);
-    if (!*q) return;
+    if (!*q || !_stricmp(q, "0")) return FALSE;
 
     if (strchr(q, 'x') || strchr(q, 'X')) {
         int a = 0, b = 0;
@@ -3276,15 +3426,26 @@ static void StateParseSmall(const char* value, int* w, int* h, int* permille)
         if (sscanf(q, "%d%c%d", &a, &sep, &b) == 3 && a >= 160 && b >= 120) {
             *w = a;
             *h = b;
+            *permille = 0;
+            return TRUE;
         }
-    } else {
+        return FALSE;
+    }
+    {
         double d = atof(q);
         if (d > 0.05 && d < 1.0) {
             *permille = (int)(d * 1000.0 + 0.5);
-        } else if (d >= 160.0 && d < 8192.0) {
+            *w = *h = 0;
+            return TRUE;
+        }
+        if (d >= 160.0 && d < 8192.0) {
             *w = (int)d;
+            *h = 0;
+            *permille = 0;
+            return TRUE;
         }
     }
+    return FALSE;
 }
 
 /* 读配置。defaults=1 时先填默认值（没有共享内存的兜底）；
@@ -3568,14 +3729,74 @@ static void FixOnOwnerThread(HWND h, int force)
     }
 }
 
-static BOOL CALLBACK EnforceProc(HWND h, LPARAM lp){
+/* 只看"现在需不需要动手", 不改任何东西 —— enforcer 每轮都用它决定要不要
+   给窗口线程投 WM_BYPASS_FIX。以前是无条件投: 那些 IsWorthFixing 为真、
+   但 FixOnOwnerThread 又会早退的窗口 (没有 CAPTION、尺寸介于半屏~2/3屏)
+   每 300ms~1s 收一条空消息, 窗口线程慢时还会积压。 */
+static BOOL NeedsFix(HWND h)
+{
     RECT     r;
     LONG_PTR st, ex;
+    int      w, hh;
+
+    if (!h || !IsWindow(h)) return FALSE;
+    if (GetPropA(h, PROP_PARKED) || IsIconic(h) || TaskbarMinimized(h)) return FALSE;
+    if (!GetWindowRect(h, &r)) return FALSE;
+    st = GetWindowLongPtrW(h, GWL_STYLE);
+    ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    w  = r.right - r.left;
+    hh = r.bottom - r.top;
+
+    if (LooksManaged(h))
+        return ((ex & WS_EX_TOPMOST) || (st & WS_POPUP)) ? TRUE : FALSE;
+    if (!IsWorthFixing(h)) return FALSE;
+    return ((ex & WS_EX_TOPMOST) || (st & WS_POPUP) || (st & WS_MAXIMIZE) ||
+            w > g_maxW || hh > g_maxH) ? TRUE : FALSE;
+}
+
+/* 别的进程的窗口: 只做"异步几何", 一个样式字节都不碰。
+   ★ SetWindowLong(GWL_STYLE) 会同步 SendMessage(WM_STYLECHANGING) 到对端 UI
+     线程; 对端一旦不泵消息 (模态框 / 断点 / 渲染卡死), 就会把我们唯一的
+     enforcer 线程永久挂死 —— 本进程的小窗化、注入、心跳全部停摆。
+     SetWindowPos 带 SWP_ASYNCWINDOWPOS 就不会等; 样式等 DLL 注进去以后,
+     由对端自己的钩子去修。 */
+static BOOL FixForeignGeometry(HWND h)
+{
+    RECT     r;
+    LONG_PTR st, ex;
+    int      w, hh, nx, ny, nw, nh;
+
+    if (!h || !IsWindow(h)) return FALSE;
+    if (GetPropA(h, PROP_PARKED) || IsIconic(h) || TaskbarMinimized(h)) return FALSE;
+    if (LooksManaged(h)) return FALSE;            /* 已接管: 交给对端钩子 */
+    if (!IsWorthFixing(h)) return FALSE;
+    if (!GetWindowRect(h, &r)) return FALSE;
+    w  = r.right - r.left;
+    hh = r.bottom - r.top;
+    st = GetWindowLongPtrW(h, GWL_STYLE);
+    ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    if (!((ex & WS_EX_TOPMOST) || (st & WS_POPUP) || (st & WS_MAXIMIZE) ||
+          w > g_maxW || hh > g_maxH))
+        return FALSE;
+
+    SmallRectFor(w, hh, &nx, &ny, &nw, &nh);
+    if (!real_SetWindowPos) return FALSE;
+    real_SetWindowPos(h, HWND_NOTOPMOST, nx, ny, nw, nh,
+                      SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    MarkManaged(h);        /* 属性挂在窗口对象上, 跨进程设置也不会阻塞 */
+    if (InterlockedIncrement(&g_fixLogs) <= 60)
+        HookLog("fix(foreign, async) hwnd=%p %dx%d -> %dx%d",
+                (void*)h, w, hh, nw, nh);
+    return TRUE;
+}
+
+static BOOL CALLBACK EnforceProc(HWND h, LPARAM lp){
+    RECT     r;
     int      w, hh;
     int*     fixedCount = (int*)lp;
     DWORD    opid = 0;
 
-    if (g_disabled) return FALSE;
+    if (g_disabled) return TRUE;    /* 只管跳过干预, 不要中止枚举 (FALSE = 停止) */
     if (!IsTargetWindow(h)) return TRUE;
     /* 用户主动最大化 (BypassUserMax / 已接管的系统最大化) -> 交给系统/用户自己管。
        ⚠ 未接管的系统最大化窗口不能在这里放过: 它很可能就是"注入晚了、应用
@@ -3593,7 +3814,6 @@ static BOOL CALLBACK EnforceProc(HWND h, LPARAM lp){
         return TRUE;
     }
     if (!IsWindowVisible(h)) return TRUE;
-    if (IsIconic(h)) return TRUE;
     if (!GetWindowRect(h, &r)) return TRUE;
 
     /* 先确保这个窗口的过程被我们接管 —— 即使它现在已经是小窗也要装,
@@ -3604,7 +3824,9 @@ static BOOL CALLBACK EnforceProc(HWND h, LPARAM lp){
     hh = r.bottom - r.top;
 
     TrackGeo(h, &r);
-    GetWindowThreadProcessId(h, &opid);
+    /* 句柄可能刚被销毁: 拿不到 pid 就直接放弃, 否则 opid=0 会掉进"跨进程"
+       分支, 在 enforcer 线程去改自己进程的窗口 (违反下面那条不变式)。 */
+    if (!GetWindowThreadProcessId(h, &opid) || !opid) return TRUE;
 
     /* 自己进程的窗口: 一律"投递"给窗口线程, 绝不在 enforcer 线程直接改 */
     if (opid == g_pid) {
@@ -3623,14 +3845,7 @@ static BOOL CALLBACK EnforceProc(HWND h, LPARAM lp){
             return TRUE;
         }
 
-        st = GetWindowLongPtrW(h, GWL_STYLE);
-        ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
-        if (LooksManaged(h)) {
-            if ((ex & WS_EX_TOPMOST) || (st & WS_POPUP))
-                PostMessageA(h, WM_BYPASS_FIX, 0, 0);
-            return TRUE;
-        }
-        PostMessageA(h, WM_BYPASS_FIX, 0, 0);
+        if (NeedsFix(h)) PostMessageA(h, WM_BYPASS_FIX, 0, 0);
         return TRUE;
     }
 
@@ -3650,8 +3865,7 @@ static BOOL CALLBACK EnforceProc(HWND h, LPARAM lp){
         return TRUE;
     }
 
-    FixOnOwnerThread(h, 0);
-    (*fixedCount)++;
+    if (FixForeignGeometry(h)) (*fixedCount)++;
     return TRUE;
 }
 
@@ -3734,29 +3948,43 @@ static void DumpBigWindows(void)
    (仍然保留 WM_TIMER 那条路: 两条路都只是调 CaptionTick, 幂等。) */
 static DWORD WINAPI CaptionPumpProc(LPVOID p)
 {
+    HWND list[MAX_SUBCLASS];
+    int  i, n;
+
     (void)p;
     for (;;) {
-        int i;
+        if (g_disabled) {              /* 放行状态: 什么都不做, 也不占锁 */
+            Sleep(250);
+            continue;
+        }
 
+        n = 0;
         if (g_subCsReady) {
+            /* ★ 锁里只拷句柄: 以前在锁内做 IsWindow/GetPropA 扫 96 项, 每 250ms
+               一次, 和每条窗口消息都要拿这把锁的 SubOldProc 抢 (不会死锁,
+               但白白拖慢窗口线程)。 */
             EnterCriticalSection(&g_subCs);
-            for (i = 0; i < MAX_SUBCLASS; i++) {
-                HWND h = g_sub[i].h;
-                if (!h || !IsWindow(h)) continue;
-                if (GetPropA(h, PROP_USERMAX))
-                    PostMessageA(h, WM_BYPASS_CAP, 2, 0);
-
-                /* ★ 任务栏最小化锁的定时兜底: 窗口已经不在最小化了
-                   (可能是系统/第三方进程直接改的状态, 不发 WINDOWPOSCHANGED),
-                   而且锁已经打了 1.2 秒以上 —— 交给窗口线程决定是解锁还是压回去。
-                   只 Post, 不在这里跨线程 ShowWindow (会死锁)。 */
-                if (GetPropA(h, PROP_TASKBARMIN) && !IsIconic(h)) {
-                    DWORD t = (DWORD)(ULONG_PTR)GetPropA(h, PROP_TASKBARMIN);
-                    if (t && (DWORD)(GetTickCount() - t) > 1200)
-                        PostMessageA(h, WM_BYPASS_REMIN, 0, 0);
-                }
-            }
+            for (i = 0; i < MAX_SUBCLASS; i++)
+                if (g_sub[i].h) list[n++] = g_sub[i].h;
             LeaveCriticalSection(&g_subCs);
+        }
+
+        for (i = 0; i < n; i++) {
+            HWND h = list[i];
+
+            if (!IsWindow(h)) continue;
+            if (GetPropA(h, PROP_USERMAX))
+                PostMessageA(h, WM_BYPASS_CAP, 2, 0);
+
+            /* ★ 任务栏最小化锁的定时兜底: 窗口已经不在最小化了
+               (可能是系统/第三方进程直接改的状态, 不发 WINDOWPOSCHANGED),
+               而且锁已经打了 1.2 秒以上 —— 交给窗口线程决定是解锁还是压回去。
+               只 Post, 不在这里跨线程 ShowWindow (会死锁)。 */
+            if (GetPropA(h, PROP_TASKBARMIN) && !IsIconic(h)) {
+                DWORD t = (DWORD)(ULONG_PTR)GetPropA(h, PROP_TASKBARMIN);
+                if (t && (DWORD)(GetTickCount() - t) > 1200)
+                    PostMessageA(h, WM_BYPASS_REMIN, 0, 0);
+            }
         }
         Sleep(250);
     }
@@ -3847,6 +4075,44 @@ static BOOL InstallInlineHook(void* target, void* hook, void** realSlot)
         return FALSE;
     }
 
+    /* ★ 优先用"微软 hotpatch 位"打补丁, 这样落笔是一整条 2 字节指令:
+       MSVC 编译的系统 DLL 在每个函数入口前留 5 字节填充 (CC/90), 入口是
+       2 字节的 8B FF (mov edi,edi, 无操作)。做法:
+         p-5 : E9 <rel32 -> hook>       (填充区, 永远不会被执行到)
+         p   : EB F9  (jmp short -7 -> p-5)
+       入口那次写是**对齐的 2 字节单次写**, 线程要么看到旧的两字节, 要么看到
+       新的两字节, 不会执行到半条指令。real = p+2 (跳过 mov edi,edi)。
+       以前直接改 p..p+4 的 5 字节: 渲染器有 500ms 定时器线程在调 ShowWindow,
+       撞上"半个 E9"就是整进程崩。 */
+    if (p[0] == 0x8B && p[1] == 0xFF && p[2] == 0x55 && p[3] == 0x8B && p[4] == 0xEC &&
+        ((DWORD_PTR)p & 1) == 0) {
+        unsigned char* pad = p - 5;
+        BOOL padding = TRUE;
+        int  i;
+
+        for (i = 0; i < 5; i++)
+            if (pad[i] != 0xCC && pad[i] != 0x90) { padding = FALSE; break; }
+
+        if (padding && VirtualProtect(pad, 5, PAGE_EXECUTE_READWRITE, &old)) {
+            *(LONG*)(pad + 1) = (LONG)((unsigned char*)hook - (pad + 5));
+            pad[0] = 0xE9;
+            FlushInstructionCache(GetCurrentProcess(), pad, 5);
+
+            if (VirtualProtect(p, 2, PAGE_EXECUTE_READWRITE, &old)) {
+                *realSlot = (void*)(p + 2);      /* 先更新, 再改入口 */
+                *(WORD*)p = (WORD)0xF9EB;        /* jmp short -7 */
+                FlushInstructionCache(GetCurrentProcess(), p, 2);
+                HookLog("inline hook (hotpatch): %p -> %p (real %p)",
+                        target, hook, (void*)(p + 2));
+                return TRUE;
+            }
+            /* 入口页改不动: 把填充区的补丁撤回 */
+            VirtualProtect(pad, 5, PAGE_EXECUTE_READWRITE, &old);
+            pad[0] = 0xCC;
+            FlushInstructionCache(GetCurrentProcess(), pad, 5);
+        }
+    }
+
     tr = (unsigned char*)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE,
                                       PAGE_EXECUTE_READWRITE);
     if (!tr) return FALSE;
@@ -3912,7 +4178,7 @@ static DWORD WINAPI Worker(LPVOID p)
        映射到 SetWindowLongW/A 的宏), 所以不能把它们当成"必须存在"。 */
     if (!real_SetWindowPos || !real_SetWindowLongW || !real_SetWindowLongA ||
         !real_MoveWindow || !real_SetWindowPlacement || !real_ShowWindow ||
-        !real_ShowCursor) {
+        !real_ShowCursor || !real_SetCursor) {
         HookLog("attach failed: missing user32 exports "
                 "(pos=%p lw=%p la=%p mv=%p wp=%p sw=%p sc=%p)",
                 (void*)real_SetWindowPos, (void*)real_SetWindowLongW,
@@ -4122,6 +4388,14 @@ static void BuildPaths(void)
 
     _snprintf(g_dllPath, sizeof(g_dllPath) - 1, "%s", dll);
     g_dllPath[sizeof(g_dllPath) - 1] = '\0';
+    {
+        /* 记下自己的文件名: HasOurDll 用它判断"目标进程里已经有我们的 DLL",
+           以前硬编码 "bypass_hook32.dll", 换名部署时会一直判没有 -> 每 3 秒
+           重复自注入一次。 */
+        const char* b = strrchr(g_dllPath, '\\');
+        _snprintf(g_dllBase, sizeof(g_dllBase) - 1, "%s", b ? b + 1 : g_dllPath);
+        g_dllBase[sizeof(g_dllBase) - 1] = '\0';
+    }
 
     p = strrchr(dll, '\\');
     if (!p) return;
@@ -4220,14 +4494,43 @@ static void ComputeSmallRect(void)
      崩溃上报/清理逻辑失效 (SDL/渲染器可能自己设过)。 */
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prevUef;
 
+/* 崩溃路径专用日志: 绝不能走 HookLog —— g_logCs 是非递归锁, 而异常很可能
+   正好发生在"已经持有它"的那个线程里 (WriteFile/_vsnprintf 里 AV)。那时再去
+   EnterCriticalSection 就是永久死锁: 崩溃记录写不出来, 宿主原来的
+   UnhandledExceptionFilter 也永远轮不到 (进程挂在异常过滤器里)。
+   这里用一次性的 FILE_APPEND_DATA 句柄, 不加锁、不碰全局状态。 */
+static void CrashLog(const char* text)
+{
+    HANDLE h;
+    DWORD  wrote = 0;
+
+    if (!text || !text[0] || !g_logPath[0]) return;
+    h = CreateFileA(g_logPath, FILE_APPEND_DATA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    WriteFile(h, text, (DWORD)strlen(text), &wrote, NULL);
+    CloseHandle(h);
+}
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 {
     if (ep && ep->ExceptionRecord) {
         DWORD_PTR base = (DWORD_PTR)g_self;
         DWORD_PTR addr = (DWORD_PTR)ep->ExceptionRecord->ExceptionAddress;
-        HookLog("!! crash code=0x%08X addr=%p%s",
-                (unsigned)ep->ExceptionRecord->ExceptionCode, (void*)addr,
-                (addr >= base && addr < base + 0x400000) ? " [inside our dll]" : "");
+        char      line[256];
+        SYSTEMTIME st;
+
+        GetLocalTime(&st);
+        _snprintf(line, sizeof(line) - 1,
+                  "[%02u:%02u:%02u.%03u] [pid %lu] !! crash code=0x%08X addr=%p%s\r\n",
+                  (unsigned)st.wHour, (unsigned)st.wMinute,
+                  (unsigned)st.wSecond, (unsigned)st.wMilliseconds,
+                  (unsigned long)g_pid,
+                  (unsigned)ep->ExceptionRecord->ExceptionCode, (void*)addr,
+                  (addr >= base && addr < base + 0x400000) ? " [inside our dll]" : "");
+        line[sizeof(line) - 1] = '\0';
+        CrashLog(line);
     }
     if (g_prevUef && g_prevUef != CrashFilter)
         return g_prevUef(ep);
@@ -4249,6 +4552,12 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
         InitializeCriticalSection(&g_subCs);
         g_subCsReady = 1;
 
+        InitializeCriticalSection(&g_envCs);
+        g_envCsReady = 1;
+
+        InitializeCriticalSection(&g_geoSs);
+        g_geoSsReady = 1;
+
         BuildPaths();
 
         /* 崩溃取证 (只记录, 继续调用宿主原来的过滤器) */
@@ -4256,7 +4565,10 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
 
         /* DllMain 里只做这些"绝对安全"的事, 其余全交给 Worker 线程。
            这里绝不能 LoadLibrary / GetProcAddress / 等待任何东西。 */
-        CreateThread(NULL, 0, Worker, NULL, 0, NULL);
+        {
+            HANDLE th = CreateThread(NULL, 0, Worker, NULL, 0, NULL);
+            if (th) CloseHandle(th);      /* 线程句柄不用留 (以前一直泄漏) */
+        }
     }
     /* DLL_PROCESS_DETACH 时不要 DeleteCriticalSection: Worker 线程可能还在跑,
        进程退出时由系统回收即可。 */

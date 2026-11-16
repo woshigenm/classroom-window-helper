@@ -75,6 +75,26 @@
     `SetWindowPos(用户矩形)`。
   这样即使应用把 `WS_MAXIMIZE` 位改乱，用户也总能把窗口摆回他要的样子。
 
+实现细节（并发相关，改代码前必读）：
+
+- `BypassUserRc`／几何对照表是**进程内两张表**，由 enforcer 线程和各窗口线程
+  并发读写，统一用 `g_geoSs` 保护。`RECT` 是 4 个 `LONG`，不加锁会读到
+  "新 left + 旧 right"的撕裂矩形，再拿去 `SetWindowPos` 就是"闪一下、位置错乱"。
+- 表满时**轮转覆盖**而不是丢弃：`Student.exe` 的顶层窗口一多，广播窗否则永远
+  拿不到槽 → 没有"用户矩形" → 还原/最大化静默失效（日志里什么都不会留下）。
+- 跨进程兜底（同族进程还没被注入时）**只做异步几何**：`SetWindowPos` 带
+  `SWP_ASYNCWINDOWPOS`，一个样式字节都不写。`SetWindowLong(GWL_STYLE)` 会同步
+  `SendMessage(WM_STYLECHANGING)` 到对端 UI 线程，对端一旦不泵消息（模态框 /
+  断点 / 渲染卡死），我们唯一的 enforcer 线程就被永久挂死。
+- 内联钩子优先用微软 hotpatch 位（入口前 5 字节 `CC/90` 填充 + 入口 `8B FF`）：
+  入口只落一条**对齐的 2 字节** `jmp short`，不存在"半个 `E9 rel32`"的窗口
+  （渲染器有 500ms 定时器线程在调 `ShowWindow`，撞上就是整进程崩）；
+  序言不是这个形状时才退回"搬 5 字节到 trampoline"。
+- 子类化判定看**窗口当前的过程指针**（`GWLP_WNDPROC == SubclassProc`），
+  不能信进程内表：HWND 数值会被系统复用，旧记录会让新窗口永远不再子类化。
+  每个窗口销毁时 `ForgetWindowGeom()` 会把用户矩形 / 几何 / managed / cross
+  几处状态一并清掉。
+
 > 为什么不用 `WS_MAXIMIZE` 当判据：渲染器每 500ms 会把缓存的旧样式写回来（不含
 > `WS_MAXIMIZE`），一旦该位被清掉，窗口就变成「普通窗口 + 满屏几何」——标题栏被顶到
 > 屏幕外 `(-8,-8)`，最大化/还原按钮既看不见也点不到，用户看到的就是"窗口卡死"。
@@ -513,8 +533,11 @@ bypass.exe (普通用户)
 | 关键字 | 含义 |
 |---|---|
 | `attached: <exe> - IAT patched (N entries)` | 注入成功，共 patch 了 N 个导入项 |
+| `inline hook (hotpatch): ... -> ... (real ...)` | 用函数入口前的 5 字节填充位挂的内联钩子（入口只写一条 2 字节 `jmp short`，不会执行到半条指令） |
+| `inline hook installed: ... (trampoline ...)` | 序言不是 hotpatch 形状（`B8`/`68` 等）时退回"搬 5 字节到 trampoline"的写法 |
 | `broadcast_proc=1/0` | 本进程是否被判定为"全屏广播渲染器" |
 | `fix hwnd=... 1918x964` | 首次降级某个窗口 |
+| `fix(foreign, async) hwnd=...` | 降级**别的进程**的窗口：只用 `SWP_ASYNCWINDOWPOS` 改几何，不碰样式（`SetWindowLong` 会同步等对端 UI 线程） |
 | `-> now 868x467 (wanted 868x467)` | 降级后回读，尺寸对得上 |
 | `!! readback mismatch` | 改完回读不一致 → 另有东西在改这个窗口 |
 | `keep user geometry ... (app wanted ...)` | 应用想改尺寸/位置，被冻结 |
