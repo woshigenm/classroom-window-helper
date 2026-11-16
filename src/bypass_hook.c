@@ -70,6 +70,17 @@ static volatile LONG g_workerRunning;
 static HANDLE        g_hWorker;
 static volatile LONG g_captionRunning;
 static HANDLE        g_hCaption;
+
+/* Core-side wrappers: fast passthrough while draining, then count the call.
+   The authoritative count for before_unload is the Loader's (all 33
+   dispatchers); this one is a second layer for direct calls. */
+#define HOOK_ENTER(realCall) \
+    do { \
+        if (InterlockedCompareExchange(&g_coreDisabled, 0, 0)) return (realCall); \
+        InterlockedIncrement(&g_inHookCount); \
+    } while (0)
+
+#define HOOK_LEAVE() InterlockedDecrement(&g_inHookCount)
 static DWORD  g_pid;
 static HMODULE g_self;
 static volatile LONG g_disabled;
@@ -4251,24 +4262,18 @@ static BOOL WINAPI Hook_SetWindowPos(HWND h, HWND after,
                                      int x, int y, int cx, int cy, UINT flags)
 {
     BOOL r;
-
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_SetWindowPos ? real_SetWindowPos(h, after, x, y, cx, cy, flags) : FALSE;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_SetWindowPos ? real_SetWindowPos(h, after, x, y, cx, cy, flags) : FALSE);
     r = Impl_SetWindowPos(h, after, x, y, cx, cy, flags);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
 static BOOL WINAPI Hook_ShowWindow(HWND h, int cmd)
 {
     BOOL r;
-
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_ShowWindow ? real_ShowWindow(h, cmd) : FALSE;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_ShowWindow ? real_ShowWindow(h, cmd) : FALSE);
     r = Impl_ShowWindow(h, cmd);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
@@ -4280,103 +4285,83 @@ static BOOL WINAPI Hook_CreateProcessW(LPCWSTR app, LPWSTR cmd,
                                        LPPROCESS_INFORMATION pi)
 {
     BOOL r;
-
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0)) {
-        return real_CreateProcessW
+    HOOK_ENTER(real_CreateProcessW
                ? real_CreateProcessW(app, cmd, pa, ta, inh, flags, env, cwd, si, pi)
-               : FALSE;
-    }
-    InterlockedIncrement(&g_inHookCount);
+               : FALSE);
     r = Impl_CreateProcessW(app, cmd, pa, ta, inh, flags, env, cwd, si, pi);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
 static LONG WINAPI Hook_SetWindowLongW(HWND h, int idx, LONG val)
 {
     LONG r;
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_SetWindowLongW ? real_SetWindowLongW(h, idx, val) : 0;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_SetWindowLongW ? real_SetWindowLongW(h, idx, val) : 0);
     r = Impl_SetWindowLongW(h, idx, val);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
 static LONG WINAPI Hook_SetWindowLongA(HWND h, int idx, LONG val)
 {
     LONG r;
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_SetWindowLongA ? real_SetWindowLongA(h, idx, val) : 0;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_SetWindowLongA ? real_SetWindowLongA(h, idx, val) : 0);
     r = Impl_SetWindowLongA(h, idx, val);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
 static LONG_PTR WINAPI Hook_SetWindowLongPtrW(HWND h, int idx, LONG_PTR val)
 {
     LONG_PTR r;
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_SetWindowLongPtrW ? real_SetWindowLongPtrW(h, idx, val) : 0;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_SetWindowLongPtrW ? real_SetWindowLongPtrW(h, idx, val) : 0);
     r = Impl_SetWindowLongPtrW(h, idx, val);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
 static LONG_PTR WINAPI Hook_SetWindowLongPtrA(HWND h, int idx, LONG_PTR val)
 {
     LONG_PTR r;
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_SetWindowLongPtrA ? real_SetWindowLongPtrA(h, idx, val) : 0;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_SetWindowLongPtrA ? real_SetWindowLongPtrA(h, idx, val) : 0);
     r = Impl_SetWindowLongPtrA(h, idx, val);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
 static BOOL WINAPI Hook_MoveWindow(HWND h, int x, int y, int w, int hgt, BOOL repaint)
 {
     BOOL r;
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_MoveWindow ? real_MoveWindow(h, x, y, w, hgt, repaint) : FALSE;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_MoveWindow ? real_MoveWindow(h, x, y, w, hgt, repaint) : FALSE);
     r = Impl_MoveWindow(h, x, y, w, hgt, repaint);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
 static BOOL WINAPI Hook_SwitchDesktop(HDESK desk)
 {
     BOOL r;
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_SwitchDesktop ? real_SwitchDesktop(desk) : TRUE;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_SwitchDesktop ? real_SwitchDesktop(desk) : TRUE);
     r = Impl_SwitchDesktop(desk);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
 static int WINAPI Hook_ShowCursor(BOOL show)
 {
     int r;
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_ShowCursor ? real_ShowCursor(show) : 0;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_ShowCursor ? real_ShowCursor(show) : 0);
     r = Impl_ShowCursor(show);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
 static HCURSOR WINAPI Hook_SetCursor(HCURSOR c)
 {
     HCURSOR r;
-    if (InterlockedCompareExchange(&g_coreDisabled, 0, 0))
-        return real_SetCursor ? real_SetCursor(c) : NULL;
-    InterlockedIncrement(&g_inHookCount);
+    HOOK_ENTER(real_SetCursor ? real_SetCursor(c) : NULL);
     r = Impl_SetCursor(c);
-    InterlockedDecrement(&g_inHookCount);
+    HOOK_LEAVE();
     return r;
 }
 
