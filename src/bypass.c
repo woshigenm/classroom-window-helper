@@ -328,6 +328,7 @@ static const char* STARTUP_PROCESS_NAMES[] = {
 /* ========== 全局变量 ========== */
 static HWND g_hwndLog = NULL;
 static HWND g_hwndMain = NULL;
+static volatile LONG g_logGen;   /* bumped by ClearLog; queued WM_APP+1 must match */
 
 /* 静默模式 */
 static BOOL g_silentMode = FALSE;
@@ -626,7 +627,9 @@ void AppendLog(HWND hwnd, const char* fmt, ...) {
         char* copy = (char*)malloc(strlen(buffer) + 1);
         if (copy) {
             strcpy(copy, buffer);
-            if (!PostMessage(g_hwndMain, WM_APP + 1, 0, (LPARAM)copy)) free(copy);
+            if (!PostMessage(g_hwndMain, WM_APP + 1,
+                                 (WPARAM)InterlockedCompareExchange(&g_logGen, 0, 0),
+                                 (LPARAM)copy)) free(copy);
         }
         return;
     }
@@ -681,7 +684,9 @@ void SafeLog(const char* fmt, ...) {
         char* copy = (char*)malloc(strlen(buffer) + 1);
         if (copy) {
             strcpy(copy, buffer);
-            if (!PostMessage(g_hwndMain, WM_APP + 1, 0, (LPARAM)copy)) {
+            if (!PostMessage(g_hwndMain, WM_APP + 1,
+                             (WPARAM)InterlockedCompareExchange(&g_logGen, 0, 0),
+                             (LPARAM)copy)) {
                 free(copy);
             }
         }
@@ -710,12 +715,17 @@ void UpdateStatus(HWND hwnd, const char* status) {
     }
 }
 
+/* 后台线程的日志行是 PostMessage 到 UI 线程的，队列里可能还压着清空之前的行；
+   ClearLog 递增 g_logGen，WM_APP+1 只接受同代消息（见 WndProc）。 */
 /* 清空日志 */
 void ClearLog(HWND hwnd) {
     HWND hLog = GetDlgItem(hwnd, ID_LOG_OUTPUT);
-    if (hLog) {
-        SetWindowText(hLog, "");
-    }
+
+    InterlockedIncrement(&g_logGen);          /* drop already-queued lines */
+    if (!hLog) return;
+    SendMessageW(hLog, WM_SETTEXT, 0, (LPARAM)L"");
+    SendMessageW(hLog, EM_SETSEL, 0, 0);
+    SendMessageW(hLog, EM_SCROLLCARET, 0, 0);
 }
 
 /* ========== 进程操作函数 ========== */
@@ -5779,7 +5789,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_APP + 1: {
             char* text = (char*)lParam;
             if (text) {
-                AppendLog(hwnd, "%s", text);
+                /* a line queued before the last ClearLog must not reappear */
+                if ((LONG)wParam == InterlockedCompareExchange(&g_logGen, 0, 0))
+                    AppendLog(hwnd, "%s", text);
                 free(text);
             }
             return 0;
