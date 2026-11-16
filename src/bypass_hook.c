@@ -172,6 +172,10 @@ static void TryInjectOwner(DWORD pid);
 /* 定义在文件后面 (内联 hook), 关机守卫也要用 */
 static BOOL InstallInlineHook(void* target, void* hook, void** realSlot);
 
+/* 定义在 bypass_shut.inc (在 bypass_vd.inc 之后才 include):
+   0x28 的倒计时窗 (class=ShutDownDlg) 由 CreateWindowExW 钩子压掉。 */
+static int SH_SuppressDialog(HWND hwnd, LPCWSTR cls);
+
 /* 这些进程一律"挂起创建 -> 注入 -> 恢复":
    MultiClient 在收到命令后毫秒级就会 SwitchDesktop, 等 5 秒轮询注进去时
    桌面早就切走了。挂起注入保证 SwitchDesktop 的钩子在它第一次调用前就位。 */
@@ -4376,7 +4380,8 @@ static DWORD WINAPI Worker(LPVOID p)
                     ? "identity match: env/cmdline -> window is the broadcast, no size test"
                     : "not the broadcast renderer -> size fallback only");
         HookLog("dll=%s", g_dllPath[0] ? g_dllPath : "?");
-        HookLog("build=%s %s", __DATE__, __TIME__);
+        HookLog("[build] image=%s dll=bypass_hook32.dll built=%s %s pid=%lu",
+                g_ownImage, __DATE__, __TIME__, (unsigned long)g_pid);
         InitOwnDesktop();
         HookLog("own desktop=%s", g_ownDesktop[0] ? g_ownDesktop : "?");
         HookLog("window_mode=%s (bypass_config.ini)", WindowModeOn() ? "on" : "off");

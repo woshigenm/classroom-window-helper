@@ -153,11 +153,16 @@ enabled=1
 
 - 拦截点：`ExitWindowsEx`（0x27 的直接调用）、`CreateProcessA/W` / `WinExec` /
   `ShellExecuteA/W`（0x28 的 `shutdown -s -t 1`）、`InitiateSystemShutdown*`（未使用，兜底）。
+- 0x28 的**倒计时窗**（`ShutDownDlg`）也会被隐藏：关机已经拦了，再弹一个
+  “系统将在 N 秒后关闭”只会让人以为工具坏了。
 - 被拦的调用会返回"成功"（`TRUE` / `33`），控制端不会当成失败反复重发。
 - 只影响课堂进程（`Student.exe`、`MultiClient.exe` 等被注入的进程）；**你自己点开始菜单关机
   不受影响**。
 - `systemoper.dll` 是运行时才加载的，所以用的是函数入口 inline hook，不是只改 IAT
   （见 `docs\design.md` 2.7）。
+- 版本自检：主界面「检查当前状态」会列出每个课堂进程里 `bypass_hook32.dll` 的构建时间，
+  和磁盘上的 DLL 比对；不一致会提示 **restart the classroom client**——重启 `bypass.exe`
+  不会替换已经注入的旧 DLL。
 
 ## 6. 安全与回退
 

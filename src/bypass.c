@@ -159,6 +159,7 @@
 #define TRAY_RETRY_MAX      20      /* NIM_ADD 失败后最多重试次数 */
 #define TRAY_RETRY_MS       500     /* 重试间隔 */
 #define IDT_TRAY_RETRY      0x52    /* 托盘图标重试定时器 (0x51 被 demote recheck 占用) */
+#define IDT_BUILD_CHECK     0x53    /* 启动后 4 秒: 检查进程内的 DLL 是否与磁盘一致 */
 #define IDM_TRAY_SHOW       2001
 #define IDM_TRAY_UNLOCK     2004
 #define IDM_TRAY_ABOUT      2005
@@ -1807,6 +1808,209 @@ static const char* CONFIG_KEYS_TO_ZERO[] = {
 
 /* ========== 状态检查函数 ========== */
 
+/* ================= 注入 DLL 版本自检 =================
+ *
+ * 问题：Student.exe 里已经加载了 bypass_hook32.dll 时，重启 bypass.exe
+ * 不会替换它（注入器看到 "已经挂着 hook" 就跳过）。于是"新加的守卫/日志
+ * 有没有生效"完全靠猜。
+ *
+ * 判定方式：直接比较 **磁盘上的 DLL** 和 **目标进程内存里的 DLL** 的
+ * PE TimeDateStamp（FileHeader.TimeDateStamp）。这比读日志可靠：
+ *   - 两边是同一个编译器产物时，__TIME__ 天然差几秒，不能直接字符串比；
+ *   - bypass_hook.log 每次启动都会截断，旧进程的 [build] 行会被抹掉；
+ *   - PE 头不受日志、共享内存、版本号影响，而且能一次看到每个进程。
+ * 日志里仍然保留一行 [build]（image + built），方便人工 grep。
+ */
+typedef struct {
+    const char* image;
+    DWORD       pid;
+    DWORD       stamp;      /* 0 = 进程没跑 / DLL 没注入 / 读不到 */
+} DLLPROBE;
+
+static DWORD FindPidByName(const char* name)
+{
+    HANDLE        snap;
+    PROCESSENTRY32 pe;
+    DWORD         pid = 0;
+
+    if (!name) return 0;
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    pe.dwSize = sizeof(pe);
+    if (Process32First(snap, &pe)) {
+        do {
+            if (!_stricmp(pe.szExeFile, name)) { pid = pe.th32ProcessID; break; }
+        } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+    return pid;
+}
+
+/* PE TimeDateStamp of a file on disk (0 = unreadable). */
+static DWORD PeStampFile(const char* path)
+{
+    HANDLE            f;
+    DWORD             rd = 0, stamp = 0;
+    IMAGE_DOS_HEADER  dos;
+    IMAGE_NT_HEADERS32 nt;
+
+    if (!path || !path[0]) return 0;
+    f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    if (ReadFile(f, &dos, sizeof(dos), &rd, NULL) && rd == sizeof(dos) &&
+        dos.e_magic == IMAGE_DOS_SIGNATURE &&
+        SetFilePointer(f, dos.e_lfanew, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER &&
+        ReadFile(f, &nt, sizeof(nt), &rd, NULL) && rd == sizeof(nt) &&
+        nt.Signature == IMAGE_NT_SIGNATURE)
+        stamp = nt.FileHeader.TimeDateStamp;
+    CloseHandle(f);
+    return stamp;
+}
+
+/* PE TimeDateStamp of the module mapped inside `pid` (0 = not loaded/no access). */
+static DWORD PeStampLoaded(DWORD pid, const char* dllName)
+{
+    HANDLE            snap, hp;
+    MODULEENTRY32     me;
+    DWORD             stamp = 0;
+    SIZE_T            rd = 0;
+    IMAGE_DOS_HEADER  dos;
+    IMAGE_NT_HEADERS32 nt;
+
+    if (!pid || !dllName) return 0;
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    me.dwSize = sizeof(me);
+    if (Module32First(snap, &me)) {
+        do {
+            if (_stricmp(me.szModule, dllName) != 0) continue;
+
+            hp = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+                             FALSE, pid);
+            if (hp) {
+                if (ReadProcessMemory(hp, me.modBaseAddr, &dos, sizeof(dos), &rd) &&
+                    dos.e_magic == IMAGE_DOS_SIGNATURE &&
+                    ReadProcessMemory(hp, (BYTE*)me.modBaseAddr + dos.e_lfanew,
+                                      &nt, sizeof(nt), &rd) &&
+                    nt.Signature == IMAGE_NT_SIGNATURE)
+                    stamp = nt.FileHeader.TimeDateStamp;
+                CloseHandle(hp);
+            }
+            break;
+        } while (Module32Next(snap, &me));
+    }
+    CloseHandle(snap);
+    return stamp;
+}
+
+static void StampText(DWORD stamp, char* out, DWORD n)
+{
+    ULARGE_INTEGER u;
+    FILETIME       ft;
+    SYSTEMTIME     st;
+
+    if (!out || n < 8) return;
+    if (!stamp) {
+        _snprintf(out, n - 1, "(unknown)");
+        out[n - 1] = '\0';
+        return;
+    }
+    u.QuadPart = ((ULONGLONG)stamp + 11644473600ULL) * 10000000ULL;
+    ft.dwLowDateTime  = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    if (FileTimeToLocalFileTime(&ft, &ft) && FileTimeToSystemTime(&ft, &st))
+        _snprintf(out, n - 1, "%04u-%02u-%02u %02u:%02u:%02u",
+                  (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+                  (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
+    else
+        _snprintf(out, n - 1, "stamp:%lu", (unsigned long)stamp);
+    out[n - 1] = '\0';
+}
+
+/* verbose=1: 把逐进程结果写进日志（给「检查当前状态」用）
+   verbose=0: 只在发现旧 DLL 时警告（给启动后的一次性定时器用） */
+static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
+{
+    static const char* images[] = { "Student.exe", "MultiClient.exe",
+                                    "ScreenRecord.exe", "ScreenRender.exe" };
+    char  dll[MAX_PATH] = "";
+    char  dir[MAX_PATH] = "";
+    char  stale[160] = "";
+    DWORD disk, oldStamp = 0;
+    int   i, staleCount = 0;
+
+    if (GetModuleFileNameA(NULL, dir, sizeof(dir))) {
+        char* p = strrchr(dir, '\\');
+        if (p) {
+            *(p + 1) = '\0';
+            PathCombineA(dll, dir, "bypass_hook32.dll");
+        }
+    }
+    disk = dll[0] ? PeStampFile(dll) : 0;
+
+    if (verbose) {
+        char t[40];
+
+        AppendLog(hwnd, "\r\n--- Guard Status ---\r\n");
+        AppendLog(hwnd, "  screen guard   : %s (bin\\bypass_screen.ini)\r\n",
+                  g_screenGuard ? "ON" : "off");
+        AppendLog(hwnd, "  shutdown guard : %s (bin\\bypass_shut.ini)\r\n",
+                  g_shutGuard ? "ON" : "off");
+        StampText(disk, t, sizeof(t));
+        AppendLog(hwnd, "  DLL on disk    : %s\r\n", disk ? t : "NOT FOUND");
+    }
+
+    for (i = 0; i < (int)(sizeof(images) / sizeof(images[0])); i++) {
+        DLLPROBE pr;
+        char     t[40];
+
+        pr.image = images[i];
+        pr.pid   = FindPidByName(images[i]);
+        pr.stamp = pr.pid ? PeStampLoaded(pr.pid, "bypass_hook32.dll") : 0;
+
+        if (!pr.pid) {
+            if (verbose)
+                AppendLog(hwnd, "  %-14s : not running\r\n", pr.image);
+            continue;
+        }
+        if (!pr.stamp) {
+            if (verbose)
+                AppendLog(hwnd, "  %-14s : DLL not loaded / no access\r\n", pr.image);
+            continue;
+        }
+
+        StampText(pr.stamp, t, sizeof(t));
+        if (disk && pr.stamp != disk) {
+            if (!oldStamp) oldStamp = pr.stamp;
+            if (stale[0]) strncat(stale, ", ", sizeof(stale) - strlen(stale) - 1);
+            strncat(stale, pr.image, sizeof(stale) - strlen(stale) - 1);
+            staleCount++;
+            if (verbose)
+                AppendLog(hwnd, "  %-14s : DLL %s  <== OLD (restart the classroom client)\r\n",
+                          pr.image, t);
+        } else if (verbose) {
+            AppendLog(hwnd, "  %-14s : DLL %s  (current)\r\n", pr.image, t);
+        }
+    }
+
+    if (staleCount) {
+        char told[40], tnew[40];
+
+        StampText(oldStamp, told, sizeof(told));
+        StampText(disk, tnew, sizeof(tnew));
+        AppendLog(hwnd, "\r\n[Build] WARNING: %s 里还是旧 DLL（%s），磁盘上是 %s。\r\n"
+                        "[Build] 旧的守卫仍然有效，但新加的日志/钩子要重启课堂客户端才会加载。\r\n",
+                  stale, told, tnew);
+        UpdateStatus(hwnd, "Status: WARNING - old DLL in classroom client (restart it)");
+        return TRUE;
+    }
+
+    if (verbose && disk)
+        AppendLog(hwnd, "  (all classroom processes run the current DLL)\r\n");
+    return FALSE;
+}
+
 BOOL CheckStatus(HWND hwnd) {
     AppendLog(hwnd, "\r\n[Status] Checking system status...\r\n");
     UpdateStatus(hwnd, "Status: Checking...");
@@ -1824,6 +2028,9 @@ BOOL CheckStatus(HWND hwnd) {
     BOOL driverInstalled = IsDriverInstalled();
     AppendLog(hwnd, "  %-20s: %s\r\n", DRIVER_SERVICE_NAME,
         driverInstalled ? "INSTALLED" : "NOT INSTALLED");
+
+    /* 注入 DLL 的版本自检 + 两个守卫的开关状态 (磁盘 DLL vs 进程内 DLL) */
+    BuildStatusReport(hwnd, TRUE);
     
     /* 检查配置 (用安装目录定位, 而不是 exe 所在目录; 不再用硬编码偏移取值) */
     AppendLog(hwnd, "\r\n--- Config Status ---\r\n");
@@ -5616,6 +5823,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 TrayAdd(hwnd);
                 return 0;
             }
+            if (wParam == IDT_BUILD_CHECK) {
+                KillTimer(hwnd, IDT_BUILD_CHECK);
+                BuildStatusReport(hwnd, FALSE);   /* 只在旧 DLL 时警告 */
+                return 0;
+            }
             break;
 
         case WM_DESTROY:
@@ -5927,6 +6139,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ShowWindow(hwnd, SW_SHOWNORMAL);
     UpdateWindow(hwnd);
     AppendLog(hwnd, "[UI] window shown at startup (nCmdShow=%d)\r\n", nCmdShow);
+
+    /* 等注入器把 DLL 送进去之后, 检查"进程里的 DLL 是不是磁盘上的这个":
+       旧 DLL 不会因为重启本程序而替换 (注入器会跳过已注入的进程)。 */
+    SetTimer(hwnd, IDT_BUILD_CHECK, 4000, NULL);
 
     /* 如果指定了 /auto, 自动执行一次一键绕过。
        ★ 投递到消息循环里跑: AutoAllCore 里有 Sleep + 等驱动停止 (最坏几十秒),

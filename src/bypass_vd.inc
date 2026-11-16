@@ -751,6 +751,9 @@ static HWND WINAPI Hook_CreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name
     if (!real) return NULL;
 
     hw = real(exStyle, cls, name, style, x, y, w, h, parent, menu, inst, param);
+    /* 0x28 的倒计时窗 (class=ShutDownDlg) 建出来就藏掉: 关机已经被拦了,
+       再弹一个"系统将在 N 秒后关闭"只会让人以为工具坏了。 */
+    if (hw && SH_SuppressDialog(hw, cls)) return hw;
     /* still hidden here (dwStyle has no WS_VISIBLE in ScreenRender.exe), so
        moving it now means it can never flash on the wrong desktop */
     if (hw && !g_disabled) VD_PinNow(hw, "create");

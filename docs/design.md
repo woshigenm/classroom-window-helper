@@ -602,6 +602,24 @@ FUN_00413560(cmd)
     `[Guard] blocked 25 remote power commands (last: ...)`。
   - 开关状态只在**变化**时记一行；默认关闭不再为每个进程打印 "off"。
 
+- 0x28 的**倒计时窗**：`CShutDownDlg` 的窗口类名就是 `ShutDownDlg`
+  （`Student.exe` 的 `FUN_0040d560` 直接 `return L"ShutDownDlg"`；`StuShutDownWnd.xml`
+  只是 DuiLib 皮肤）。`CreateWindowExW` 钩子在窗口建出来后立刻 `ShowWindow(SW_HIDE)`，
+  不会再出现"系统将在 N 秒后关闭"。故意**不**投递 `WM_CLOSE`：DuiLib 的
+  `WindowImplBase::OnClose` 常常直接 `PostQuitMessage(0)`，非模态场景会把 `Student.exe`
+  的整个消息循环结束掉；隐藏就够了——倒计时走完仍会调 `SYS_RunCommand`，而那条路已经被
+  `CreateProcess` 钩子拦下。
+
+- **版本自检**：DLL 在每个进程写一行
+  `[build] image=Student.exe dll=bypass_hook32.dll built=Nov 16 2026 21:08:38 pid=6116`。
+  主程序判断"进程里的是不是新 DLL"**不靠这行日志**，而是比较**磁盘 DLL** 与**进程内
+  DLL** 的 PE `FileHeader.TimeDateStamp`：
+  - `bypass_hook.log` 每次启动都会截断，旧进程的 `[build]` 行会被抹掉；
+  - `bypass.exe` 和 `bypass_hook32.dll` 是两次编译，`__TIME__` 天然差几秒，字符串比对会误报；
+  - PE 头不受日志/共享内存/版本号影响，还能一次看到 `Student.exe`、`MultiClient.exe`、
+    `ScreenRecord.exe`、`ScreenRender.exe` 各自加载的是哪个版本。
+  启动 4 秒后自动查一次（不一致就警告），「检查当前状态」里也会逐进程列出构建时间。
+
 > **自测注意（血泪教训）**：`tests\shutguard_test.c` **不允许**调用
 > `ExitWindowsEx`（实测 `ExitWindowsEx(0x80000000, 0)` 会被 Windows 当成关机，直接把机器关掉），
 > 也不允许出现裸的 `shutdown -s -t 1`（会解析到 `System32\shutdown.exe`）。

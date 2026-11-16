@@ -256,6 +256,41 @@ static int SH_On(void)
     return (g_shutEnabled == 1) ? 1 : 0;
 }
 
+/* 0x28 会先弹 CShutDownDlg（窗口类 L"ShutDownDlg"，Student.exe FUN_0040d560
+   返回的就是这个字符串）再执行 shutdown。CreateProcess 已经被吞掉，但倒计时
+   窗还是会弹出来，用户看到的是"系统将在 N 秒后关闭"，然后什么都没发生。
+   这里在窗口创建后立即隐藏。
+
+   故意**不**投递 WM_CLOSE：DuiLib 的 WindowImplBase::OnClose 往往直接
+   PostQuitMessage(0)，在非模态场景会把 Student.exe 的整个消息循环结束掉。
+   隐藏就够了 —— 倒计时走完照样会调 SYS_RunCommand，而那条路已经被
+   CreateProcess 钩子拦下，不会再关机。 */
+static volatile LONG g_shutDlgLogged;
+
+static int SH_SuppressDialog(HWND hwnd, LPCWSTR cls)
+{
+    wchar_t name[64];
+    char    a[64];
+
+    if (!hwnd || !SH_On()) return 0;
+
+    /* class atom (MAKEINTATOM) 不是字符串指针，先取回真实类名 */
+    if (!cls || (ULONG_PTR)cls < 0x10000) {
+        if (!GetClassNameW(hwnd, name, 64)) return 0;
+        cls = name;
+    }
+    if (!SH_HasW(cls, L"ShutDown")) return 0;
+
+    ShowWindow(hwnd, SW_HIDE);
+    if (InterlockedIncrement(&g_shutDlgLogged) == 1) {
+        a[0] = '\0';
+        WideCharToMultiByte(CP_ACP, 0, cls, -1, a, sizeof(a) - 1, NULL, NULL);
+        a[sizeof(a) - 1] = '\0';
+        HookLog("[Guard] shutdown dialog suppressed (class=%s)", a);
+    }
+    return 1;
+}
+
 static int SH_BlockA(const char* app, const char* cmd, const char* api)
 {
     char what[420];
