@@ -1,6 +1,6 @@
-# 设计与实现
+# 设计与实现（v2.0）
 
-> 本文说明「小窗化广播」的核心机制、开关、日志、自测和已知限制。
+> 本文说明「小窗化广播」的核心机制、Loader/Core 分层与热重载、开关、日志、自测和已知限制。
 > 使用方法见 [`how-to-use.md`](how-to-use.md)。
 
 ---
@@ -1240,7 +1240,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1 -NoBuild -
 ```
 
 `run_all.ps1` 先构建 `all / fakecores / testcores / corehost / uitest / wmodetest /
-screentest / shuttest`，然后依次跑 12 个套件：
+screentest / shuttest`，然后依次跑 13 个套件：
 
 | 套件 | 覆盖 |
 |---|---|
@@ -1254,6 +1254,7 @@ screentest / shuttest`，然后依次跑 12 个套件：
 | shutguard | 关机/重启拦截 |
 | reentry | 阶段 2 失败后 6 个 inline hook 直通（半禁用期的 hook 语义） |
 | reload_hooks | 重载成功后 hook 立即恢复（g_unloading 复位；WH_MOUSE_LL 探针） |
+| status_uaf | 卸载成功 + 新 Core 加载失败后 `status` 返回 `core=?`（不读悬空 build_id） |
 | version | P3 自检：current / OLD+「重载」/ 磁盘重写不给建议 |
 | multi | 4 进程一次点击、管道并发、慢 reload 期间的状态检查、崩溃隔离 |
 

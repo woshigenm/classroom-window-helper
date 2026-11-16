@@ -1,9 +1,23 @@
-# 噢易多媒体网络教室 V10.8 —— 学生端「小窗化广播」工具
+# 噢易多媒体网络教室 V10.8 —— 学生端「小窗化广播」工具 v2.0
 
 把教师端的**全屏广播**变成学生端**可拖动 / 可缩放 / 可最大化**的普通窗口，
 并默认把广播窗钉在一号虚拟桌面（切到别的桌面后再广播，不会被拽回去）。
 
 原理见 [`docs/design.md`](docs/design.md)，上手 / 快捷键 / 故障排查见 [`docs/how-to-use.md`](docs/how-to-use.md)。
+
+**v2.0 变更（相对 v1.x）**
+
+- 注入 DLL 拆成 **Loader（`bypass_hook32.dll`）+ Core（`bypass_hook_core.dll`）**：
+  只改拦截逻辑时 `make.bat core` + 界面「重载 Core」即可，**不用重启课堂客户端**。
+- 热重载：缓存副本、失败回滚、阶段 1/2 卸载、`g_coreDead` 终态、
+  控制管道 `status` / `reload` / `reload norollback`。
+- 版本自检改成**内容哈希**：区分「Core 旧 → 点重载」和「Loader 旧 → 重启客户端」，
+  并识别「构建正在重写 DLL」。
+- 半禁用语义收敛：重载失败后 22 个入口直通，只剩安全类（抓屏冻结、关机入口、输入锁）生效。
+- 多实例/并发验证（4 进程一次重载、管道并发、崩溃隔离）。
+- 修复：重载成功后 hook 全哑（`g_unloading` 未复位）、`status` 读已卸载 Core 的 `build_id`（UAF）、
+  控制管道 `ERROR_PIPE_BUSY` 误判、Core 初始化与卸载的线程竞态。
+- `core_cache` 孤儿自愈；`make.bat core` 只编 Core，版本自检不会误报 Loader 旧。
 
 ## 1. 交付文件（都在 `bin\`，必须同一目录）
 
@@ -58,7 +72,7 @@ make.bat fakecores | testcores | corehost   :: 失败注入用的假/坏 Core、
 make.bat clean | rebuild | check
 ```
 
-跑全部回归（构建 + 12 个套件，任一失败退出码非 0）：
+跑全部回归（构建 + 13 个套件，任一失败退出码非 0）：
 
 ```bat
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1
@@ -84,18 +98,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1
 classroom-window-helper\
 ├─ .editorconfig                编码 / 换行约定（UTF-8，.bat 纯 ASCII）
 ├─ make.bat  Makefile          构建入口（工具链自动探测）
-├─ src\                        交付组件源码
-│   ├─ bypass.c                主程序：界面 / 托盘 / 注入调度
-│   ├─ bypass_hook.c           注入 DLL（含 bypass_vd.inc：虚拟桌面固定）
+├─ src\                        全部 C 源码
+│   ├─ bypass.c                主程序：界面 / 托盘 / 注入调度 / 守卫开关
+│   ├─ loader.c                **Loader**：钩子、trampoline、缓存/重载/回滚、控制管道、UEF
+│   ├─ bypass_hook.c           **Core**：Hook 实现、Worker、子类化
+│   ├─ bypass_vd.inc           Core 内：虚拟桌面钉住
+│   ├─ bypass_screen.inc       Core 内：屏幕监控守卫（冻结首帧）
+│   ├─ bypass_shut.inc         Core 内：远程关机/重启守卫
+│   ├─ bypass_abi.h            Loader ↔ Core 的 ABI（HrHost / HrCoreApi / HrHooks）
+│   ├─ bypass_hash.h           FNV-1a（Loader 与 UI 共用的内容哈希）
+│   ├─ bypass_state.h          主程序 / DLL 共享状态
 │   ├─ inject32.c              注入器
 │   ├─ elevate.c / elevate.h   启动提权：lpe / uac / manual / off
-│   ├─ lpe_broker.c            自动提权用 shell_broker.exe
-│   └─ bypass_state.h          主程序 / DLL 共享状态
-├─ lpe\                        自动提权载荷（trigger.ps1 + payload\ 里的 PoC 原样二进制）
-├─ tests\                      自测源码（hooktest32 / wmode_test / vd_pin_test / hangwin_test）
+│   └─ lpe_broker.c            自动提权用 shell_broker.exe
+├─ lpe\                        自动提权载荷（trigger.ps1 + payload\ 预编译二进制）
+├─ tests\                      自测：C 载体（core_host / wmode_test / …）+ 13 个 .ps1 套件
 ├─ build\                      编译 / 签名 / 打包脚本（说明见 build\README.md）
 ├─ docs\                       how-to-use.md（手册）、design.md（原理）
-└─ bin\                        所有编译产物 + 运行期配置 / 日志（gitignore）
+└─ bin\                        编译产物 + 运行期配置 / 日志（gitignore）
 ```
 
 ## 5. 运行期配置与安全阀

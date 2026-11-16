@@ -1,5 +1,5 @@
-param(
-    [string]$Version = "v1.2.0",
+﻿param(
+    [string]$Version = "v2.0.0",
     [string]$OutDir = "",
     [string]$Pfx = "",
     [string]$Password = "",

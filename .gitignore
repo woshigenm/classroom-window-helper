@@ -29,3 +29,6 @@
 .idea/
 Thumbs.db
 desktop.ini
+
+# ---- test artifacts ------------------------------------------------
+tests/hooktest_result.txt

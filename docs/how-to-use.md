@@ -1,4 +1,4 @@
-# 使用手册（classroom-window-helper）
+# 使用手册（classroom-window-helper v2.0）
 
 > 本工具只解决本机全屏广播问题：把广播变成可拖动小窗、解锁键盘。
 

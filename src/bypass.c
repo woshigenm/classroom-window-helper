@@ -1,5 +1,5 @@
 /*
- * Classroom Control Bypass Tool v1.2
+ * Classroom Control Bypass Tool v2.0
  * 噢易多媒体网络教室 (V10.8.0.3895) 课堂控制解除工具
  *
  * ===========================================================================
@@ -129,8 +129,16 @@
 
 
 /* ========== 常量定义 ========== */
+
+/* 版本号唯一来源：改这里就同时改窗口标题 / 启动 banner / 关于框 / 静默模式输出。
+   ABI 版本（bypass_abi.h 的 HR_ABI_VERSION）和共享状态版本
+   （bypass_state.h 的 BYPASS_STATE_VERSION）是**协议**版本，网络/内存布局一改才动，
+   跟产品版本无关，不要跟着这里改。 */
+#define APP_VERSION_W   L"2.0"
+#define APP_VERSION_A   "2.0"
+
 #define WINDOW_CLASS    L"ClassroomBypassClass"
-#define WINDOW_TITLE    L"教学控制解除工具 v1.2"
+#define WINDOW_TITLE    L"教学控制解除工具 v" APP_VERSION_W
 
 /* 控件ID */
 #define ID_BTN_UNLOCK_KB    1001
@@ -5449,7 +5457,7 @@ static void TrayShowMenu(HWND hwnd) {
     case IDM_TRAY_ABOUT:
         ShowMainWindow(hwnd);
         AppendLog(hwnd,
-            "\r\n[Info] 教学控制解除工具 v1.2\r\n"
+            "\r\n[Info] 教学控制解除工具 v" APP_VERSION_A "\r\n"
             "[Info] 托盘: 左键单击=显示/隐藏, 右键=菜单, Ctrl+Alt+X=应急\r\n");
         break;
     case IDM_TRAY_EXIT:
@@ -5722,7 +5730,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             }
 
-            AppendLog(hwnd, "Classroom Bypass Tool v1.2 initialized.\r\n");
+            AppendLog(hwnd, "Classroom Bypass Tool v" APP_VERSION_A " initialized.\r\n");
             AppendLog(hwnd, "Hint: hover any button to see what it does (bottom-right).\r\n");
             AppendLog(hwnd, "Hotkeys (global, work even when the classroom tool grabs the mouse):\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+H  show / hide this panel\r\n");
@@ -6318,7 +6326,7 @@ static int RunSilentMode(void) {
     g_logFile = fopen(logPath, "w");
 
     printf("========================================\n");
-    printf("  Classroom Bypass Tool v1.1 (Silent)\n");
+    printf("  Classroom Bypass Tool v" APP_VERSION_A " (Silent)\n");
     printf("========================================\n\n");
 
     printf("[Silent] Running full auto bypass...\n");

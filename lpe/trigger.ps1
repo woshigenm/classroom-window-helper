@@ -149,6 +149,15 @@ if ($LASTEXITCODE -ne 0 -or -not $original) {
     Set-Stage 'could not read the Documents path'
     exit 4
 }
+
+# A previous run that died between "set" and "restore" leaves Documents pointing
+# into the LPE temp root.  Capturing that as "original" would restore the stale
+# redirect forever (and the wallet callback would seed into the wrong folder).
+$lpeRoot = Join-Path $env:LOCALAPPDATA 'ClassroomBypass-LPE'
+if ($original.TrimEnd('\') -like "$lpeRoot*") {
+    $original = Join-Path $env:USERPROFILE 'Documents'
+    Set-Stage "documents stale redirect under LPE root -> using $original"
+}
 Set-Stage "documents original=$original"
 
 try {
