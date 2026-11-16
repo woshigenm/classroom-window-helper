@@ -1670,6 +1670,30 @@ static DWORD WINAPI CtlThread(LPVOID p)
     return 0;
 }
 
+/* Strict Loader cache name: core.<pid>.<seq>.dll (both numeric).  Anything
+   else in the directory is left alone: "don't touch what you don't recognise"
+   beats deleting a hand-made / truncated / older-format file.  Parse failure
+   (pid==0, missing seq, junk suffix) => 0 => keep. */
+static int ParseCacheName(const char* name, unsigned long* pidOut)
+{
+    const char*   p;
+    char*         end = NULL;
+    unsigned long pid;
+
+    if (!name || _strnicmp(name, "core.", 5) != 0) return 0;
+    p = name + 5;
+    if (*p < '0' || *p > '9') return 0;          /* no pid digits */
+    pid = strtoul(p, &end, 10);
+    if (!end || *end != '.') return 0;           /* pid not followed by '.' */
+    p = end + 1;
+    if (*p < '0' || *p > '9') return 0;          /* no seq digits */
+    (void)strtoul(p, &end, 10);
+    if (!end || _stricmp(end, ".dll") != 0) return 0;   /* must end at ".dll" */
+    if (!pid) return 0;
+    *pidOut = pid;
+    return 1;
+}
+
 /* Cache copies are left behind on purpose when a load fails *after* the module
    was initialized (bad ABI / incomplete hook table are kept mapped), and never
    deleted after coreDead.  Nothing references those files and only the owning
@@ -1684,7 +1708,7 @@ static void CleanOrphanCaches(void)
     char  dir[MAX_PATH], pat[MAX_PATH];
     WIN32_FIND_DATAA fd;
     HANDLE fh;
-    int removed = 0, kept = 0;
+    int removed = 0;
 
     _snprintf(dir, sizeof(dir) - 1, "%s%s", g_baseDir, HR_CACHE_DIR);
     dir[sizeof(dir) - 1] = '\0';
@@ -1695,27 +1719,20 @@ static void CleanOrphanCaches(void)
     if (fh == INVALID_HANDLE_VALUE) return;
 
     do {
-        char*          end = NULL;
-        unsigned long  pid;
+        unsigned long  pid = 0;
         char           full[MAX_PATH];
         HANDLE         hp;
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (_strnicmp(fd.cFileName, "core.", 5) != 0) continue;
-
-        pid = strtoul(fd.cFileName + 5, &end, 10);
-        if (!pid || !end || *end != '.' || pid == (unsigned long)g_pid) continue;
+        if (!ParseCacheName(fd.cFileName, &pid)) continue;   /* unknown: keep */
+        if (pid == (unsigned long)g_pid) continue;
 
         hp = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
         if (hp) {
             CloseHandle(hp);            /* pid still alive: keep */
-            kept++;
             continue;
         }
-        if (GetLastError() != ERROR_INVALID_PARAMETER) {
-            kept++;                     /* access denied: assume alive */
-            continue;
-        }
+        if (GetLastError() != ERROR_INVALID_PARAMETER) continue;  /* denied: keep */
 
         _snprintf(full, sizeof(full) - 1, "%s\\%s", dir, fd.cFileName);
         full[sizeof(full) - 1] = '\0';
@@ -1723,8 +1740,8 @@ static void CleanOrphanCaches(void)
     } while (FindNextFileA(fh, &fd));
     FindClose(fh);
 
-    if (removed || kept)
-        HookLog("[Loader] cache: %d orphan(s) removed, %d live kept", removed, kept);
+    if (removed)
+        HookLog("[Loader] cache: %d orphan(s) removed", removed);
 }
 
 static DWORD WINAPI Manager(LPVOID p)

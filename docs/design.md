@@ -716,6 +716,10 @@ P2b = 上面第 2 步的十项真正实现。
   `core.*.dll`，按 `<pid>` 用 `OpenProcess(SYNCHRONIZE)` 判断进程是否还在，
   只在 `ERROR_INVALID_PARAMETER`（pid 不存在）时删除；被映射的文件删不掉，
   `DeleteFileA` 失败即跳过。pid 复用会漏删（留下垃圾，不是误删）。
+  文件名解析是严格的 `core.<digits>.<digits>.dll`：`core.1234.dll`（缺 seq）、
+  `core.abc.1.dll`、`core.0.1.dll`、`core.1.2.tmp.dll`、`other.txt` 一律**不动**
+  ——「不认识的就不删」比「不认识的删掉」安全。日志只在真删了东西时打一行
+  `[Loader] cache: N orphan(s) removed`（并发注入时不会每个进程都刷一行）。
 - 控制管道 `\\.\pipe\bypass_core_ctl_<pid>`，一行命令 / 一行响应：
   `status`、`reload`、`reload norollback`（`norollback` 用于调试，失败时不回滚）。
   消息模式下请求超过 127 字节时 `ReadFile` 返回 `ERROR_MORE_DATA`，必须把剩余消息
