@@ -149,7 +149,8 @@
 #define ID_HOTKEY_PANEL     1307    /* Ctrl+Alt+H 显示/隐藏主面板 */
 #define ID_HOTKEY_DESKTOP   1308    /* Ctrl+Alt+D 立即切回 Default 桌面 */
 #define ID_HOTKEY_CLICK     1309    /* Ctrl+Alt+E 应急点击 (穿过 MultiClient 的鼠标钩子) */
-#define ID_HOTKEY_LAST      ID_HOTKEY_CLICK
+#define ID_HOTKEY_SCREEN    1310    /* Ctrl+Alt+M 屏蔽屏幕监控 (备用入口) */
+#define ID_HOTKEY_LAST      ID_HOTKEY_SCREEN
 
 /* 托盘 */
 #define WM_TRAYICON         (WM_APP + 2)
@@ -383,7 +384,7 @@ static const BTNDEF g_btnDefs[] = {
 
     /* ---- 第 3 行: 屏幕监控守卫 (整行) ---- */
     { ID_BTN_SCREENGUARD, L"屏蔽屏幕监控", L"开关: 开=老师端只能看到定格画面(不传实时桌面); 关=正常",
-      UI_SUCCESS,     RGB(60,170,110), RGB(40,140,90), 0, NULL },
+      UI_SUCCESS,     RGB(60,170,110), RGB(40,140,90), 0, L"Ctrl+Alt+M" },
 
     /* ---- 底部按钮 (不参与网格布局) ---- */
     { ID_BTN_CHECK_STATUS,L"检查当前状态", L"只读诊断: 权限/驱动/进程/配置/当前桌面",
@@ -4386,12 +4387,16 @@ static void OnScreenGuardToggle(HWND hwnd)
     /* 守卫逻辑在注入的 DLL 里: 打开时确保它已经进了 Student.exe 等进程 */
     if (g_screenGuard) RunInjector(hwnd, TRUE);
 
-    AppendLog(hwnd, "\r\n[Screen] 屏幕监控守卫 -> %s (bin\\bypass_screen.ini)\r\n"
-                    "[Screen] %s\r\n",
-              g_screenGuard ? "开" : "关",
-              g_screenGuard
-                  ? "第一次抓屏存成定格帧, 之后老师端只看到这张静止画面"
-                  : "恢复正常上传");
+    /* ⚠ 中文只能写在**格式串**里: AppendLog 只把格式串从 UTF-8 转成 ACP,
+       而 %s 的实参按 ACP 处理 —— 直接把 "开"/"关" 当参数传会变成
+       "寮€/鍏?" 这种乱码 (UTF-8 字节被当成 GBK 显示)。 */
+    if (g_screenGuard) {
+        AppendLog(hwnd, "\r\n[Screen] 屏幕监控守卫 -> 开 (bin\\bypass_screen.ini)\r\n"
+                        "[Screen] 第一次抓屏存成定格帧, 之后老师端只看到这张静止画面\r\n");
+    } else {
+        AppendLog(hwnd, "\r\n[Screen] 屏幕监控守卫 -> 关 (bin\\bypass_screen.ini)\r\n"
+                        "[Screen] 恢复正常上传\r\n");
+    }
     UpdateStatus(hwnd, g_screenGuard ? "Status: screen guard ON (frozen frame)"
                                      : "Status: screen guard OFF");
     {
@@ -4988,6 +4993,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     { ID_HOTKEY_STICKY,   'T', "Ctrl+Alt+T 持续保持小窗" },
                     { ID_HOTKEY_DESKTOP,  'D', "Ctrl+Alt+D 立即切回桌面" },
                     { ID_HOTKEY_CLICK,    'E', "Ctrl+Alt+E 应急点击" },
+                    { ID_HOTKEY_SCREEN,   'M', "Ctrl+Alt+M 屏蔽屏幕监控 (备用)" },
                     { ID_HOTKEY_QUIT,     'Q', "Ctrl+Alt+Q 退出" },
                 };
                 int i;
@@ -5006,6 +5012,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             AppendLog(hwnd, "  Ctrl+Alt+T  sticky small window (toggle)\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+D  restore desktop (if trapped on NetTeachingDesktop)\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+E  emergency click (passes MultiClient's mouse hook)\r\n");
+            AppendLog(hwnd, "  Ctrl+Alt+M  screen-monitor guard (frozen frame) toggle\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+Q  quit\r\n");
             AppendLog(hwnd, "  Ctrl+Alt+X  EMERGENCY: kill classroom processes\r\n");
             AppendLog(hwnd, "Click 'Check Status' for a read-only scan.\r\n");
@@ -5378,6 +5385,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+E -> emergency click sent "
                                 "(dwExtraInfo=0x12452)\r\n");
                 return 0;
+            /* 备用入口: 面板被关掉/点不到时也能切换 (主入口是主界面的按钮) */
+            case ID_HOTKEY_SCREEN:
+                AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+M -> screen-monitor guard toggle\r\n");
+                OnScreenGuardToggle(hwnd);
+                return 0;
             case ID_HOTKEY_QUIT:
                 AppendLog(hwnd, "\r\n[Hotkey] Ctrl+Alt+Q -> exit\r\n");
                 DestroyWindow(hwnd);
@@ -5506,6 +5518,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
     return 0;
+}
+
+/* 让本窗口不出现在任何抓屏里 —— 老师端监控/录屏/截图都拍不到工具界面。
+   WDA_EXCLUDEFROMCAPTURE(0x11, Win10 2004+): 直接从抓屏画面里排除;
+   更老的系统退化成 WDA_MONITOR(1): 抓屏里是一块黑, 至少不泄露界面内容。
+   注意这是"窗口级"设置, 对 BitBlt/PrintWindow/DXGI 抓屏都生效。 */
+static void ExcludeOwnWindowFromCapture(HWND hwnd)
+{
+    DWORD aff = 0;
+    BOOL  ok;
+
+    if (!hwnd) return;
+    ok = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+    if (!ok) ok = SetWindowDisplayAffinity(hwnd, WDA_MONITOR);
+    if (!GetWindowDisplayAffinity(hwnd, &aff)) aff = 0;
+    FileLog("[Screen] own window capture affinity=0x%lx (%s)",
+            (unsigned long)aff,
+            aff == WDA_EXCLUDEFROMCAPTURE ? "excluded from captures"
+                                          : (aff == WDA_MONITOR ? "black in captures"
+                                                                : "NOT excluded"));
 }
 
 /* ========== 主函数 ========== */
@@ -5740,6 +5772,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* 放行低完整性进程发来的 WM_BYPASS_SHOW：第二次双击 bypass.exe 的新实例
        (通常是普通权限) 要能唤醒已提权的本窗口（UIPI 默认拒收）。 */
     ChangeWindowMessageFilterEx(hwnd, WM_BYPASS_SHOW, MSGFLT_ALLOW, NULL);
+
+    /* 本窗口永远不进抓屏: 老师端监控/录屏时看不到工具界面 (托盘里点的
+       「屏蔽屏幕监控」只负责"定格画面", 这一条负责"别把工具拍进去")。 */
+    ExcludeOwnWindowFromCapture(hwnd);
 
     /* Windows 11: rounded window corners (optional, dynamic load) */
     {

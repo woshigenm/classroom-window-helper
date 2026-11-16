@@ -87,7 +87,7 @@ static int RunInjector(const char* injector, const char* dll)
 }
 
 /* 和 StudentLogic.dll 的 FUN_10025610 一样的抓屏顺序 */
-static DWORD CaptureChecksum(int w, int h)
+static DWORD CaptureRectSum(int x, int y, int w, int h)
 {
     HDC        disp;
     HDC        mem;
@@ -104,7 +104,7 @@ static DWORD CaptureChecksum(int w, int h)
     bm  = CreateCompatibleBitmap(disp, w, h);
     old = SelectObject(mem, bm);
 
-    BitBlt(mem, 0, 0, w, h, disp, 0, 0, SRCCOPY | CAPTUREBLT);
+    BitBlt(mem, 0, 0, w, h, disp, x, y, SRCCOPY | CAPTUREBLT);
 
     bits = (BYTE*)calloc(1, (size_t)w * (size_t)h * 4);
     if (bits) {
@@ -128,10 +128,75 @@ static DWORD CaptureChecksum(int w, int h)
     return sum;
 }
 
+static DWORD CaptureChecksum(int w, int h)
+{
+    return CaptureRectSum(0, 0, w, h);
+}
+
+/* --affinity: 验证 SetWindowDisplayAffinity 在本机是否真的把窗口挡在抓屏之外。
+   控制组(不设)应"可见/隐藏"两次抓屏不同; 实验组(设了 WDA)应完全相同
+   (说明抓屏里根本没有这个窗口)。 */
+static int CheckAffinity(void)
+{
+    int   sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    RECT  r;
+    DWORD a1, b1, a2, b2, aff = 0;
+    HWND  w1, w2;
+    int   control, excluded;
+
+    g_color = RGB(240, 235, 60);
+    w1 = CreateWindowExA(0, RENDER_CLASS, "control window",
+                         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                         sw / 4, sh / 4, 480, 360, NULL, NULL,
+                         GetModuleHandleA(NULL), NULL);
+    if (!w1) { printf("control window failed\n"); return 1; }
+    ShowWindow(w1, SW_SHOW);
+    UpdateWindow(w1);
+    Pump(500);
+    GetWindowRect(w1, &r);
+    a1 = CaptureRectSum(r.left, r.top, r.right - r.left, r.bottom - r.top);
+    ShowWindow(w1, SW_HIDE);
+    Pump(500);
+    b1 = CaptureRectSum(r.left, r.top, r.right - r.left, r.bottom - r.top);
+    control = (a1 != b1) ? 1 : 0;
+    printf("control  visible=%08lx hidden=%08lx changed=%d\n",
+           (unsigned long)a1, (unsigned long)b1, control);
+    DestroyWindow(w1);
+    Pump(300);
+
+    w2 = CreateWindowExA(0, RENDER_CLASS, "excluded window",
+                         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                         sw / 4, sh / 4, 480, 360, NULL, NULL,
+                         GetModuleHandleA(NULL), NULL);
+    if (!w2) { printf("excluded window failed\n"); return 2; }
+    if (!SetWindowDisplayAffinity(w2, WDA_EXCLUDEFROMCAPTURE))
+        SetWindowDisplayAffinity(w2, WDA_MONITOR);
+    GetWindowDisplayAffinity(w2, &aff);
+    ShowWindow(w2, SW_SHOW);
+    UpdateWindow(w2);
+    Pump(500);
+    GetWindowRect(w2, &r);
+    a2 = CaptureRectSum(r.left, r.top, r.right - r.left, r.bottom - r.top);
+    ShowWindow(w2, SW_HIDE);
+    Pump(500);
+    b2 = CaptureRectSum(r.left, r.top, r.right - r.left, r.bottom - r.top);
+    excluded = (a2 == b2) ? 1 : 0;
+    printf("wda      affinity=0x%lx visible=%08lx hidden=%08lx excluded=%d\n",
+           (unsigned long)aff, (unsigned long)a2, (unsigned long)b2, excluded);
+    DestroyWindow(w2);
+
+    printf("SUMMARY control_changed=%d affinity_excluded=%d\n", control, excluded);
+    printf("VERDICT %s\n", (control && excluded)
+           ? "PASS (SetWindowDisplayAffinity keeps our window out of captures)"
+           : "FAIL");
+    return (control && excluded) ? 0 : 3;
+}
+
 int main(int argc, char** argv)
 {
     const char* dll = NULL;
     const char* injector = NULL;
+    int         affinity = 0;
     WNDCLASSA wc;
     MSG msg;
     int sw, sh, i;
@@ -140,6 +205,7 @@ int main(int argc, char** argv)
 
     for (i = 1; i < argc; i++) {
         if (!_stricmp(argv[i], "--inject") && i + 1 < argc) dll = argv[++i];
+        else if (!_stricmp(argv[i], "--affinity")) affinity = 1;
         else if (!injector) injector = argv[i];
     }
 
@@ -150,6 +216,8 @@ int main(int argc, char** argv)
     wc.hbrBackground = NULL;
     wc.lpszClassName = RENDER_CLASS;
     if (!RegisterClassA(&wc)) { printf("RegisterClass failed\n"); return 1; }
+
+    if (affinity) return CheckAffinity();
 
     g_color = RGB(10, 40, 90);
     sw = GetSystemMetrics(SM_CXSCREEN);

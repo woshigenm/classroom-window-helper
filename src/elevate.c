@@ -481,6 +481,11 @@ static DWORD WINAPI StatusThread(LPVOID p)
         return 0;
     }
 
+    /* 提权进度窗也不能被拍进抓屏: 老师端监控/录屏正好在这个时间点是可能的。
+       (0x11 = WDA_EXCLUDEFROMCAPTURE, Win10 2004+; 老系统退回"抓屏里变黑") */
+    if (!SetWindowDisplayAffinity(g_sw, WDA_EXCLUDEFROMCAPTURE))
+        SetWindowDisplayAffinity(g_sw, WDA_MONITOR);
+
     g_swText = CreateWindowExW(0, L"STATIC", L"正在自动提权…",
                                WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
                                16, 14, w - 32, 64, g_sw,

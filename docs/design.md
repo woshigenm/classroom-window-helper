@@ -541,7 +541,7 @@ FUN_10025610 (0x10025610, 调用方 FUN_10025720)
 | `freeze`（默认） | **第一次**抓屏照常读屏幕，把结果存成"定格帧"；之后每次抓屏都 `SetDIBitsToDevice` 从缓存画到调用方的位图里，**屏幕一个像素都不再读**，连 `GetDIBits` 拿到的都是缓存帧 |
 | `blank` | 连第一帧都不抓，直接铺一块纯色 |
 | 其它 rop | 只有 `SRCCOPY` / `SRCCOPY\|CAPTUREBLT` 才拦（AND/OR/XOR 不是抓屏） |
-| 开关 | `bin\bypass_screen.ini`：`enabled=0/1` + `mode=freeze\|blank`，DLL 每 0.5 秒重读一次，改完不用重启；主界面第 3 行的「屏蔽屏幕监控」按钮就是写这个文件（并用 `RunInjector` 保证 DLL 已经进了 `Student.exe`） |
+| 开关 | `bin\bypass_screen.ini`：`enabled=0/1` + `mode=freeze\|blank`，DLL 每 0.5 秒重读一次，改完不用重启；主界面第 3 行的「屏蔽屏幕监控」按钮就是写这个文件（并用 `RunInjector` 保证 DLL 已经进了 `Student.exe`），`Ctrl+Alt+M` 是同一个开关的**备用入口**（面板收进托盘/点不到时用） |
 
 **边界（务必知道）**：
 
