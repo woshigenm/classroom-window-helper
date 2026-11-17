@@ -8,8 +8,8 @@
 |---|---|
 | `lpe\trigger.ps1` | `do{}` 内新增 `# >>> abort-check` 块：发现 `abort.<AbortPid>` → 记 `documents: abort observed, exiting` → `return`（不是 `throw`，`return` 同样会跑 `finally`） |
 | `src\elevate.c` | `SkipFilePath()` / `WriteAbort()` / `CreateKillOnCloseJob()` / `CloseJob()` / `LogLeftoverServices()`；`RunHidden()` 加 `job` 参数（`CREATE_SUSPENDED` → assign → 无条件 `ResumeThread`）；跳过时写 abort → 等 ≤3000ms → 超时才 `TerminateProcess` |
-| `BuildEncodedCommand()` | 前置段增加 `$AbortPid=<launcher pid>`；顺手修掉 `qTarget[900]` 对 `target[2048]` 的静默截断（截掉的是 `--elevate=uac`） |
-| `tests\lpe_documents.ps1` | 新增 abort-check 三个用例（命中 / 无文件 / 无 pid + 残留 `abort.` 文件）+ `restore-fallback`，共 67 项 |
+| `MaterializeScript()` / `BuildLpeCommand()` | 前置段（含 `$AbortPid=<launcher pid>`）与脚本一起写成 `%LOCALAPPDATA%\ClassroomBypass-LPE\trigger.<pid>.<tick>.ps1`（UTF-8 带 BOM），命令行只带路径：`-Command "Invoke-Expression (Get-Content -LiteralPath '<path>' -Raw)"`。`-EncodedCommand` 整条删除，理由见 §5.1。顺手修掉 `qTarget[900]` 对 `target[2048]` 的静默截断（截掉的是 `--elevate=uac`） |
+| `tests\lpe_documents.ps1` | 新增 abort-check 三个用例（命中 / 无文件 / 无 pid + 残留 `abort.` 文件）+ `restore-fallback`，再加 IEX 指令形态 5 项（路径含 `'`、BOM、`return` 跑 `finally`、`exit N` 传播），共 72 项 |
 
 `return` 在脚本作用域、`try/finally` 内是否真的跑 `finally` 不是靠读文档断言的：上面第三个
 用例把真实形状（`try { do{} } finally {}` + `return`）抽出来跑，断言 `finally ran` 出现、
@@ -36,7 +36,7 @@
 
 ```
 bypass.exe（普通用户；elevate.c）
- └─ powershell.exe -EncodedCommand <trigger.ps1>      ← RunHidden(), elevate.c:265
+ └─ powershell.exe -Command "IEX (Get-Content <落盘的触发脚本>)"   ← RunHidden()
        └─ （conhost.exe 之类）
 (WinRT)  WalletService   [服务，不在我们的进程树里]
  └─ shell_broker.exe
@@ -182,6 +182,37 @@ documents restored original=C:\Users\x\Documents source=fallback
   通常也能读，但我们不需要这个方向。
 - `trigger.ps1` 不删这个文件：只有写方删，才没有“两边都删/一方删了另一方还在等”的竞态。
 
+### 5.1 脚本怎么交给 powershell：`-EncodedCommand` 已删
+
+原来把 `trigger.ps1` 转成 UTF-16 再 Base64，塞进 `powershell.exe -EncodedCommand`。这条路
+有个硬上限：命令行 32767 字符，而 UTF-16 + Base64 是 ~2.7 倍膨胀，脚本超过约 12 KB 就再
+也起不来。`trigger.ps1` 长到 19 KB 之后，**每次** LPE 都在这一行失败并退回 UAC——单元
+测试全绿，真实链路 100% 走不到。日志里长这样：
+
+```
+lpe: encoded command does not fit in 32767 bytes (-1 needed) - is the payload script too big?
+lpe failed - falling back to uac/manual
+```
+
+现在：前置段 + 脚本写成 `%LOCALAPPDATA%\ClassroomBypass-LPE\trigger.<pid>.<tick>.ps1`
+（UTF-8 **带 BOM**），命令行只带路径：
+
+```
+powershell.exe -NoLogo -NoProfile -NonInteractive -Command "Invoke-Expression (Get-Content -LiteralPath '<path>' -Raw)"
+```
+
+四个不能改错的点：
+
+| 点 | 为什么 |
+|---|---|
+| 用 `-Command`，不用 `-File` | 执行策略（含 GPO「禁止运行脚本」，它连 `-ExecutionPolicy Bypass` 都能盖掉）只约束 `-File` 启动的脚本文件；`-Command` 的文本不查策略。`Get-Content` 只是读数据，同样不查。 |
+| 必须带 BOM | Windows PowerShell 5.1 对无 BOM 文件按 ANSI 代码页解码；前置段里可能有非 ASCII 的安装路径，无 BOM 会被解成乱码。`trigger.ps1` 自身是纯 ASCII。 |
+| 路径放**单引号**里，`'` 写成 `''` | 外层是双引号参数，路径里不会有 `"`；`PsEscape()` 只处理 `'`，而且**装不下就返回失败**，不截断（截断会指向另一个文件）。 |
+| 临时文件由启动器删 | 脚本在子进程的第一条语句就被 `Get-Content` 读进去，握手/退出/60s 上限都在那之后；硬杀会留下一个，`DeleteStaleScripts()` 下次同 pid 清掉，`build\cleanup_lpe.ps1` 也能列出/清理。 |
+
+`--elevate-selftest` 跟着改了：它现在把脚本落到 `%TEMP%`，并把**完整命令行**写进日志，
+不再产出 `.b64`。要判断「这次 LPE 为什么退回 UAC」，先看这两行，再把命令行贴进控制台。
+
 ## 6. Job Object
 
 - `CreateJobObjectW` + `SetInformationJobObject(JobObjectExtendedLimitInformation,
@@ -306,9 +337,12 @@ pid 也会复用。同一次「回绕后 tick 恰好相等 + pid 恰好复用 + 
    | 清理指定项 | `-Service <name>` / `-RunId <id>` |
    | 全清 | `-All -Force`，且要求 `net session` 通过 + 二次确认 |
 
-   列表阶段就要做存活判断：服务名里的 pid 用 `Get-Process -Id` 查，活着就标
-   `[RUNNING, do not delete]`。这条比任何参数都重要——它挡住的就是「清理脚本杀掉正在
-   运行的那一次」。
+    存活判断不能只看 pid：服务名里的 pid 是 **WalletService（SYSTEM，几乎总活着）** 的
+    pid，不是提权实例的 pid（`wallet_callback_shell.c:114` 的 `GetCurrentProcessId()`）。
+    按 pid 判活会把每一条残留都标成「运行中」，永远清理不掉。实际用的是两条证据：
+    服务 `State -ne 'Stopped'`，以及**从 `PathName` 反解出 runid 目录**后有进程的
+    `ExecutablePath`/`CommandLine` 落在该目录里。`abort.*` / `trigger.*.ps1` 才按 pid
+    判活，且要求进程名是 `bypass.exe`（pid 被别的映像复用 → 按残留处理）。
 
 2. **遗留 `documents_path.exe` 检测：不做。** 对象选错了：它的生命周期是「set 完就退」，
    被逮到的概率极低，而且它不持有状态——真正持有重定向的是跑 `trigger.ps1` 的

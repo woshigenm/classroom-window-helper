@@ -355,6 +355,52 @@ $case = Run-Case 'abort-nopid' $abortTemplate $abort @{
 } @('tail') 0
 Check ($case.Stages -notmatch 'abort observed') 'nopid      no pid, no abort even with a stray file'
 
+# ---- materialized payload: the -Command / IEX leg ---------------------------
+#
+# the launcher no longer ships the script inside -EncodedCommand (trigger.ps1
+# outgrew the 32767-character limit).  It writes preamble + script to
+# %LOCALAPPDATA%\ClassroomBypass-LPE\trigger.<pid>.<tick>.ps1 and runs
+#
+#   -Command "Invoke-Expression (Get-Content -LiteralPath '<path>' -Raw)"
+#
+# Three things can break that silently and none of them is covered above: the
+# single-quote escaping of the path, the UTF-8 BOM (PowerShell 5.1 decodes a
+# BOM-less file with the ANSI code page and mangles a non-ASCII preamble), and
+# whether IEX keeps the -File semantics the launcher's exit-code logic assumes.
+# -ExecutionPolicy Bypass is deliberately NOT passed: -Command must not need it.
+
+$iexDir = New-Dir (Join-Path $work "q'uote dir")
+$iex = Join-Path $iexDir 'trigger.999.1.ps1'
+$body = @'
+$msg = -join ([char]0x4E2D, [char]0x6587)
+Write-Output ("preamble len=" + $msg.Length)
+try {
+    do {
+        Start-Sleep -Milliseconds 20
+        break
+    } while ($false)
+    return
+} finally {
+    Write-Output 'finally ran'
+}
+Write-Output 'after-return'
+'@
+[IO.File]::WriteAllText($iex, $body, (New-Object Text.UTF8Encoding($true)))
+$q = $iex.Replace("'", "''")
+$out = (& powershell -NoProfile -Command "Invoke-Expression (Get-Content -LiteralPath '$q' -Raw)" 2>&1 | Out-String)
+Check ($LASTEXITCODE -eq 0) 'iex        exit 0 without -ExecutionPolicy'
+Check ($out -match 'preamble len=2') 'iex        BOM honoured, non-ASCII preamble intact'
+Check ($out -match 'finally ran') 'iex        return inside try still runs finally'
+Check ($out -notmatch 'after-return') 'iex        and does not fall through'
+
+# The launcher reads the exit code to pick its grace period (0 = the child may
+# still be in UAC, 25 s; non-zero = final, 2.5 s), so exit N has to survive IEX.
+$iexExit = Join-Path $iexDir 'trigger.999.2.ps1'
+[IO.File]::WriteAllText($iexExit, "exit 7`r`n", (New-Object Text.UTF8Encoding($true)))
+$q2 = $iexExit.Replace("'", "''")
+& powershell -NoProfile -Command "Invoke-Expression (Get-Content -LiteralPath '$q2' -Raw)" | Out-Null
+Check ($LASTEXITCODE -eq 7) 'iex        exit N becomes the process exit code'
+
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ''

@@ -43,6 +43,7 @@
 | `%LOCALAPPDATA%\ClassroomBypass-LPE\<runid>\` | 本次运行的 `wallet.db`、payload 副本、`result.txt` | 保留供排查，手工删除 |
 | `%LOCALAPPDATA%\ClassroomBypass-LPE\documents.orig` | Documents 原值快照 | 重定向前写入，恢复成功后删除 |
 | `%LOCALAPPDATA%\ClassroomBypass-LPE\abort.<elevate-pid>` | “跳过”信号：`elevate.c` 写一行，`trigger.ps1` 的等待循环看到它就收尾（设计见 `docs\P1-abort.md`） | 写方自己删：启动前清残留，退出前删掉 |
+| `%LOCALAPPDATA%\ClassroomBypass-LPE\trigger.<pid>.<tick>.ps1` | 落盘的触发脚本（前置变量 + `trigger.ps1`，UTF-8 带 BOM）：启动器把它写给 `-Command "IEX (Get-Content ...)"`，因为 `-EncodedCommand` 装不下 19 KB 的脚本 | 正常路径由 `elevate.c` 删；硬杀留下的由下次同 pid 运行清掉，或 `build\cleanup_lpe.ps1`（仓库内）列出/删除 |
 
 放在用户目录而不是安装目录，是因为安装目录可能只读（Program Files），而这些文件
 必须能写；同时它们也不应该跟着发布包发给别人。
@@ -51,7 +52,7 @@
 
 ```
 bin\bypass.exe（普通用户，非管理员）
-  └─ powershell -EncodedCommand <trigger.ps1 + TargetCommand>
+  └─ powershell -Command "IEX (Get-Content <落盘的 trigger.<pid>.<tick>.ps1> -Raw)"
        ├─ seed/Documents 重定向 + WalletManager.RequestStoreAsync()
        ├─ WalletService(LocalSystem) 加载 wallet_callback_shell.dll
        ├─ 该 DLL 创建按需服务 -> shell_broker.exe <result.txt>
@@ -65,7 +66,7 @@ bin\bypass.exe（普通用户，非管理员）
 
 ## 安全性 / 限制
 
-- 只启动 `command.txt` 里那一行命令，而那是启动器编进 `-EncodedCommand` 的 `bin\bypass.exe` 路径。
+- 只启动 `command.txt` 里那一行命令，而那是启动器写进落盘脚本的 `bin\bypass.exe` 路径。
 - 优先取会话令牌的**未过滤链接令牌**（真正的管理员组身份），拿不到才退回 SYSTEM（PoC 原行为）。
 - `trigger.ps1` 的 `finally` 会恢复 Documents 已知文件夹。
 - 「跳过」是协作退出，不是直接杀进程：`elevate.c` 写 `abort.<pid>`，脚本在 200 ms 轮询里
@@ -169,6 +170,8 @@ rem   %LOCALAPPDATA%\ClassroomBypass-LPE\<runid>\payload\result.txt  PoC 的原�
 ```
 
 > 直接 `.\trigger.ps1` 会被执行策略拦住——这是 PowerShell 对**脚本文件**的限制。
-> `bypass.exe` 用的是 `-EncodedCommand`（内容 Base64 后执行），不经过脚本文件，所以
-> 即使 `Get-ExecutionPolicy` 是 `Restricted` 或被组策略锁死也能跑。手工执行时加
+> `bypass.exe` 把脚本落到 `%LOCALAPPDATA%\ClassroomBypass-LPE\` 后用
+> `-Command "Invoke-Expression (Get-Content ...)"` 执行：`-Command` 的文本不经过
+> 脚本文件检查，所以即使 `Get-ExecutionPolicy` 是 `Restricted` 或被组策略锁死也能跑
+> （`-File` 即使加了 `-ExecutionPolicy Bypass` 也会被 GPO 盖掉）。手工执行时加
 > `-ExecutionPolicy Bypass -File` 即可。

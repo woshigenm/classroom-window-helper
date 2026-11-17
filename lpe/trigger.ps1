@@ -28,15 +28,18 @@
 #  Progress goes straight into the shared log (..\bypass_hook.log, the file
 #  next to bypass.exe) - there are no separate stage/status files.
 #
-#  bypass.exe runs this through -EncodedCommand, so an execution policy that
-#  forbids *.ps1 files (including a GPO-enforced one) cannot block it.  Running
-#  it by hand still works:
+#  bypass.exe stages this script (with a preamble of variables) under
+#  %LOCALAPPDATA%\ClassroomBypass-LPE and runs it as
+#    powershell -Command "Invoke-Expression (Get-Content -LiteralPath '<f>' -Raw)"
+#  so an execution policy that forbids *.ps1 files (including a GPO-enforced
+#  one) cannot block it: the policy covers script files started with -File, not
+#  text handed to -Command.  Running it by hand still works:
 #    powershell -NoProfile -ExecutionPolicy Bypass -File .\trigger.ps1 `
 #        -TargetCommand '"C:\path\bin\bypass.exe"'
 # ============================================================
 
-# NO param() block on purpose.  With -EncodedCommand the launcher prepends
-#   $Repo='...';$TargetCommand='...';$TimeoutSec=45;
+# NO param() block on purpose.  The launcher prepends
+#   $Repo='...';$TargetCommand='...';$TimeoutSec=45;$AbortPid=<pid>;
 # and param() must be the FIRST statement of a script block - with variables in
 # front it is parsed as "call the command `param`" and the whole script fails
 # (that is exactly what broke the LPE on 2026-11-16 18:12).  Manual runs pass

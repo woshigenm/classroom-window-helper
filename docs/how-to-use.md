@@ -175,7 +175,7 @@ build=Oct 22 2026 23:36:28
 | 双击后长时间没反应 | 正在跑自动提权（会显示进度小窗，`bin\bypass_hook.log` 里能看到进度），最多 60 秒 | 等它走完；想立刻放弃就点小窗上的「跳过，直接弹 UAC」 |
 | 双击后没弹任何东西就退出了 | 工具已经在运行（托盘里有图标）——防重复设计，不会白跑一遍提权/UAC | 找托盘图标；找不到按 `Ctrl+Alt+H` |
 | 最小化/关闭后托盘里找不到图标 | 图标可能在托盘的「显示隐藏的图标」（`^`）折叠区；或本机 shell 的托盘没建出来 | 先点任务栏的 `^` 看看；再从折叠区把图标拖到任务栏（Explorer 会按 exe 路径记住）。窗口可见时任务栏上有按钮，最小化后也可以先点 `^`。仍然没有就看 `bin\bypass_hook.log` 里的 `[Tray]` 行：`NIM_ADD failed err=...` 是创建失败（程序会重试 20 次，并**拒绝隐藏窗口**，不会让你找不到窗口）；`[Tray] env ... tray_hwnd=0000000000000000` 说明进程不在用户桌面/会话上 |
-| 提示"禁止运行脚本" / 自动提权没反应 | 手动跑 `.ps1` 才会撞执行策略；工具本身走 `-EncodedCommand`，不受策略限制 | 手动测试用 `powershell -ExecutionPolicy Bypass -File ... -TargetCommand ...`；集成路径看 `bin\bypass_hook.log` 里 `[elevate]` 进度行和 payload 输出 |
+| 提示"禁止运行脚本" / 自动提权没反应 | 手动跑 `.ps1` 才会撞执行策略；工具把脚本落到 `%LOCALAPPDATA%\ClassroomBypass-LPE\` 后用 `-Command` 执行，不受策略限制 | 手动测试用 `powershell -ExecutionPolicy Bypass -File ... -TargetCommand ...`；集成路径看 `bin\bypass_hook.log` 里 `[elevate]` 进度行和 payload 输出；LPE 退回 UAC 先看 `selftest:` / `lpe: payload` 两行 |
 | 自动提权失败 | 系统已打补丁（2026-07 后）、Defender 拦了载荷、或非 Win11 25H2 | 看 `bin\bypass_hook.log` 的 `[elevate]` 行和 payload 输出；直接在 UAC 里点"是"，或 点 UAC 提示的「是」即可 |
 | 想完全跳过自动提权 | 可选 | 临时删掉 `bin\lpe\trigger.ps1`（启动器检测不到 payload 会直接走 UAC），或命令行加 `--elevate=uac` |
 | 注入了但没效果 | 同路径旧 DLL 已在进程里 | 重启课堂软件 |

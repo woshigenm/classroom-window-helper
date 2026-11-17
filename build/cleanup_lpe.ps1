@@ -23,7 +23,7 @@
 #    restoring it; throwing it away turns a recoverable state into a permanent
 #    one.  Removing it is a decision for a human who has checked the path.
 #
-#  * Services go before directories: deleting a directory first leaves a
+#  * services go before directories: deleting a directory first leaves a
 #    service pointing at a missing file, which is worse than leaving both.
 
 [CmdletBinding()]
@@ -202,6 +202,32 @@ function Show-AbortFiles {
     }
 }
 
+function Show-Scripts {
+    Write-Host ""
+    Write-Host "== trigger.*.ps1 (payload scripts staged for a run) ==" -ForegroundColor Cyan
+    if (-not (Test-Path -LiteralPath $lpeRoot)) { Write-Host "   (none)"; return }
+    $found = @(Get-ChildItem -LiteralPath $lpeRoot -File -Filter 'trigger.*.ps1' -ErrorAction SilentlyContinue)
+    if ($found.Count -eq 0) { Write-Host "   (none)"; return }
+    $procs = Get-ProcessSnapshot
+    foreach ($f in $found) {
+        # trigger.<pid>.<tick>.ps1 - the pid is the launcher's, and only
+        # bypass.exe writes these (same pid-reuse caveat as abort.*).
+        $pidText = ($f.Name -split '\.')[1]
+        $byPid = $procs | Where-Object { [string]$_.ProcessId -eq $pidText }
+        $alive = $byPid | Where-Object { $_.Name -ieq 'bypass.exe' }
+        if (-not $alive -and $byPid) {
+            Write-Host ("   {0}  {1:N0} B  [ORPHAN, pid {2} reused by {3}]" -f
+                        $f.Name, $f.Length, $pidText, $byPid[0].Name)
+        } elseif ($alive) {
+            Write-Host ("   {0}  {1:N0} B  [RUNNING, do not delete]" -f $f.Name, $f.Length)
+        } else {
+            Write-Host ("   {0}  {1:N0} B  [ORPHAN]" -f $f.Name, $f.Length)
+        }
+    }
+    Write-Host "   Present = the launcher died between staging and deleting."
+    Write-Host "   It is a copy of the script, not state: deleting one loses nothing."
+}
+
 function Remove-OneService([string]$name, [bool]$force) {
     if ($name -notmatch '^CVE49176_[0-9]+_[0-9]+$') {
         throw "refusing '$name': not a CVE49176_<pid>_<tick> name"
@@ -244,6 +270,7 @@ Show-Services $svcRows
 Show-Dirs $dirRows
 Show-Snapshot
 Show-AbortFiles
+Show-Scripts
 
 # ---- explicit cleanup --------------------------------------------------------
 
@@ -278,7 +305,8 @@ if ($All) {
         throw 'something is still running - stop the tool before -All'
     }
 
-    Write-Host "This deletes: CVE49176_* services (stopped) and run directories."
+    Write-Host "This deletes: CVE49176_* services (stopped), run directories,"
+    Write-Host "and stale abort.* / trigger.*.ps1 whose pid no longer runs."
     Write-Host "It does NOT delete documents.orig - that is the only copy of the"
     Write-Host "user's real Documents path until a restore succeeds."
     $answer = Read-Host "Type DELETE to continue"
@@ -291,6 +319,13 @@ if ($All) {
 
     foreach ($f in (Get-ChildItem -LiteralPath $lpeRoot -File -Filter 'abort.*' -ErrorAction SilentlyContinue)) {
         $pidText = $f.Name.Substring(6)
+        $alive = $procs | Where-Object { [string]$_.ProcessId -eq $pidText -and $_.Name -ieq 'bypass.exe' }
+        if ($alive) { Write-Host "   $($f.Name) : launcher pid $pidText alive - kept" }
+        else { Remove-Item -LiteralPath $f.FullName -Force; Write-Host "   $($f.Name) : removed" }
+    }
+
+    foreach ($f in (Get-ChildItem -LiteralPath $lpeRoot -File -Filter 'trigger.*.ps1' -ErrorAction SilentlyContinue)) {
+        $pidText = ($f.Name -split '\.')[1]
         $alive = $procs | Where-Object { [string]$_.ProcessId -eq $pidText -and $_.Name -ieq 'bypass.exe' }
         if ($alive) { Write-Host "   $($f.Name) : launcher pid $pidText alive - kept" }
         else { Remove-Item -LiteralPath $f.FullName -Force; Write-Host "   $($f.Name) : removed" }

@@ -449,7 +449,7 @@ wmode_test.exe --ticks 6 --inject bypass_hook32.dll
 
 ```
 bypass.exe (普通用户)
-  └─ powershell -EncodedCommand <trigger.ps1 + 参数，无中间文件>
+  └─ powershell -Command "IEX (Get-Content <落盘的触发脚本> -Raw)"
        ├─ wallet_ese_seed.exe     造带回调的 wallet.db（回调 = wallet_callback_shell.dll）
        ├─ documents_path.exe set  把 Documents 指到本次的临时目录
        └─ WalletManager.RequestStoreAsync()  →  WalletService(LocalSystem)
@@ -463,17 +463,21 @@ bypass.exe (普通用户)
 
 几个刻意的设计：
 
-几个刻意的设计：
-
 - **已在运行就不再折腾**：单实例检查放在**提权之前**——第二次双击时探测
   `ClassroomBypassTool_SingleInstance` 互斥体，已存在就直接唤醒旧窗口退出
   （通过窗口放行的 `WM_BYPASS_SHOW` 消息，低权限实例也能唤醒已提权实例），
   不会白跑 LPE/UAC。提权链路自己拉起的实例（命令行带 `--elevate=uac`）跳过这个
   探测，由它们在提权成功后持有互斥体。
-- **不经过脚本执行策略**：脚本内容是读出来、拼上参数、Base64 成 UTF-16LE 后交给
-  `powershell -EncodedCommand` 的。执行策略（包括被组策略锁死的 `Restricted`）只约束
-  `*.ps1` **文件**，`-EncodedCommand` 直接执行代码，所以“禁止运行脚本”的机器也能走这条路。
-  （手工跑才需要 `-ExecutionPolicy Bypass -File`。）
+- **不经过脚本执行策略**：`trigger.ps1` 加上前置变量落成
+  `%LOCALAPPDATA%\ClassroomBypass-LPE\trigger.<pid>.<tick>.ps1`（UTF-8 带 BOM），命令行是
+  `-Command "Invoke-Expression (Get-Content -LiteralPath '<path>' -Raw)"`。执行策略（包括被组策略
+  锁死的 `Restricted`——它连 `-ExecutionPolicy Bypass` 都能盖掉）只约束用 `-File` 启动的 `*.ps1`
+  **文件**；`-Command` 的文本不查策略，`Get-Content` 只是读数据，也不查。带 BOM 是必须的：
+  PowerShell 5.1 对无 BOM 文件按 ANSI 代码页解码，前置段里的非 ASCII 安装路径会变乱码。
+  这也顺手解决了原来的硬上限：`-EncodedCommand` 要把整个脚本转 UTF-16 再 Base64（~2.7 倍），
+  脚本超过约 12 KB 就撞 32767 字符的命令行上限；`trigger.ps1` 长过那条线之后，每次 LPE 都在
+  这里失败并退回 UAC。落盘脚本由启动器删，硬杀留下的由下一次同 pid 运行或
+  `build\cleanup_lpe.ps1` 清掉。（手工跑才需要 `-ExecutionPolicy Bypass -File`。）
 - **`result.txt` 只允许 ASCII**：回调 DLL（原样二进制）和 `shell_broker.exe` 都往同一个文件追加
   事件行，读取方（`trigger.ps1`）用默认编码 + 正则匹配。任何一边写 UTF-16 都会让两种编码混进
   一个文件，匹配永远失败（第一版集成就是这么挂的：broker 用宽字符写事件 → 脚本读不出来 →
@@ -510,9 +514,9 @@ bypass.exe (普通用户)
   （启动器先截断；被 broker 拉起的实例**不截断**——它们的历史记录和握手行都在里面，启动器
   还要扫它们）。日志用 `FILE_APPEND_DATA` 打开，多进程并发追加各自落到真实文件尾。
 
-调试用：`bin\bypass.exe --elevate-selftest` 只把编码后的命令写到
-`%TEMP%\bypass_elevate_selftest.b64`（可与 PowerShell 自己算出的 Base64 逐字节比对），
-**不会启动任何东西**。
+调试用：`bin\bypass.exe --elevate-selftest` 把脚本落到 `%TEMP%`，并把落盘路径和**完整命令行**
+写进 `bin\bypass_hook.log`，**不会启动任何东西**。要查「这次 LPE 为什么退回 UAC」，先看这两行，
+再把命令行贴进控制台复现脚本层面的错误。
 
 `lpe\payload\` 里除 `shell_broker.exe` 外的三个文件是 PoC 原样二进制（见 `lpe\payload\README.txt`
 的来源与 SHA256）；`shell_broker.exe` 由 `src\lpe_broker.c` 编译，因为原版把子进程写死成

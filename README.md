@@ -150,7 +150,8 @@ classroom-window-helper\
 - LPE 走 `bin\lpe\`（WalletService 链路，**2026 年 7 月已修复**的漏洞）：补丁机上必然失败，
   会自动退回 UAC，属设计内行为。链路细节 / 编码约定 / broker 令牌见 [`lpe/README.md`](lpe/README.md)。
 - 提权与 DLL 日志合并成一个文件 `bin\bypass_hook.log`（启动器每次启动重写，broker 拉起的
-  实例不重写，链路日志连续）。`--elevate-selftest` 只把 Base64 载荷写到 `%TEMP%`，不启动任何东西。
+  实例不重写，链路日志连续）。`--elevate-selftest` 把落盘脚本和完整命令行写进日志
+  （脚本在 `%TEMP%`），不启动任何东西。
 
 ### 5.4 屏幕监控守卫（`bin\bypass_screen.ini`）
 
