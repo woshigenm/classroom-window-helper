@@ -68,8 +68,11 @@ hook32: $(BIN)/bypass_hook32.dll $(BIN)/bypass_hook_core.dll $(BIN)/inject32.exe
 #     make.bat core  ->  click 重载 Core
 core: $(BIN)/bypass_hook_core.dll
 
-# WalletService auto-elevation payload: bin\lpe\ (self-contained folder)
+# WalletService auto-elevation payload: bin\lpe\ (self-contained folder).
+# Guarded: refuses to stage when lpe\src no longer hashes to
+# lpe\payload\SOURCES.sha256 (i.e. the payload predates the current sources).
 lpe: lpebroker
+	@powershell -NoProfile -ExecutionPolicy Bypass -File "build/check_payload.ps1" || exit /b 1
 	@if not exist "$(LPEOUT)" mkdir "$(LPEOUT)"
 	@copy /y "$(LPEPAY)\wallet_ese_seed.exe" "$(LPEOUT)\" >nul
 	@copy /y "$(LPEPAY)\wallet_callback_shell.dll" "$(LPEOUT)\" >nul
@@ -90,6 +93,7 @@ lpepayload:
 	"$(CC64)" -O2 -Wall -o "$(LPEPAY)/wallet_ese_seed.exe" "lpe/src/wallet_ese_seed.c" -lesent
 	@echo [lpepayload] rebuilt in $(LPEPAY) - run "make.bat lpe" to stage
 	@echo [lpepayload] then refresh the SHA256 lines in lpe\payload\README.txt
+	@powershell -NoProfile -ExecutionPolicy Bypass -File "build/check_payload.ps1" -Update
 
 test: $(BIN)/hooktest32.exe
 

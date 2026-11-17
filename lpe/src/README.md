@@ -38,6 +38,11 @@ gcc           -O2 -Wall -o lpe\payload\wallet_ese_seed.exe       lpe\src\wallet_
 构建的二进制，重编会改变 SHA256（`lpe\payload\README.txt` 里记的是原值），所以这件事
 应该是一次有意识的动作，而不是每次构建都顺手做。
 
+为了避免"改了源码、却静默拷了旧二进制"，`make.bat lpe` 会先跑
+`build\check_payload.ps1`：把 `lpe\src\*.c` 的内容哈希和 `lpe\payload\SOURCES.sha256`
+比对，不一致就拒绝拷贝并提示先跑 `lpepayload`。`lpepayload` 编译成功后会重写这个文件。
+用内容哈希而不是时间戳，因为 `git clone` 会把所有文件的 mtime 写成同一时刻。
+
 ## 对同一份源码做过/没做过的验证
 
 用 mingw 构建的这三个文件，已在本机验证：

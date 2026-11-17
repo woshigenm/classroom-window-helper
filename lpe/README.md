@@ -33,6 +33,9 @@
 `make.bat lpepayload` 重编（mingw-w64），再 `make.bat lpe` 铺到 `bin\lpe\`。
 重编会改变 SHA256，而 `payload\README.txt` 记的是原值。细节见 `src\README.md`。
 
+`make.bat lpe` 会先用 `build\check_payload.ps1` 比对 `src\*.c` 的内容哈希与
+`payload\SOURCES.sha256`：源码改过而没重编时直接失败，不会静默把旧二进制拷进 `bin\lpe\`。
+
 ## 调用链
 
 ```
