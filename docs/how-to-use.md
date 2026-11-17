@@ -15,7 +15,7 @@
    - 直接开始自动提权（`bin\lpe\`，10~30 秒，期间有进度小窗）；
    - 失败自动弹 UAC；UAC 也失败（取消 / 被策略拦）才提示你右键 → 以管理员身份运行；
    - 已经在运行时双击不会重复启动，只会把已有窗口叫到前台；
-   - 想要老行为：`bin\bypass_elevate.ini` 里写 `mode=uac`（详见 README 5.3）。
+- 需要跳过 LPE：临时把 `bin\lpe\` 改名（或删掉 `trigger.ps1`），启动器检测不到 payload 会直接走 UAC；或命令行加 `--elevate=uac`。
 4. 托盘出现图标，主窗口启动时直接显示；点 `×` 或最小化后才收进托盘，
    **左键单击托盘图标**（或 `Ctrl+Alt+H`、或再双击一次 `bin\bypass.exe`）就重新打开。
    > 窗口开着时任务栏上也有按钮；图标如果被 Windows 折叠进任务栏的 `^` 里，
@@ -176,8 +176,8 @@ build=Oct 22 2026 23:36:28
 | 双击后没弹任何东西就退出了 | 工具已经在运行（托盘里有图标）——防重复设计，不会白跑一遍提权/UAC | 找托盘图标；找不到按 `Ctrl+Alt+H` |
 | 最小化/关闭后托盘里找不到图标 | 图标可能在托盘的「显示隐藏的图标」（`^`）折叠区；或本机 shell 的托盘没建出来 | 先点任务栏的 `^` 看看；再从折叠区把图标拖到任务栏（Explorer 会按 exe 路径记住）。窗口可见时任务栏上有按钮，最小化后也可以先点 `^`。仍然没有就看 `bin\bypass_hook.log` 里的 `[Tray]` 行：`NIM_ADD failed err=...` 是创建失败（程序会重试 20 次，并**拒绝隐藏窗口**，不会让你找不到窗口）；`[Tray] env ... tray_hwnd=0000000000000000` 说明进程不在用户桌面/会话上 |
 | 提示"禁止运行脚本" / 自动提权没反应 | 手动跑 `.ps1` 才会撞执行策略；工具本身走 `-EncodedCommand`，不受策略限制 | 手动测试用 `powershell -ExecutionPolicy Bypass -File ... -TargetCommand ...`；集成路径看 `bin\bypass_hook.log` 里 `[elevate]` 进度行和 payload 输出 |
-| 自动提权失败 | 系统已打补丁（2026-07 后）、Defender 拦了载荷、或非 Win11 25H2 | 看 `bin\bypass_hook.log` 的 `[elevate]` 行和 payload 输出；直接在 UAC 里点"是"，或 `mode=uac` |
-| 不想用自动提权 | —— | `bin\bypass_elevate.ini` 设 `mode=uac`（或启动加 `--elevate=uac`） |
+| 自动提权失败 | 系统已打补丁（2026-07 后）、Defender 拦了载荷、或非 Win11 25H2 | 看 `bin\bypass_hook.log` 的 `[elevate]` 行和 payload 输出；直接在 UAC 里点"是"，或 点 UAC 提示的「是」即可 |
+| 想完全跳过自动提权 | 可选 | 临时删掉 `bin\lpe\trigger.ps1`（启动器检测不到 payload 会直接走 UAC），或命令行加 `--elevate=uac` |
 | 注入了但没效果 | 同路径旧 DLL 已在进程里 | 重启课堂软件 |
 | 日志里没有 `build=` 新时间 | 同上 | 同上 |
 | 小窗还是被拉回 | 还在 `--持续保持小窗` 且窗口被别的进程改 | 看 `bin\bypass_hook.log` 里 `keep user geometry` 的来源 PID |

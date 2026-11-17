@@ -29,7 +29,7 @@
 | `bin\bypass_hook_single.dll` | 回退用的旧版单 DLL（P1 之前那版），把名字改回 `bypass_hook32.dll` 即可回退 |
 | `bin\inject32.exe` | 注入器（主程序自动拉起，也可手动） |
 | `bin\lpe\` | 启动时的自动提权载荷（可选；没有它就走 UAC） |
-| `bin\*.ini` | 运行配置（`bypass_config` / `bypass_screen` / `bypass_shut` / `bypass_vd` / `bypass_elevate`），首次运行自动生成 |
+| `bin\*.ini` | 运行配置（`bypass_config` / `bypass_screen` / `bypass_shut` / `bypass_vd`），首次运行自动生成 |
 | `bin\core_cache\` | 运行期产物（Loader 的 Core 缓存副本），可以整个删掉；Loader 启动时会清掉死进程留下的孤儿 |
 
 > ⚠ `bin\` 必须在本机磁盘。VMware 共享目录 / 网络盘不支持 PE image section 映射，
@@ -142,10 +142,10 @@ classroom-window-helper\
 老师用**窗口模式**发广播时，小窗出生就带置顶；工具会摘掉置顶并冻结 Z 序，
 你自己点它仍然能提到前面（详见 `docs\design.md` 2.4）。无需配置。
 
-### 5.3 启动方式与自动提权（`bin\bypass_elevate.ini`）
+### 5.3 启动方式与自动提权（自动，无配置文件）
 
-`mode=auto`（默认，先 LPE → 再 UAC → 再手动指引）| `lpe` | `uac` | `manual` | `off`；
-命令行 `--elevate=xxx` 单次覆盖。没有 `bin\lpe\` 时等价于 `uac`（旧行为）。
+模式由代码决定，用户不用配置：`bin\lpe\trigger.ps1` 存在 → 先 LPE，再 UAC，再手动指引；
+不存在 → 直接 UAC（旧行为）。命令行 `--elevate=xxx` 单次覆盖（测试用）。
 
 - LPE 走 `bin\lpe\`（WalletService 链路，**2026 年 7 月已修复**的漏洞）：补丁机上必然失败，
   会自动退回 UAC，属设计内行为。链路细节 / 编码约定 / broker 令牌见 [`lpe/README.md`](lpe/README.md)。

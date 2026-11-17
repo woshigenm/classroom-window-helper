@@ -2,8 +2,9 @@
  * elevate.h -- start-up elevation with a graceful fallback.
  *
  * The tool needs Administrator rights (driver IOCTL + injecting into the
- * classroom processes).  Four modes, picked by bin\bypass_elevate.ini
- * ("mode=") or by --elevate=... on the command line:
+ * classroom processes).  The mode is decided by the code - LPE when
+ * bin\lpe\trigger.ps1 exists, otherwise the UAC prompt - and can be forced
+ * with --elevate=... on the command line:
  *
  *   uac      ShellExecuteEx("runas"): the classic UAC prompt.  Default when
  *            the LPE payload is not installed.
@@ -40,8 +41,9 @@ int  Elevate_IsSpawnedChildCmd(const char* cmdline);
  * `cmdline` is the raw command line to forward, `silent` suppresses all UI. */
 int  Elevate_Boot(HWND owner, const char* cmdline, int silent);
 
-/* Called by the elevated instance as soon as it knows it is admin: writes
- * bin\bypass_elevate.status, which is what the launcher waits for. */
+/* Called by the elevated instance as soon as it knows it is admin: writes the
+ * "elevated instance pid=..." line to the shared log, which is what the
+ * launcher waits for. */
 void Elevate_NoteElevated(void);
 
 #endif

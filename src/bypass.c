@@ -6398,10 +6398,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (hMutex) CloseHandle(hMutex);
     }
 
-    /* Elevation (src\elevate.c): mode=uac/lpe/manual/off from
-       bin\bypass_elevate.ini (--elevate= overrides).  "lpe" tries the
-       WalletService payload in bin\lpe\ first and falls back to the UAC
-       prompt and finally to the manual "run as administrator" instructions. */
+    /* Elevation (src\elevate.c): the mode is decided by the code - "lpe" when
+       bin\lpe\trigger.ps1 exists (WalletService payload, falls back to UAC and
+       then to the manual instructions), otherwise "uac".  --elevate= overrides. */
     if (!IsUserAnAdmin()) {
         Elevate_Boot(NULL, lpCmdLine, g_silentMode);
         return 0;

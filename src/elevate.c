@@ -1,19 +1,16 @@
 /*
  * elevate.c -- start-up elevation with a graceful fallback.
  *
- * Modes (bin\bypass_elevate.ini "mode=" or --elevate=... on the command line):
+ * The mode is decided by the code, not by a config file: LPE when
+ * bin\lpe\trigger.ps1 is present, otherwise the UAC prompt.  --elevate=...
+ * on the command line still wins (the broker appends --elevate=uac, and tests
+ * may force a mode explicitly).
  *
- *   uac     ShellExecuteEx("runas") -- the classic UAC prompt.
- *   lpe     Try the WalletService LPE in bin\lpe\ first (CVE-2026-49176).
- *           On failure fall back to UAC, then to the manual instructions.
- *   manual  Only instruct the user (Retry still fires the UAC prompt).
- *   off     Nothing at all (debugging).
- *
- * The elevated instance is recognised by bin\bypass_elevate.status, written by
- * Elevate_NoteElevated() from the new process.  Waiting for that file (instead
- * of trusting the trigger's exit code) is what makes "did the LPE work?"
- * reliable: the exploit only proves that a process *started*, not that our
- * program is actually running elevated.
+ * The elevated instance is recognised by the "elevated instance pid=..." line
+ * in the shared log, written by Elevate_NoteElevated() from the new process.
+ * Waiting for that line (instead of trusting the trigger's exit code) is what
+ * makes "did the LPE work?" reliable: the exploit only proves that a process
+ * *started*, not that our program is actually running elevated.
  *
  * NOTE: this file is compiled with the rest of the project (GBK source encoding
  * for the Chinese UI strings).  Keep the code itself ASCII so it does not
@@ -31,7 +28,6 @@
 
 #include "elevate.h"
 
-#define ELEVATE_INI      "bypass_elevate.ini"
 /* the ONE shared log: the launcher, the payload, the spawned children and
    the injected DLLs all append here (see also TruncateHookLog in bypass.c) */
 #define ELEVATE_LOG      "bypass_hook.log"
@@ -39,6 +35,8 @@
 #define LPE_TRIGGER      "lpe\\trigger.ps1"
 
 static int   g_mode = -1;
+static char  g_modeDir[MAX_PATH];      /* exe dir, resolved once by Mode() */
+static char  g_modeTrigger[MAX_PATH];  /* <dir>\lpe\trigger.ps1, ditto */
 
 /* ---------------- small helpers ---------------- */
 
@@ -156,47 +154,23 @@ static int ParseMode(const char* s, int* out)
     while (*s == ' ' || *s == '\t') s++;
     if (!_strnicmp(s, "lpe", 3))    { *out = ELEVATE_LPE;    return 1; }
     if (!_strnicmp(s, "uac", 3))    { *out = ELEVATE_UAC;    return 1; }
-    if (!_strnicmp(s, "auto", 4))   { *out = ELEVATE_LPE;    return 1; }
     if (!_strnicmp(s, "manual", 6)) { *out = ELEVATE_MANUAL; return 1; }
     if (!_strnicmp(s, "off", 3))    { *out = ELEVATE_OFF;    return 1; }
     return 0;
 }
 
-/* mode=... from bin\bypass_elevate.ini; -1 when the key is absent */
-static int IniMode(void)
+/* Mode decided by the code (see the file header): LPE when the payload exists,
+   UAC otherwise. */
+static int Mode(void)
 {
-    char  dir[MAX_PATH], path[MAX_PATH];
-    FILE* f;
-    char  line[256];
-    int   mode = -1;
+    if (g_mode >= 0) return g_mode;
 
-    ExeDir(dir, sizeof(dir));
-    if (!dir[0]) return -1;
-    Join(path, sizeof(path), dir, ELEVATE_INI);
-    f = fopen(path, "r");
-    if (!f) return -1;
-
-    while (fgets(line, sizeof(line), f)) {
-        char* p = line;
-        char* v;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == ';' || *p == '#' || !*p) continue;
-        if (_strnicmp(p, "mode", 4) != 0) continue;
-        p += 4;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p != '=') continue;
-        p++;
-        while (*p == ' ' || *p == '\t') p++;
-        v = p;
-        while (*v && *v != '\r' && *v != '\n' && *v != ';' && *v != '#') v++;
-        *v = '\0';
-        {
-            int m;
-            if (ParseMode(p, &m)) mode = m;
-        }
-    }
-    fclose(f);
-    return mode;
+    /* Mode decided by the code (see the file header): LPE when the payload
+       exists, UAC otherwise. */
+    ExeDir(g_modeDir, sizeof(g_modeDir));
+    Join(g_modeTrigger, sizeof(g_modeTrigger), g_modeDir, LPE_TRIGGER);
+    g_mode = (g_modeDir[0] && FileExists(g_modeTrigger)) ? ELEVATE_LPE : ELEVATE_UAC;
+    return g_mode;
 }
 
 /* take the LAST --elevate= occurrence: the broker appends "--elevate=uac" to
@@ -216,30 +190,6 @@ static int CmdLineMode(const char* cmdline, int* found)
         if (ParseMode(p + 10, &m)) { mode = m; *found = 1; }
     }
     return mode;
-}
-
-static int Mode(void)
-{
-    if (g_mode >= 0) return g_mode;
-
-    g_mode = IniMode();
-    {
-        char dir[MAX_PATH], trigger[MAX_PATH];
-
-        /* Integrated builds ship bin\lpe\.  Without the payload a Wallet request
-           cannot work, so do not burn 45 s on it: use UAC.  This also covers a
-           fresh extract of a package that forgot bin\lpe\ (EnsureIni() has just
-           written mode=auto, which would otherwise select LPE). */
-        ExeDir(dir, sizeof(dir));
-        Join(trigger, sizeof(trigger), dir, LPE_TRIGGER);
-        if (g_mode < 0) {
-            g_mode = (dir[0] && FileExists(trigger)) ? ELEVATE_LPE : ELEVATE_UAC;
-        } else if (g_mode == ELEVATE_LPE && !(dir[0] && FileExists(trigger))) {
-            ELog("lpe payload missing (%s) - using UAC", trigger);
-            g_mode = ELEVATE_UAC;
-        }
-    }
-    return g_mode;
 }
 
 /* ---------------- launching helpers ---------------- */
@@ -879,29 +829,6 @@ int Elevate_IsSpawnedChildCmd(const char* cmdline)
     return (cmdline && strstr(cmdline, "--elevate=uac") != NULL) ? 1 : 0;
 }
 
-static void EnsureIni(void)
-{
-    char  dir[MAX_PATH], path[MAX_PATH];
-    FILE* f;
-
-    ExeDir(dir, sizeof(dir));
-    if (!dir[0]) return;
-    Join(path, sizeof(path), dir, ELEVATE_INI);
-    if (FileExists(path)) return;
-
-    f = fopen(path, "wb");
-    if (!f) return;
-    fprintf(f, "; bypass.exe - how to obtain Administrator rights\r\n");
-    fprintf(f, ";   lpe    = try the WalletService auto-elevation first\r\n");
-    fprintf(f, ";            (falls back to UAC, then to the manual instructions)\r\n");
-    fprintf(f, ";   uac    = UAC prompt only (the old behaviour)\r\n");
-    fprintf(f, ";   manual = never start anything by itself; just instruct the user\r\n");
-    fprintf(f, ";   off    = no elevation handling at all (debugging)\r\n");
-    fprintf(f, "; --elevate=... on the command line overrides this file.\r\n");
-    fprintf(f, "mode=auto\r\n");
-    fclose(f);
-}
-
 /* A spawned child writes this marker line before giving up, so the launcher
    that is waiting in ScanHookLogStatus can fall back immediately instead of
    timing out (e.g. the user canceled the child's UAC prompt). */
@@ -955,7 +882,6 @@ int Elevate_Boot(HWND owner, const char* cmdline, int silent)
         return 0;
     }
 
-    EnsureIni();
     mode = CmdLineMode(cmdline, &found);
     if (!found) mode = Mode();
 

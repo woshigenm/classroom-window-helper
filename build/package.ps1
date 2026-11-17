@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$Version = "v2.0.0",
     [string]$OutDir = "",
     [string]$Pfx = "",
@@ -73,7 +73,7 @@ try {
     # Runtime ini files that carry explicit (default) settings.  bypass_vd.ini is
     # deliberately NOT shipped: it stores the pinned desktop GUID of the machine
     # that produced the zip.
-    foreach ($ini in @("bypass_shut.ini", "bypass_elevate.ini")) {
+    foreach ($ini in @("bypass_shut.ini")) {
         $p = Join-Path $Bin $ini
         if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $stageBin }
     }

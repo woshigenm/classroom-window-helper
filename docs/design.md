@@ -437,9 +437,9 @@ wmode_test.exe --ticks 6 --inject bypass_hook32.dll
 原来的做法只有一条路 —— `IsUserAnAdmin()` 为假就 `ShellExecuteEx("runas")` 弹 UAC。现在多了一条
 **自动提权**，并且失败时自动退回到"手动给管理员"的模式：
 
-| 模式（`bin\bypass_elevate.ini` 的 `mode=`，`--elevate=` 覆盖） | 流程 |
+| 模式（由代码决定：`bin\lpe\trigger.ps1` 存在 → `lpe`，否则 `uac`；`--elevate=` 覆盖） | 行为 |
 |---|---|
-| `lpe` / `auto`（默认，前提是 `bin\lpe\trigger.ps1` 存在） | 进度窗 → `bin\lpe\trigger.ps1` → 等日志里的握手行（`elevated instance pid=...`）→ 成功则退出启动器；失败 → UAC；再失败 → 手动指引框（可重试）。**没有确认框**：双击即开始，失败自动回退 |
+| `lpe`（默认，前提是 `bin\lpe\trigger.ps1` 存在） | 进度窗 → `bin\lpe\trigger.ps1` → 等日志里的握手行（`elevated instance pid=...`）→ 成功则退出启动器；失败 → UAC；再失败 → 手动指引框（可重试）。**没有确认框**：双击即开始，失败自动回退 |
 | `uac` | 只走 UAC（老行为） |
 | `manual` | 不自动启动任何东西，只显示手动指引（「重试」仍弹 UAC） |
 | `off` | 不处理提权（调试） |
