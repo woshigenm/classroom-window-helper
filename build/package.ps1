@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "v2.0.0",
+    [string]$Version = "v2.1.0",
     [string]$OutDir = "",
     [string]$Pfx = "",
     [string]$Password = "",
@@ -123,7 +123,7 @@ try {
     }
 
     @(
-        "Classroom Window Mode v2.0"
+        "Classroom Window Mode v2.1"
         ""
         "1. Extract this zip (bin\ must stay on a local disk)."
         "2. Run bin\bypass.exe as Administrator."

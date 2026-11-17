@@ -1,5 +1,5 @@
 /*
- * Classroom Control Bypass Tool v2.0
+ * Classroom Control Bypass Tool v2.1
  * 噢易多媒体网络教室 (V10.8.0.3895) 课堂控制解除工具
  *
  * ===========================================================================
@@ -134,8 +134,8 @@
    ABI 版本（bypass_abi.h 的 HR_ABI_VERSION）和共享状态版本
    （bypass_state.h 的 BYPASS_STATE_VERSION）是**协议**版本，网络/内存布局一改才动，
    跟产品版本无关，不要跟着这里改。 */
-#define APP_VERSION_W   L"2.0"
-#define APP_VERSION_A   "2.0"
+#define APP_VERSION_W   L"2.1"
+#define APP_VERSION_A   "2.1"
 
 #define WINDOW_CLASS    L"ClassroomBypassClass"
 #define WINDOW_TITLE    L"教学控制解除工具 v" APP_VERSION_W
