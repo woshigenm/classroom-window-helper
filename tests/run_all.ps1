@@ -134,6 +134,14 @@ Run-Suite 'version self-check (content hash)' {
         Out-Host
 }
 
+# lpe\trigger.ps1's Documents known-folder handling (snapshot protocol, stale
+# recovery, restore).  Extracts the marked blocks out of the shipped script and
+# runs them against a sandbox, so it needs no privileges and no WalletService.
+Run-Suite 'lpe documents state (snapshot)' {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tests 'lpe_documents.ps1') |
+        Out-Host
+}
+
 # Multi-instance / concurrency: four classroom processes, one UI click, two
 # clients on the same pipe, a status check during a slow reload, crash
 # isolation.  Runs last: it swaps the Core DLL around (always restored).

@@ -83,6 +83,11 @@ try {
     $lpeSrc = Join-Path $Bin "lpe"
     if (Test-Path -LiteralPath $lpeSrc) {
         Copy-Item -LiteralPath $lpeSrc -Destination $stageBin -Recurse -Force
+        # bin\lpe\documents.orig is this machine's snapshot of where its
+        # Documents folder was (see trigger.ps1).  Shipping it would tell the
+        # recipient's first run to restore a path that only exists here.
+        $stale = Join-Path $stageBin "lpe\documents.orig"
+        if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
     } else {
         Write-Warning "bin\lpe missing: the package can only elevate through UAC"
     }

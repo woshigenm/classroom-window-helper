@@ -63,12 +63,22 @@ bin\bypass.exe（普通用户，非管理员）
   随后 `get` 报 `0x80070002`）。所以 `trigger.ps1` 每次 `set` 之前都用
   `Test-Path -PathType Container` 验目标，验不过就 `exit 4`，而不是照着写——
   写进去就是一个指不到任何目录的 Documents。
-- stale 自愈是**尽力猜测**，不是权威原值：原值已被上一条那个覆盖写抹掉，注册表里没有副本。
-  能还原：`%USERPROFILE%\Documents`、OneDrive KFM（`$env:OneDrive` / `$env:OneDriveConsumer`
-  下的 `Documents`，优先于 profile 里那个空壳目录）。不能还原：自定义重定向
-  （`D:\MyDocs`、网络盘等）——这种情况脚本拒绝运行（`exit 4`），退回 UAC，需要手工执行
-  `bin\lpe\documents_path.exe set <真实路径>`。要让这一类也能自愈，只能在第一次运行时把
-  原值快照到 `bin\lpe\documents.orig`（P1 待办，尚未实现）。
+- stale 自愈分两级：**快照**优先，**候选列表**只是兜底。
+  - 快照 `bin\lpe\documents.orig`：每次重定向前把当前值写进去（UTF-8 无 BOM，
+    中文用户名不会坏），恢复成功才删除。脚本被杀时它留在磁盘上，下一次运行直接
+    读回真值（`Test-Path -PathType Container` 验过才用），所以自定义重定向
+    （`D:\MyDocs`、网络盘）也能自愈。
+  - 候选列表：只有没有快照时（旧版本遗留的坏状态）才用，顺序
+    `$env:OneDrive` → `$env:OneDriveConsumer` → `%USERPROFILE%\Documents`。
+    OneDrive 优先，是因为 KFM 用户通常还留着一个空壳 `%USERPROFILE%\Documents`，
+    写进去会悄悄取消同步（看起来“修好了”，其实换了目录）。
+  - 两者都不可用 → `exit 4`，退回 UAC，并提示手工
+    `bin\lpe\documents_path.exe set <真实路径>`。快照存在但当前不可达
+    （移动硬盘拔了、共享离线）时同样拒绝，而不是拿候选覆盖它——那是最后一版真值。
+- 回调 DLL 的服务名是 `CVE49176_<pid>_<tick>`，每次运行唯一，`StartService` 之后
+  立即 `DeleteService`，所以没有“上次残留 → 本次 `ERROR_SERVICE_EXISTS`”这条路径。
+  `trigger.ps1` 启动时仍对 `CVE49176_*` 做一次只读扫描，发现残留才写 `WARNING`
+  （不自动删除：删服务需要本脚本不一定持有的权限）。
 - `documents_path.exe get` 的输出会丢非 ASCII 字符（CRT `"C"` locale），所以
   `trigger.ps1` 只用它写日志，不再用它做任何判断：读当前路径走 .NET 的
   `[Environment]::GetFolderPath`，判断成败看 `documents_path.exe` 的退出码。

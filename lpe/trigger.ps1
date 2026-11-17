@@ -91,6 +91,20 @@ foreach ($file in @($seed, $callback, $broker, $documents)) {
     }
 }
 
+# Diagnostic only.  The callback DLL names its service CVE49176_<pid>_<tick>
+# and calls DeleteService right after StartService, so a leftover means the SCM
+# never processed that delete.  Nothing is removed here: deleting a service
+# needs rights this script may not have, and guessing at one is worse than
+# reporting it.
+try {
+    $leftover = @(Get-Service -Name 'CVE49176_*' -ErrorAction SilentlyContinue)
+} catch {
+    $leftover = @()
+}
+if ($leftover.Count -gt 0) {
+    Set-Stage "WARNING leftover payload services: $(($leftover | ForEach-Object { $_.Name }) -join ', ')"
+}
+
 $commandLine = $TargetCommand
 if (-not $commandLine -and $JobFile) {
     if (-not (Test-Path -LiteralPath $JobFile -PathType Leaf)) {
@@ -144,43 +158,71 @@ if ($LASTEXITCODE -ne 0) {
 Set-Stage 'database seeded'
 
 $record = $null
+# >>> known-folder
 # Read the known folder in-process instead of parsing documents_path.exe's
 # stdout: its wprintf goes through the CRT "C" locale, which drops non-ASCII
 # (a Chinese user name came back as C:\Users\\Documents).  .NET returns the
 # same FOLDERID_Documents as a UTF-16 string, so nothing is ever narrowed.
 $original = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
-if (-not $original) {
-    Set-Stage 'could not read the Documents path'
-    exit 4
+
+# Snapshot of what the redirect is about to overwrite.  SHSetKnownFolderPath
+# overwrites User Shell Folders\Personal -- the only copy -- and it does that
+# even when the call fails, so a run that dies between "set" and "restore"
+# destroys the real value.  This file is the only record of it; the candidate
+# list below is a guess by comparison.
+$snapshot = Join-Path $Repo 'documents.orig'
+$recorded = $null
+if (Test-Path -LiteralPath $snapshot -PathType Leaf) {
+    # UTF-8 without a BOM so a non-ASCII user name survives.  Empty or
+    # unreadable counts as absent rather than as a path to trust.
+    $recorded = ([IO.File]::ReadAllText($snapshot, [Text.Encoding]::UTF8)).Trim()
+    if (-not $recorded) { $recorded = $null }
 }
 
 # A previous run that died between "set" and "restore" leaves Documents pointing
 # into the LPE temp root.  Capturing that as "original" would restore the stale
 # redirect forever (and the wallet callback would seed into the wrong folder).
 #
-# There is no recorded origin: SHSetKnownFolderPath overwrites the only copy
-# (User Shell Folders\Personal), and it does that even when the call fails, so
-# this is a best guess, not the real value.  OneDrive first, because a
-# known-folder-move profile usually keeps an empty leftover
-# %USERPROFILE%\Documents that would win a plain "does it exist" test.
-# A user who relocated Documents anywhere else (D:\MyDocs, a share) cannot be
-# recovered this way - that is why an empty candidate list refuses to run
-# rather than overwriting the last usable copy with a new $root.
+# OneDrive first: a known-folder-move profile usually keeps an empty leftover
+# %USERPROFILE%\Documents that would win a plain "does it exist" test, and
+# redirecting there silently unsyncs Documents.  A user who relocated Documents
+# anywhere else (D:\MyDocs, a share) cannot be guessed at - that is why an
+# empty candidate list refuses to run instead of overwriting the last usable
+# copy with a new $root.
 $lpeRoot = Join-Path $env:LOCALAPPDATA 'ClassroomBypass-LPE'
-if ($original.TrimEnd('\') -like "$lpeRoot*") {
-    $candidates = @()
-    if ($env:OneDrive)         { $candidates += (Join-Path $env:OneDrive 'Documents') }
-    if ($env:OneDriveConsumer) { $candidates += (Join-Path $env:OneDriveConsumer 'Documents') }
-    $candidates += (Join-Path $env:USERPROFILE 'Documents')
-    Set-Stage "documents stale redirect -> candidates: $($candidates -join ' | ')"
-    $original = $candidates |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
-        Select-Object -First 1
-    if (-not $original) {
-        Set-Stage 'stale redirect under the LPE root and no candidate to restore - refusing to run'
+if ($original -and $original.TrimEnd('\') -like "$lpeRoot*") {
+    if ($recorded -and (Test-Path -LiteralPath $recorded -PathType Container)) {
+        $original = $recorded
+        Set-Stage "documents stale redirect -> recorded original $original"
+    } elseif ($recorded) {
+        # Recorded, but not reachable right now (unplugged drive, share
+        # offline).  Guessing would overwrite the only remaining copy of the
+        # real value: keep the snapshot and let the next run retry.
+        Set-Stage "documents stale redirect, recorded original is not a directory - refusing to run: $recorded"
+        exit 4
+    } else {
+        $candidates = @()
+        if ($env:OneDrive)         { $candidates += (Join-Path $env:OneDrive 'Documents') }
+        if ($env:OneDriveConsumer) { $candidates += (Join-Path $env:OneDriveConsumer 'Documents') }
+        $candidates += (Join-Path $env:USERPROFILE 'Documents')
+        Set-Stage "documents stale redirect -> candidates: $($candidates -join ' | ')"
+        $original = $candidates |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+            Select-Object -First 1
+        if (-not $original) {
+            Set-Stage 'stale redirect under the LPE root and no candidate to restore - refusing to run'
+            exit 4
+        }
+        Set-Stage "documents stale redirect under LPE root -> using $original"
+    }
+} elseif (-not $original) {
+    if ($recorded -and (Test-Path -LiteralPath $recorded -PathType Container)) {
+        $original = $recorded
+        Set-Stage "documents unreadable, using recorded original $original"
+    } else {
+        Set-Stage 'could not read the Documents path'
         exit 4
     }
-    Set-Stage "documents stale redirect under LPE root -> using $original"
 } elseif (-not (Test-Path -LiteralPath $original -PathType Container)) {
     # The per-user value is not validated when it is read, so it can name a
     # path that no longer exists (unplugged drive, deleted folder, or an older
@@ -190,6 +232,17 @@ if ($original.TrimEnd('\') -like "$lpeRoot*") {
     exit 4
 }
 Set-Stage "documents original=$original"
+
+# Written before the redirect and cleared only after a verified restore: if
+# this process is killed in between, the next run reads the real value back
+# instead of guessing, and the guessing branch above never runs.
+try {
+    [IO.File]::WriteAllText($snapshot, $original,
+        (New-Object Text.UTF8Encoding($false)))
+} catch {
+    Set-Stage "WARNING cannot write the snapshot $snapshot : $($_.Exception.Message)"
+}
+# <<< known-folder
 
 try {
     # The exit code is the whole check now.  SHSetKnownFolderPath returns S_OK
@@ -227,14 +280,31 @@ try {
     Set-Stage "exception: $($_.Exception.Message)"
     throw
 } finally {
-    # $original was checked with Test-Path before the redirect, so this cannot
-    # install a dead path (a failed set writes anyway and does not roll back).
-    & $documents set $original | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Set-Stage "WARNING documents restore failed (exit $LASTEXITCODE): $original"
+    # >>> restore
+    # Re-checked here rather than trusting the check before the try: the LPE
+    # chain takes seconds to minutes, and $original can sit on a drive that
+    # was unplugged in the meantime.  set writes before it validates and does
+    # not roll back, so restoring a dead path would turn a recoverable state
+    # into a broken one.
+    if (Test-Path -LiteralPath $original -PathType Container) {
+        & $documents set $original | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Set-Stage "WARNING documents restore failed (exit $LASTEXITCODE): $original"
+        } else {
+            Set-Stage 'documents restored'
+            try {
+                Remove-Item -LiteralPath $snapshot -Force
+            } catch {
+                Set-Stage "WARNING documents restored but the snapshot could not be removed: $snapshot"
+            }
+        }
     } else {
-        Set-Stage 'documents restored'
+        # Deliberately a different message from "restore failed": nothing was
+        # written, Documents stays redirected, and the snapshot is what the
+        # next run needs to repair it.
+        Set-Stage "WARNING documents original is no longer a directory, restore skipped: $original"
     }
+    # <<< restore
 }
 
 if (-not $record) {
