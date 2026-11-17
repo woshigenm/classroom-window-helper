@@ -7,6 +7,7 @@ rem     make.bat              -> build all (bypass + hook32 + lpe)
 rem     make.bat bypass       -> only bypass.exe
 rem     make.bat hook32       -> only bypass_hook32.dll (Loader) + bypass_hook_core.dll + inject32.exe
 rem     make.bat lpe          -> only bin\lpe\ (auto-elevation payload)
+rem     make.bat lpepayload   -> rebuild lpe\payload\*.exe/dll from lpe\src (mingw)
 rem     make.bat test         -> bin\hooktest32.exe
 rem     make.bat wmodetest    -> bin\wmode_test.exe
 rem     make.bat vdtest       -> bin\vd_pin_test.exe

@@ -19,14 +19,19 @@
 | 路径 | 说明 |
 |---|---|
 | `trigger.ps1` | 本次的入口。构造并触发 WalletService 链路，结束后无条件还原 Documents 路径 |
-| `payload\wallet_ese_seed.exe` | PoC 原样：造带持久化回调的 `wallet.db` |
-| `payload\wallet_callback_shell.dll` | PoC 原样：被 WalletService 以 SYSTEM 加载，创建按需服务 |
-| `payload\documents_path.exe` | PoC 原样：读写 `FOLDERID_Documents` |
+| `payload\wallet_ese_seed.exe` | 造带持久化回调的 `wallet.db`（上游 MSVC 构建，源码见 `src\`） |
+| `payload\wallet_callback_shell.dll` | 被 WalletService 以 SYSTEM 加载，创建按需服务（同上） |
+| `payload\documents_path.exe` | 读写 `FOLDERID_Documents`（同上） |
 | `payload\README.txt` | 来源、SHA256、与原版的差异说明 |
+| `src\*.c` | 上面三个二进制的源码，可直接修改；`make.bat lpepayload` 重新编译 |
 | `..\src\lpe_broker.c` | 由本仓库编译成 `bin\lpe\shell_broker.exe`：拉起 `bin\bypass.exe` |
 
 构建：`make.bat lpe`（`make.bat all` 也会带上）。产物全部落到 `bin\lpe\`，
 **运行期只读 `bin\lpe\`**，本目录不参与运行。
+
+`payload\` 里三个二进制默认是上游 MSVC 构建。改了 `src\` 的源码后，先用
+`make.bat lpepayload` 重编（mingw-w64），再 `make.bat lpe` 铺到 `bin\lpe\`。
+重编会改变 SHA256，而 `payload\README.txt` 记的是原值。细节见 `src\README.md`。
 
 ## 调用链
 

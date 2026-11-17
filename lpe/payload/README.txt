@@ -28,3 +28,7 @@ broker is built 32-bit and runs fine as a demand-start service.
 
 Only use this on machines you own.  Windows patched after July 2026 does not
 have the vulnerability -- the tool then falls back to UAC / manual start.
+
+The sources of the three vendored binaries live in lpe\src\.  After editing
+them, rebuild with "make.bat lpepayload" (mingw-w64) and stage with
+"make.bat lpe"; the SHA256 values above then no longer describe the files.

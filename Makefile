@@ -4,6 +4,7 @@
 #  Usage (make is not on PATH by default):
 #     make.bat                  -> all (bypass + hook32 + lpe)
 #     make.bat bypass / hook32 / lpe
+#     make.bat lpepayload       -> rebuild lpe\payload\ from lpe\src (mingw)
 #     make.bat test / wmodetest / vdtest
 #     make.bat clean / rebuild / check
 #
@@ -53,7 +54,7 @@ CFLAGS32 := -std=gnu11 -O2 -Wall
 DLLFLAGS := -shared -Wl,--kill-at -static -static-libgcc
 DLLLIBS  := -lpsapi -lole32 -ladvapi32 -lgdi32
 
-.PHONY: all bypass hook32 lpe lpebroker test wmodetest vdtest hangwintest screentest shuttest fakecores testcores corehost clean rebuild check
+.PHONY: all bypass hook32 lpe lpebroker lpepayload test wmodetest vdtest hangwintest screentest shuttest fakecores testcores corehost clean rebuild check
 
 # 主程序 + DLL + 注入器 + 自动提权载荷（自测程序按需单独编）
 all: bypass hook32 lpe
@@ -78,6 +79,17 @@ lpe: lpebroker
 	@echo [lpe] payload staged in bin\lpe
 
 lpebroker: $(LPEOUT)/shell_broker.exe
+
+# Rebuild the three vendored PoC binaries from lpe\src with mingw.  Explicit
+# target on purpose: lpe\payload\ currently holds the upstream MSVC builds and
+# rebuilding changes their SHA256 (recorded in lpe\payload\README.txt), so this
+# must be a decision, not a side effect of "make all".  See lpe\src\README.md.
+lpepayload:
+	"$(CC64)" -municode -O2 -Wall -o "$(LPEPAY)/documents_path.exe" "lpe/src/documents_path.c" -lshell32 -lole32 -luuid
+	"$(CC64)" -shared -O2 -Wall -o "$(LPEPAY)/wallet_callback_shell.dll" "lpe/src/wallet_callback_shell.c" -ladvapi32
+	"$(CC64)" -O2 -Wall -o "$(LPEPAY)/wallet_ese_seed.exe" "lpe/src/wallet_ese_seed.c" -lesent
+	@echo [lpepayload] rebuilt in $(LPEPAY) - run "make.bat lpe" to stage
+	@echo [lpepayload] then refresh the SHA256 lines in lpe\payload\README.txt
 
 test: $(BIN)/hooktest32.exe
 
