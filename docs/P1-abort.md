@@ -1,7 +1,9 @@
 # P1b 设计：点「跳过」时的协作退出
 
-状态：**已实现并真机验收**（abort 协作 + Job Object）。正常链路与「点跳过」都已在真机
-各跑通一次（2026-11-17，见 §0 验证状态与 §8 验收进度）；剩余未覆盖的只有 §8 的 1b/2/3。
+状态：**已实现并真机验收**（abort 协作 + Job Object）。正常链路、点跳过（协作退出 + 卡死
+硬杀两种形态）、快照修复（`source=snapshot`）、skip-race 修复都已在真机跑通（2026-11-17，
+见 §0 验证状态与 §8 验收进度）；剩余未覆盖的只有 1 的 `fallback` 形态（单元覆盖）和第 6 条
+（定义性，无测试）。
 
 ## 0. 实现记录（本轮）
 
@@ -21,13 +23,16 @@
 | 项 | 覆盖方式 |
 |---|---|
 | abort 文件写入 / 轮询 / `return` 跑 `finally` | 单元（`tests\lpe_documents.ps1`，桩） |
-| 3000ms 等待与超时 `TerminateProcess` | 代码审查 + 单元形状，未在真实链路上计时 |
-| Job assign / `KILL_ON_JOB_CLOSE` / disarm | 本机一次性探针（armed close 杀、disarmed close 不杀、父在 job 内 assign 成功）+ 真机日志 `lpe: script is in the job (kill-on-close)`（2026-11-17） |
+| 3000ms 等待与超时 `TerminateProcess` | **真机已验证**（2026-11-17 两次）：卡死桩（`Start-Sleep 10`）下 skip → 恰 3.0 s 后 `did not exit in 3000 ms, terminating` |
+| Job assign / `KILL_ON_JOB_CLOSE` / disarm | 本机一次性探针（armed close 杀、disarmed close 不杀、父在 job 内 assign 成功）+ 真机：job 行正常；**强杀启动器后 powershell 死在 `finally` 之前**——下一次运行触发 stale 分支就是它死于半途的直接后果 |
 | 落盘脚本 + `-Command` IEX + `policy=Restricted` 下运行 + `finally` 恢复 Documents + 握手行 | **真机已验证**（2026-11-17，另一台机）：`policy=Restricted` 脚本照常执行，从落盘到 `elevated instance pid=4644 is up` 共 2.95s，`documents restored ... source=original`，`how=user-linked` |
 | **点跳过 → 真 `elevate.c` 写文件 → 真 `trigger.ps1` 轮询 → 真 `finally` 恢复** | **真机已验证**（2026-11-17）：跳过写入后脚本 **47 ms** 退出（未动用 `TerminateProcess`），`documents restored ... source=original`，`note: no leftover CVE49176_* service`，abort 文件与落盘脚本正常清理 |
+| **快照修复（A+ stale 分支，`source=snapshot`）** | **真机已验证**（2026-11-17 两次）：被杀运行留下的重定向 + 快照，下一次启动 `documents stale redirect -> recorded original ...` → `source=snapshot` 修回 |
+| **skip-race 修复（不弹第二个 UAC）** | **真机已验证**（2026-11-17 两次）：skip 落在握手行之后，`skip landed after the chain already succeeded (elevated pid=N is up) - not popping a second UAC` |
 
 三处「只有真实链路才暴露」的耦合至此全部走完一遍：跨权限读文件、残留清理时序、3000ms
-宽限（实际 47 ms，余量巨大）。但这次实测还暴露了一个当初推不出来的竞态，已修：
+宽限（协作退出实测 47 ms；卡死实测恰 3.0 s 终止）。实测还暴露并修掉了一个当初推不出来的
+竞态：
 
 **skip 与成功的竞态。** 跳过落在了握手行之后 109 ms（`elevated instance pid=4712 is up` 在
 t，skip 在 t+109 ms）。skip 分支一旦进入就只等脚本退出、不再扫握手行，所以 `ok` 保持 0 →
@@ -35,8 +40,12 @@ t，skip 在 t+109 ms）。skip 分支一旦进入就只等脚本退出、不再
 难看。修法：skip 收尾时做一次最终握手检查，链路已经成功就认账、不再弹第二个 UAC——
 「跳过」跳过的是利用链，不是已经存在的结果。
 
-因此：在 `§8` 跑过之前，**遇到「点了跳过但 Documents 没回来」，先看这条链路**，不要先怀疑
-快照或候选列表。README 的运行时文件表也带同样的提示。
+另一个实测确认的边界（不是 bug，记下来免得再疑惑）：**skip 写在脚本进入 `do{}` 循环之前
+时，脚本要等循环开始才轮询到 abort**。正常链路里循环 0.5 s 内就开始，看不出来；卡死桩下
+能看到 abort 写入后脚本继续把 seed/重定向跑完才死。上限由 3000 ms 硬杀兜住。
+
+因此：**遇到「点了跳过但 Documents 没回来」，先看这条链路**，不要先怀疑快照或候选列表。
+README 的运行时文件表也带同样的提示。
 
 ## 1. 先摆事实（读代码得出，不是推测）
 
@@ -301,11 +310,23 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -Command "Invoke-Expression (G
 7. **成功路径不误杀**：握手行出现后（不点跳过）等 10 秒，日志里没有“脚本被杀”的痕迹，Documents 已由 `finally` 恢复（不是停在 `$root`）。这条专门验证 §6 的“撤掉 kill-on-close”；
 8. `make all` 0 警告，全套测试通过（`lpe documents state` 72 项）。
 
-**验收进度**（2026-11-17，DESKTOP-UCUPIMQ 真机）：1 的 `source=original` 形态、4（以竞态
-形态真实发生：skip 落在握手后 109 ms，提权实例 4712 不受影响；修复后更是不再弹第二个
-UAC）、5（写 abort → `exited after 47 ms`，恰一条）、7 的“不误杀”半边已覆盖。
-未覆盖：1 的 `snapshot`/`fallback` 形态、2（脚本卡住被硬杀）、3（强杀 elevate.c）——
-三条都只有单元/探针形状，再遇真实环境时优先补这三条。
+**验收进度**（2026-11-17，DESKTOP-UCUPIMQ 真机，全天累计）：
+
+| 条 | 状态 |
+|---|---|
+| 1 `source=original` 形态 | ✓ 三次正常成功链路 |
+| 1 `source=snapshot` 形态 | ✓ 两次（强杀/skip 硬杀留下重定向 + 快照，下一次启动修回） |
+| 2 卡死脚本 3 s 硬杀 | ✓ 两次（10 s 桩 + skip → `did not exit in 3000 ms, terminating`，恰 3.0 s） |
+| 3 强杀 `elevate.c` → powershell 死 | ✓ 以后果验证：被杀运行的 powershell 死在 `finally` 之前，下一次运行才可能触发 stale 分支（已触发两次）；直接指纹（该 run 日志无 `documents restored`、`Get-CimInstance` 无残留 powershell）见运行记录 |
+| 4 握手后点跳过，提权实例不受影响 | ✓ 两次（竞态真实发生；修复生效，未弹第二个 UAC） |
+| 5 关键节点日志齐全且恰一条 | ✓ |
+| 6 conhost 不作残留依据 | 定义性条目，无测试 |
+| 7 成功路径不误杀 | ✓ |
+| 8 `make all` 0 警告、全套通过 | ✓ 每次提交前跑 |
+
+未覆盖：1 的 `fallback` 形态（快照指向已消失的目录 → 候选列表猜回）只有单元覆盖
+（`tests\lpe_documents.ps1` 的 `stale-recorded-dead`）；要真机做，手工把 `documents.orig`
+改成一个不存在的目录再启动即可。
 
 ## 9. 已定（本轮答复）
 
