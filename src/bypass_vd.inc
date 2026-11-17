@@ -131,7 +131,7 @@ static void VD_GuidToStr(const GUID* g, char* out, int n)
               (unsigned long)g->Data1, (unsigned)g->Data2, (unsigned)g->Data3,
               g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3],
               g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
-    out[n - 1] = 0;
+    out[n - 1] = '\0';
 }
 
 static int VD_StrToGuid(const char* s, GUID* g)
@@ -179,7 +179,7 @@ static BOOL VD_IsRenderWindow(HWND h)
 
     if (!h || !IsWindow(h)) return FALSE;
     if (GetAncestor(h, GA_ROOT) != h) return FALSE;
-    cls[0] = 0;
+    cls[0] = '\0';
     GetClassNameA(h, cls, sizeof(cls));
     return IsRenderWindowClass(cls);
 }
@@ -227,12 +227,12 @@ static void VD_BuildPath(void)
 
     if (g_vdPath[0] || !g_dllPath[0]) return;
     _snprintf(dir, sizeof(dir) - 1, "%s", g_dllPath);
-    dir[sizeof(dir) - 1] = 0;
+    dir[sizeof(dir) - 1] = '\0';
     p = strrchr(dir, '\\');
     if (!p) return;
     *(p + 1) = 0;
     _snprintf(g_vdPath, sizeof(g_vdPath) - 1, "%s%s", dir, VD_INI_NAME);
-    g_vdPath[sizeof(g_vdPath) - 1] = 0;
+    g_vdPath[sizeof(g_vdPath) - 1] = '\0';
 }
 
 static void VD_LoadIni(void)
@@ -242,7 +242,7 @@ static void VD_LoadIni(void)
 
     g_vdCfgEnabled = 1;
     g_vdIndex = 0;
-    g_vdCfgGuid[0] = 0;
+    g_vdCfgGuid[0] = '\0';
 
     if (!g_vdPath[0]) return;
     f = fopen(g_vdPath, "r");
@@ -267,7 +267,7 @@ static void VD_LoadIni(void)
             if (g_vdIndex < 0) g_vdIndex = 0;
         } else if (!_stricmp(k, "guid")) {
             _snprintf(g_vdCfgGuid, sizeof(g_vdCfgGuid) - 1, "%s", v);
-            g_vdCfgGuid[sizeof(g_vdCfgGuid) - 1] = 0;
+            g_vdCfgGuid[sizeof(g_vdCfgGuid) - 1] = '\0';
         } else if (!_stricmp(k, "pinned")) {
             GUID g;
             if (VD_StrToGuid(v, &g)) {

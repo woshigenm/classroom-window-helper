@@ -713,7 +713,7 @@ void UpdateStatus(HWND hwnd, const char* status) {
             if (MultiByteToWideChar(CP_ACP, 0, status, -1, wstat, 128) > 0) {
                 wchar_t tip[160];
                 _snwprintf(tip, 159, L"教学控制解除工具 — %s", wstat);
-                tip[159] = 0;
+                tip[159] = L'\0';
                 TrayUpdateTip(hwnd, tip);
             }
         }
@@ -4673,7 +4673,7 @@ static void StateParseSmall(const char* value, int* w, int* h, int* permille)
 
     if (strchr(q, 'x') || strchr(q, 'X')) {
         int a = 0, b = 0;
-        char sep = 0;
+        char sep = '\0';
         if (sscanf(q, "%d%c%d", &a, &sep, &b) == 3 && a >= 160 && b >= 120) {
             *w = a;
             *h = b;
@@ -5299,7 +5299,7 @@ static void TrayUpdateTip(HWND hwnd, const wchar_t* tip) {
     nid.uID = TRAY_ICON_ID;
     nid.uFlags = NIF_TIP;
     wcsncpy(nid.szTip, tip, 127);
-    nid.szTip[127] = 0;
+    nid.szTip[127] = L'\0';
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 

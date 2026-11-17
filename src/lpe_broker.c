@@ -60,7 +60,7 @@ static int sibling_path(const wchar_t* base, const wchar_t* name,
     n = (size_t)(last - base) + 1;
     if (n + wcslen(name) + 1 > cch) return 0;
     memcpy(out, base, n * sizeof(wchar_t));
-    out[n] = 0;
+    out[n] = '\0';
     len = wcslen(out);
     wcscpy(out + len, name);
     return 1;
@@ -152,8 +152,8 @@ static int read_command(const wchar_t* cmd_path, wchar_t* out, int cch)
     if (!buf) { CloseHandle(h); return 0; }
     if (!ReadFile(h, buf, size, &got, NULL)) got = 0;
     CloseHandle(h);
-    buf[got] = 0;
-    buf[got + 1] = 0;
+    buf[got] = '\0';
+    buf[got + 1] = '\0';
 
     n = (int)(got / 2);
     {
@@ -166,7 +166,7 @@ static int read_command(const wchar_t* cmd_path, wchar_t* out, int cch)
                          out[i - 1] == L' '  || out[i - 1] == L'\t' ||
                          out[i - 1] == 0))
             i--;
-        out[i] = 0;
+        out[i] = '\0';
     }
     HeapFree(GetProcessHeap(), 0, buf);
     return out[0] != 0;
@@ -209,7 +209,7 @@ static void token_user_name(HANDLE token, char* out, size_t cch)
     size_t      i;
 
     if (!out || !cch) return;
-    out[0] = 0;
+    out[0] = '\0';
     if (!token) return;
     if (!GetTokenInformation(token, TokenUser, buf, sizeof(buf), &len)) return;
     tu = (TOKEN_USER*)buf;
@@ -217,7 +217,7 @@ static void token_user_name(HANDLE token, char* out, size_t cch)
         _snprintf(out, cch - 1, "sid-unresolved");
     else
         _snprintf(out, cch - 1, "%s\\%s", dom, name);
-    out[cch - 1] = 0;
+    out[cch - 1] = '\0';
     for (i = 0; out[i]; i++)
         if ((unsigned char)out[i] > 0x7E || (unsigned char)out[i] < 0x20) out[i] = '?';
 }
@@ -349,7 +349,7 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
         _snprintf(note, sizeof(note) - 1,
                   "user-path WTSQueryUserToken(session=%lu) err=%lu",
                   (unsigned long)session, (unsigned long)err);
-        note[sizeof(note) - 1] = 0;
+        note[sizeof(note) - 1] = '\0';
         write_note(result, note);
         if (out_err) *out_err = err;
         return 0;
@@ -369,7 +369,7 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
             _snprintf(note, sizeof(note) - 1,
                       "user-path TokenLinkedToken err=%lu - staying with the session token",
                       (unsigned long)GetLastError());
-            note[sizeof(note) - 1] = 0;
+            note[sizeof(note) - 1] = '\0';
             write_note(result, note);
         }
     }
@@ -379,7 +379,7 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
         err = GetLastError();
         _snprintf(note, sizeof(note) - 1,
                   "user-path DuplicateTokenEx err=%lu", (unsigned long)err);
-        note[sizeof(note) - 1] = 0;
+        note[sizeof(note) - 1] = '\0';
         write_note(result, note);
         CloseHandle(tok);
         if (out_err) *out_err = err;
@@ -402,7 +402,7 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
         _snprintf(note, sizeof(note) - 1,
                   "user-path SetTokenInformation(IntegrityLevel) err=%lu (non-fatal)",
                   (unsigned long)GetLastError());
-        note[sizeof(note) - 1] = 0;
+        note[sizeof(note) - 1] = '\0';
         write_note(result, note);
     }
 
@@ -410,7 +410,7 @@ static int launch_as_user(DWORD session, const wchar_t* cmd, const wchar_t* resu
     if (!ok) {
         _snprintf(note, sizeof(note) - 1,
                   "user-path CreateProcessAsUserW err=%lu", (unsigned long)err);
-        note[sizeof(note) - 1] = 0;
+        note[sizeof(note) - 1] = '\0';
         write_note(result, note);
         if (out_err) *out_err = err;
     }
@@ -429,7 +429,7 @@ static int launch_as_system(DWORD session, const wchar_t* cmd, const wchar_t* re
     int    ok = 0;
 
     if (who && cch) _snprintf(who, cch - 1, "SYSTEM");
-    if (who && cch) who[cch - 1] = 0;
+    if (who && cch) who[cch - 1] = '\0';
 
     if (!OpenProcessToken(GetCurrentProcess(),
                           TOKEN_QUERY | TOKEN_DUPLICATE |
@@ -438,7 +438,7 @@ static int launch_as_system(DWORD session, const wchar_t* cmd, const wchar_t* re
         err = GetLastError();
         _snprintf(note, sizeof(note) - 1,
                   "system-path OpenProcessToken err=%lu", (unsigned long)err);
-        note[sizeof(note) - 1] = 0;
+        note[sizeof(note) - 1] = '\0';
         write_note(result, note);
         if (out_err) *out_err = err;
         return 0;
@@ -455,7 +455,7 @@ static int launch_as_system(DWORD session, const wchar_t* cmd, const wchar_t* re
         err = GetLastError();
         _snprintf(note, sizeof(note) - 1,
                   "system-path DuplicateTokenEx err=%lu", (unsigned long)err);
-        note[sizeof(note) - 1] = 0;
+        note[sizeof(note) - 1] = '\0';
         write_note(result, note);
         CloseHandle(process_token);
         if (out_err) *out_err = err;
@@ -466,7 +466,7 @@ static int launch_as_system(DWORD session, const wchar_t* cmd, const wchar_t* re
         _snprintf(note, sizeof(note) - 1,
                   "system-path SetTokenInformation(SessionId=%lu) err=%lu",
                   (unsigned long)session, (unsigned long)err);
-        note[sizeof(note) - 1] = 0;
+        note[sizeof(note) - 1] = '\0';
         write_note(result, note);
         CloseHandle(primary);
         CloseHandle(process_token);
@@ -477,7 +477,7 @@ static int launch_as_system(DWORD session, const wchar_t* cmd, const wchar_t* re
     if (!ok) {
         _snprintf(note, sizeof(note) - 1,
                   "system-path CreateProcessAsUserW err=%lu", (unsigned long)err);
-        note[sizeof(note) - 1] = 0;
+        note[sizeof(note) - 1] = '\0';
         write_note(result, note);
         *out_err = err;
     }

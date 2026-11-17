@@ -1952,7 +1952,7 @@ static BOOL SmallBcastNoRaise(HWND h)
     if (GetForegroundWindow() == h) return FALSE;   /* active: raising is harmless */
     if (LooksManaged(h)) return FALSE;              /* demoted window: own rules */
     if (IsWorthFixing(h)) return FALSE;             /* fullscreen-like: demote path */
-    cls[0] = 0;
+    cls[0] = '\0';
     GetClassNameA(h, cls, sizeof(cls));
     if (!IsRenderWindowClass(cls)) return FALSE;    /* class-based only */
     if (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOPMOST) return FALSE;
@@ -2833,11 +2833,11 @@ static BOOL WINAPI Impl_CreateProcessW(LPCWSTR app, LPWSTR cmd,
         WCHAR* p;
 
         wcsncpy(cmdbuf, cmd, 2047);
-        cmdbuf[2047] = 0;
+        cmdbuf[2047] = L'\0';
         p = wcsstr(cmdbuf, L"fullscreen");
         while (p) {
             WCHAR* q = p + 10;
-            WCHAR  prev = (p == cmdbuf) ? 0 : p[-1];
+            WCHAR  prev = (p == cmdbuf) ? L'\0' : p[-1];
             BOOL   atToken = !(((prev >= L'a' && prev <= L'z') ||
                                 (prev >= L'A' && prev <= L'Z') ||
                                 (prev >= L'0' && prev <= L'9')) ||
@@ -3344,7 +3344,7 @@ static BOOL StateParseSmall(const char* value, int* w, int* h, int* permille)
 
     if (strchr(q, 'x') || strchr(q, 'X')) {
         int a = 0, b = 0;
-        char sep = 0;
+        char sep = '\0';
         if (sscanf(q, "%d%c%d", &a, &sep, &b) == 3 && a >= 160 && b >= 120) {
             *w = a;
             *h = b;
@@ -3788,7 +3788,7 @@ static BOOL CALLBACK EnforceProc(HWND h, LPARAM lp){
                forever.  Strip it on the window thread (force=2 = topmost only). */
             {
                 char qb[64];
-                qb[0] = 0;
+                qb[0] = '\0';
                 GetClassNameA(h, qb, sizeof(qb));
                 if (IsRenderWindowClass(qb) &&
                     (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOPMOST))

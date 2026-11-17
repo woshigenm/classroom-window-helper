@@ -105,6 +105,12 @@ static void TruncateLog(void)
    even with several processes appending at once. */
 static void ELog(const char* fmt, ...)
 {
+    /* Single-threaded by construction (WinMain -> Elevate_Boot); static only to
+       keep it off the stack.  Do NOT reach for __thread/__declspec(thread) here:
+       mingw links those against libwinpthread-1.dll, which the release package
+       does not ship (a 64-bit exe that finds the 32-bit copy in C:\mingw32\bin
+       dies at startup with 0xC000007B).  If a worker thread ever logs, use
+       TlsAlloc, or take the lock the DLL loggers already use. */
     static char line[4096];
     char        path[MAX_PATH];
     SYSTEMTIME  st;
@@ -124,7 +130,7 @@ static void ELog(const char* fmt, ...)
     va_start(ap, fmt);
     _vsnprintf(line + n, sizeof(line) - n - 3, fmt, ap);
     va_end(ap);
-    line[sizeof(line) - 3] = 0;
+    line[sizeof(line) - 3] = '\0';
     n = (int)strlen(line);
     line[n++] = '\r';
     line[n++] = '\n';
@@ -311,7 +317,7 @@ static int ScanHookLogStatus(const char* path, DWORD* pid)
     SetFilePointer(h, (LONG)start, NULL, FILE_BEGIN);
     ReadFile(h, buf, size - start, &got, NULL);
     CloseHandle(h);
-    buf[got] = 0;
+    buf[got] = '\0';
 
     p = buf;
     if (start > 0) {
@@ -359,7 +365,7 @@ static int ScanHookLogChildPid(const char* path, DWORD* pid)
     SetFilePointer(h, (LONG)start, NULL, FILE_BEGIN);
     ReadFile(h, buf, size - start, &got, NULL);
     CloseHandle(h);
-    buf[got] = 0;
+    buf[got] = '\0';
 
     p = buf;
     if (start > 0) {
@@ -588,7 +594,7 @@ static char* Base64Encode(const BYTE* data, size_t len)
         out[o++] = (rem == 2) ? kB64[(v >> 6) & 63] : '=';
         out[o++] = '=';
     }
-    out[o] = 0;
+    out[o] = '\0';
     return out;
 }
 
@@ -597,14 +603,14 @@ static void PsQuote(char* out, size_t n, const char* s)
 {
     size_t o = 0;
 
-    if (n < 3) { if (n) out[0] = 0; return; }
+    if (n < 3) { if (n) out[0] = '\0'; return; }
     out[o++] = '\'';
     while (*s && o + 3 < n) {
         if (*s == '\'') out[o++] = '\'';
         out[o++] = *s++;
     }
     out[o++] = '\'';
-    out[o] = 0;
+    out[o] = '\0';
 }
 
 static char* BuildEncodedCommand(const char* scriptPath, const char* repo,
@@ -632,7 +638,7 @@ static char* BuildEncodedCommand(const char* scriptPath, const char* repo,
         fclose(f); free(script); return NULL;
     }
     fclose(f);
-    script[size] = 0;
+    script[size] = '\0';
     if ((unsigned char)script[0] == 0xEF && (unsigned char)script[1] == 0xBB &&
         (unsigned char)script[2] == 0xBF)
         memmove(script, script + 3, (size_t)size - 2);   /* drop the BOM */
@@ -642,7 +648,7 @@ static char* BuildEncodedCommand(const char* scriptPath, const char* repo,
     _snprintf(pre, sizeof(pre) - 1,
               "$Repo=%s;$TargetCommand=%s;$TimeoutSec=45;\r\n",
               qRepo, qTarget);
-    pre[sizeof(pre) - 1] = 0;
+    pre[sizeof(pre) - 1] = '\0';
 
     all = (char*)malloc(strlen(pre) + strlen(script) + 1);
     if (all) {

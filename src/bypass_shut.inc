@@ -127,7 +127,7 @@ static void SH_BaseNameW(const WCHAR* path, WCHAR* out, int n)
     const WCHAR* q;
     int          i = 0;
 
-    out[0] = 0;
+    out[0] = '\0';
     if (!path) return;
     s = path;
     while (*s == L' ' || *s == L'\t') s++;
@@ -138,10 +138,10 @@ static void SH_BaseNameW(const WCHAR* path, WCHAR* out, int n)
     for (q = s; q < e; q++)
         if (*q == L'\\' || *q == L'/') b = q + 1;
     for (q = b; q < e && i < n - 5; q++) out[i++] = SH_LowerW(*q);
-    out[i] = 0;
+    out[i] = '\0';
     if (i > 4 && out[i - 4] == L'.' && out[i - 3] == L'e' &&
         out[i - 2] == L'x' && out[i - 1] == L'e')
-        out[i - 4] = 0;
+        out[i - 4] = '\0';
 }
 
 /* Any /s /r /p /g (or -s -r -p -g) token? Those all mean "power off". */
@@ -213,8 +213,8 @@ static int SH_IsShutdownCmdA(const char* app, const char* cmd)
 {
     WCHAR wa[SH_WBUF], wc[SH_WBUF * 2];
 
-    wa[0] = 0;
-    wc[0] = 0;
+    wa[0] = L'\0';
+    wc[0] = L'\0';
     if (app && app[0])
         MultiByteToWideChar(CP_ACP, 0, app, -1, wa, SH_WBUF);
     if (cmd && cmd[0])
