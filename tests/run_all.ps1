@@ -59,7 +59,7 @@ function Run-Suite([string]$name, [scriptblock]$body) {
 
 if (-not $NoBuild) {
     Invoke-Build @('all', 'fakecores', 'testcores', 'corehost', 'uitest',
-                   'wmodetest', 'screentest', 'shuttest')
+                   'wmodetest', 'screentest', 'shuttest', 'hangwintest')
 }
 
 $script:results = @()
