@@ -216,9 +216,10 @@ documents restored original=C:\Users\x\Documents source=fallback
   不撤、直接 `CloseHandle`，子进程被杀；`AssignProcessToJobObject` 在**父进程本身也在 job
   里**的情况下依然返回成功（Windows 8+ 的嵌套 job），所以 `ERROR_ACCESS_DENIED` 那条分支
   只作为兜底存在，不是常规路径。
-- `AssignProcessToJobObject` 失败（目标已在别的 job 里，`ERROR_ACCESS_DENIED` = 5，
-  或嵌套 job 的 LimitFlags 不允许）：只写 `ELog`，不阻断流程。当前 `RunHidden` 用
-  `CreateProcessA`（`elevate.c:265`），父进程不在 job 里，正常路径不会失败；
+- `AssignProcessToJobObject` 失败（目标已在别的 job 里且嵌套不被允许，或 job 的
+  LimitFlags 不允许）：只写 `ELog`，不阻断流程。`RunHidden` 用 `CreateProcessA`
+  （`elevate.c:265`），本机探针显示父进程本身在 job 里时 assign 仍返回成功
+  （Windows 8+ 的嵌套 job），所以失败分支是兜底而不是常规路径；
   **UAC 那条路径用 `ShellExecuteEx`（`elevate.c:573`），拿不到进程句柄，不建 job**。
 - job 的作用域是 **powershell 及其默认子进程**。`conhost.exe` 是否在 job 里取决于
   启动标志（当前 `RunHidden` 用 `CREATE_NO_WINDOW`，现代 Windows 上通常随父），
@@ -238,13 +239,13 @@ documents restored original=C:\Users\x\Documents source=fallback
 ## 8. 验收标准
 
 1. 点跳过：日志出现 `documents restored ... source=<original|snapshot|fallback>`，**source 与实际来源一致**（用快照恢复时不能写 `source=original`），注册表两处 `Personal` 回到该值，abort 文件消失；
-2. 跳过 + 脚本卡住（测试桩里 `Start-Sleep 10`）：3 秒后 powershell 消失，快照文件仍在，日志有 `timed out at 3000ms`；
+2. 跳过 + 脚本卡住（测试桩里 `Start-Sleep 10`）：3 秒后 powershell 消失，快照文件仍在，日志有 `did not exit in 3000 ms, terminating`；
 3. 强杀 `elevate.c`（任务管理器）：powershell 跟着消失（`tasklist` 无残留）；
 4. 已成功（握手行已出现）后点跳过：提权实例不受影响；
 5. 关键节点日志齐全且顺序正确（写 abort → abort observed → `exited after N ms` 或 `terminating`，两者恰有一条）；
 6. `conhost.exe` 不作为残留判定依据：验收只查 powershell 是否存在；
 7. **成功路径不误杀**：握手行出现后（不点跳过）等 10 秒，日志里没有“脚本被杀”的痕迹，Documents 已由 `finally` 恢复（不是停在 `$root`）。这条专门验证 §6 的“撤掉 kill-on-close”；
-8. `make all` 0 警告，全套测试通过（含 P1a 的 45 项）。
+8. `make all` 0 警告，全套测试通过（`lpe documents state` 67 项）。
 
 ## 9. 已定（本轮答复）
 
