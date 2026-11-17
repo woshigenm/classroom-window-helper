@@ -1241,8 +1241,22 @@ static int TryLpe(const char* cmdline)
         ELog("lpe: elevated instance pid=%lu is running", (unsigned long)pid);
         StatusSetText("自动提权成功，正在启动…");
     } else if (skipped) {
-        ELog("lpe: skipped by the user");
-        StatusSetText("已跳过自动提权，正在切换到 UAC…");
+        /* The skip can race a success: the handshake may land between the
+           launcher's 200 ms polls (seen 2026-11-17: handshake at t, skip at
+           t+109 ms).  The skip branch stops polling, so without this check the
+           launcher reported failure and popped a second UAC whose instance
+           immediately exited on the single-instance mutex.  The button skips
+           the exploit chain, not a result that already exists. */
+        if (ScanHookLogStatus(hookLog, &pid) == 1 && pid != GetCurrentProcessId() &&
+            ProcessState(pid) != 0) {
+            ELog("lpe: skip landed after the chain already succeeded "
+                 "(elevated pid=%lu is up) - not popping a second UAC",
+                 (unsigned long)pid);
+            ok = 1;
+        } else {
+            ELog("lpe: skipped by the user");
+            StatusSetText("已跳过自动提权，正在切换到 UAC…");
+        }
     } else {
         /* payload stdout/stderr already stream into the shared log, so the
            failure reason is up there - just mark the summary. */

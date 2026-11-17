@@ -74,10 +74,11 @@ bin\bypass.exe（普通用户，非管理员）
   （见 `docs\P1-abort.md`）。所以「跳过」只保证**尝试**恢复，不保证回到用户最初配置的路径。
 - 脚本在 Job Object（`KILL_ON_JOB_CLOSE`）里，启动器被强杀时它会跟着死；正常返回前会先
   撤掉这个限制，否则成功路径会把还在跑 `finally` 的脚本一起杀掉。
-- 「跳过」通道**目前只有单元覆盖，未做端到端实测**（正常成功路径已在真机验证过：
-  2026-11-17，`policy=Restricted` 下落盘脚本照常执行，2.95s 出握手行，Documents 还原；
-  但那一次没点跳过，abort 轮询只有桩）。若用户反馈「点了跳过但 Documents 没回来」，
-  先按 `docs\P1-abort.md` §4 的三处失败点查这条链路，不要先怀疑快照。
+- 「跳过」通道已真机端到端验证（2026-11-17）：abort 写入后脚本 47 ms 内退出（远小于 3 s
+  宽限），`finally` 把 Documents 还原，无服务残留。由此暴露的「skip 落在成功之后」竞态
+  已修——skip 收尾时检查握手行，链路已成功就不再弹第二个 UAC（`docs\P1-abort.md` §0）。
+  若用户反馈「点了跳过但 Documents 没回来」，仍先按 `docs\P1-abort.md` §4 的三处失败点查
+  这条链路，不要先怀疑快照。
 - `SHSetKnownFolderPath` **失败时也会写入**：传一个不存在的目录，它先把
   `User Shell Folders\Personal` 和 `Shell Folders\Personal` 都改成那个路径，再返回错误，
   **不回滚**（实测：`set C:\__no_such_dir__` 退出码 1，但两处注册表值已经变坏，

@@ -1,6 +1,7 @@
 # P1b 设计：点「跳过」时的协作退出
 
-状态：**已实现**（abort 协作 + Job Object）。手动「点跳过」实测需要真实链路，见 §8。
+状态：**已实现并真机验收**（abort 协作 + Job Object）。正常链路与「点跳过」都已在真机
+各跑通一次（2026-11-17，见 §0 验证状态与 §8 验收进度）；剩余未覆盖的只有 §8 的 1b/2/3。
 
 ## 0. 实现记录（本轮）
 
@@ -23,11 +24,16 @@
 | 3000ms 等待与超时 `TerminateProcess` | 代码审查 + 单元形状，未在真实链路上计时 |
 | Job assign / `KILL_ON_JOB_CLOSE` / disarm | 本机一次性探针（armed close 杀、disarmed close 不杀、父在 job 内 assign 成功）+ 真机日志 `lpe: script is in the job (kill-on-close)`（2026-11-17） |
 | 落盘脚本 + `-Command` IEX + `policy=Restricted` 下运行 + `finally` 恢复 Documents + 握手行 | **真机已验证**（2026-11-17，另一台机）：`policy=Restricted` 脚本照常执行，从落盘到 `elevated instance pid=4644 is up` 共 2.95s，`documents restored ... source=original`，`how=user-linked` |
-| **点跳过 → 真 `elevate.c` 写文件 → 真 `trigger.ps1` 轮询 → 真 `finally` 恢复** | **未端到端验证**：正常成功路径跑通≠跳过路径跑通，abort 轮询只有单元桩覆盖，见 §8 |
+| **点跳过 → 真 `elevate.c` 写文件 → 真 `trigger.ps1` 轮询 → 真 `finally` 恢复** | **真机已验证**（2026-11-17）：跳过写入后脚本 **47 ms** 退出（未动用 `TerminateProcess`），`documents restored ... source=original`，`note: no leftover CVE49176_* service`，abort 文件与落盘脚本正常清理 |
 
-最后一行是 P1b 的核心价值所在，也是唯一没被验证的一行。前面几行只说明「零件对」加「不带
-跳过的装配对」；真实链路才暴露的耦合里已消除两处（跨权限读文件、残留清理时序——真机一次
-成功），剩下一处只有跳过才走到：3000ms 在真实 `Await-WinRtOperation` 场景下够不够。
+三处「只有真实链路才暴露」的耦合至此全部走完一遍：跨权限读文件、残留清理时序、3000ms
+宽限（实际 47 ms，余量巨大）。但这次实测还暴露了一个当初推不出来的竞态，已修：
+
+**skip 与成功的竞态。** 跳过落在了握手行之后 109 ms（`elevated instance pid=4712 is up` 在
+t，skip 在 t+109 ms）。skip 分支一旦进入就只等脚本退出、不再扫握手行，所以 `ok` 保持 0 →
+启动器报失败 → 多弹一次 UAC → 多起一个提权实例，靠单实例互斥体才没有变成双开。无害但
+难看。修法：skip 收尾时做一次最终握手检查，链路已经成功就认账、不再弹第二个 UAC——
+「跳过」跳过的是利用链，不是已经存在的结果。
 
 因此：在 `§8` 跑过之前，**遇到「点了跳过但 Documents 没回来」，先看这条链路**，不要先怀疑
 快照或候选列表。README 的运行时文件表也带同样的提示。
@@ -293,7 +299,13 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -Command "Invoke-Expression (G
 5. 关键节点日志齐全且顺序正确（写 abort → abort observed → `exited after N ms` 或 `terminating`，两者恰有一条）；
 6. `conhost.exe` 不作为残留判定依据：验收只查 powershell 是否存在；
 7. **成功路径不误杀**：握手行出现后（不点跳过）等 10 秒，日志里没有“脚本被杀”的痕迹，Documents 已由 `finally` 恢复（不是停在 `$root`）。这条专门验证 §6 的“撤掉 kill-on-close”；
-8. `make all` 0 警告，全套测试通过（`lpe documents state` 67 项）。
+8. `make all` 0 警告，全套测试通过（`lpe documents state` 72 项）。
+
+**验收进度**（2026-11-17，DESKTOP-UCUPIMQ 真机）：1 的 `source=original` 形态、4（以竞态
+形态真实发生：skip 落在握手后 109 ms，提权实例 4712 不受影响；修复后更是不再弹第二个
+UAC）、5（写 abort → `exited after 47 ms`，恰一条）、7 的“不误杀”半边已覆盖。
+未覆盖：1 的 `snapshot`/`fallback` 形态、2（脚本卡住被硬杀）、3（强杀 elevate.c）——
+三条都只有单元/探针形状，再遇真实环境时优先补这三条。
 
 ## 9. 已定（本轮答复）
 
