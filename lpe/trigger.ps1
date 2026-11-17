@@ -144,8 +144,12 @@ if ($LASTEXITCODE -ne 0) {
 Set-Stage 'database seeded'
 
 $record = $null
-$original = (& $documents get | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or -not $original) {
+# Read the known folder in-process instead of parsing documents_path.exe's
+# stdout: its wprintf goes through the CRT "C" locale, which drops non-ASCII
+# (a Chinese user name came back as C:\Users\\Documents).  .NET returns the
+# same FOLDERID_Documents as a UTF-16 string, so nothing is ever narrowed.
+$original = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+if (-not $original) {
     Set-Stage 'could not read the Documents path'
     exit 4
 }
@@ -153,17 +157,50 @@ if ($LASTEXITCODE -ne 0 -or -not $original) {
 # A previous run that died between "set" and "restore" leaves Documents pointing
 # into the LPE temp root.  Capturing that as "original" would restore the stale
 # redirect forever (and the wallet callback would seed into the wrong folder).
+#
+# There is no recorded origin: SHSetKnownFolderPath overwrites the only copy
+# (User Shell Folders\Personal), and it does that even when the call fails, so
+# this is a best guess, not the real value.  OneDrive first, because a
+# known-folder-move profile usually keeps an empty leftover
+# %USERPROFILE%\Documents that would win a plain "does it exist" test.
+# A user who relocated Documents anywhere else (D:\MyDocs, a share) cannot be
+# recovered this way - that is why an empty candidate list refuses to run
+# rather than overwriting the last usable copy with a new $root.
 $lpeRoot = Join-Path $env:LOCALAPPDATA 'ClassroomBypass-LPE'
 if ($original.TrimEnd('\') -like "$lpeRoot*") {
-    $original = Join-Path $env:USERPROFILE 'Documents'
+    $candidates = @()
+    if ($env:OneDrive)         { $candidates += (Join-Path $env:OneDrive 'Documents') }
+    if ($env:OneDriveConsumer) { $candidates += (Join-Path $env:OneDriveConsumer 'Documents') }
+    $candidates += (Join-Path $env:USERPROFILE 'Documents')
+    Set-Stage "documents stale redirect -> candidates: $($candidates -join ' | ')"
+    $original = $candidates |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+        Select-Object -First 1
+    if (-not $original) {
+        Set-Stage 'stale redirect under the LPE root and no candidate to restore - refusing to run'
+        exit 4
+    }
     Set-Stage "documents stale redirect under LPE root -> using $original"
+} elseif (-not (Test-Path -LiteralPath $original -PathType Container)) {
+    # The per-user value is not validated when it is read, so it can name a
+    # path that no longer exists (unplugged drive, deleted folder, or an older
+    # build's lossy "original").  Restoring that would be worse than not
+    # starting: set does not roll back, it would install the dead path.
+    Set-Stage "documents path is not a directory, refusing to run: $original"
+    exit 4
 }
 Set-Stage "documents original=$original"
 
 try {
-    $redirected = (& $documents set $root | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $redirected -ne $root) {
-        Set-Stage "documents redirection failed: $redirected"
+    # The exit code is the whole check now.  SHSetKnownFolderPath returns S_OK
+    # only after writing User Shell Folders and notifying the shell;
+    # documents_path.exe maps FAILED(hr) to a non-zero exit.  Comparing the
+    # echoed path would compare against the same lossy stdout we stopped
+    # reading - and it also cannot detect the call's real failure mode, since a
+    # failed set has already written the bad value.
+    & $documents set $root | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Set-Stage "documents redirection failed (exit $LASTEXITCODE)"
         exit 5
     }
     Set-Stage 'documents redirected, asking the Wallet API'
@@ -190,9 +227,11 @@ try {
     Set-Stage "exception: $($_.Exception.Message)"
     throw
 } finally {
-    $restored = (& $documents set $original | Out-String).Trim()
-    if ($restored -ne $original) {
-        Set-Stage "WARNING documents restore returned: $restored"
+    # $original was checked with Test-Path before the redirect, so this cannot
+    # install a dead path (a failed set writes anyway and does not roll back).
+    & $documents set $original | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Set-Stage "WARNING documents restore failed (exit $LASTEXITCODE): $original"
     } else {
         Set-Stage 'documents restored'
     }

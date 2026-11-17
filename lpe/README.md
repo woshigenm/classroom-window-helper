@@ -57,6 +57,21 @@ bin\bypass.exe（普通用户，非管理员）
 - 只启动 `command.txt` 里那一行命令，而那是启动器编进 `-EncodedCommand` 的 `bin\bypass.exe` 路径。
 - 优先取会话令牌的**未过滤链接令牌**（真正的管理员组身份），拿不到才退回 SYSTEM（PoC 原行为）。
 - `trigger.ps1` 的 `finally` 会恢复 Documents 已知文件夹。
+- `SHSetKnownFolderPath` **失败时也会写入**：传一个不存在的目录，它先把
+  `User Shell Folders\Personal` 和 `Shell Folders\Personal` 都改成那个路径，再返回错误，
+  **不回滚**（实测：`set C:\__no_such_dir__` 退出码 1，但两处注册表值已经变坏，
+  随后 `get` 报 `0x80070002`）。所以 `trigger.ps1` 每次 `set` 之前都用
+  `Test-Path -PathType Container` 验目标，验不过就 `exit 4`，而不是照着写——
+  写进去就是一个指不到任何目录的 Documents。
+- stale 自愈是**尽力猜测**，不是权威原值：原值已被上一条那个覆盖写抹掉，注册表里没有副本。
+  能还原：`%USERPROFILE%\Documents`、OneDrive KFM（`$env:OneDrive` / `$env:OneDriveConsumer`
+  下的 `Documents`，优先于 profile 里那个空壳目录）。不能还原：自定义重定向
+  （`D:\MyDocs`、网络盘等）——这种情况脚本拒绝运行（`exit 4`），退回 UAC，需要手工执行
+  `bin\lpe\documents_path.exe set <真实路径>`。要让这一类也能自愈，只能在第一次运行时把
+  原值快照到 `bin\lpe\documents.orig`（P1 待办，尚未实现）。
+- `documents_path.exe get` 的输出会丢非 ASCII 字符（CRT `"C"` locale），所以
+  `trigger.ps1` 只用它写日志，不再用它做任何判断：读当前路径走 .NET 的
+  `[Environment]::GetFolderPath`，判断成败看 `documents_path.exe` 的退出码。
 - 漏洞在 **2026 年 7 月**修复；补丁机上必然失败，此时自动走 UAC → 手动提示。
 - 只用于自己的机器 / 自己的课堂环境。分发前请确认当地法律与学校规定。
 

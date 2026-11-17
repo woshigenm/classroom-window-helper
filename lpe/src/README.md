@@ -59,8 +59,12 @@ gcc           -O2 -Wall -o lpe\payload\wallet_ese_seed.exe       lpe\src\wallet_
 
 - `documents_path.exe get` 把宽字符路径经 `wprintf` 输出到管道/文件时走的是 CRT 的
   `"C"` locale，非 ASCII 字符会被丢掉（`C:\Users\张三\Documents` → `C:\Users\\Documents`）。
-  上游 MSVC 构建很可能同样如此，待实测确认。`trigger.ps1` 目前用它的输出来记原路径，
-  这与"恢复 Documents"直接相关——修复方案见仓库提交记录，不要依赖这个 `get` 的输出。
+  上游 MSVC 构建很可能同样如此。`trigger.ps1` 已不再解析这个输出（读路径改用 .NET 的
+  `[Environment]::GetFolderPath`），所以它现在只影响日志可读性。
+- `set` **不是事务性的**：目标是坏路径时，`SHSetKnownFolderPath` 会先写入两个注册表值，
+  再返回 `FAILED(hr)`（`documents_path.c` 把它映射成 `result = 1`，所以退出码确实是 1）。
+  没有回滚。实测：`set C:\__no_such_dir__` → 退出码 1，注册表里已经是那个坏路径。
+  调用方必须先验证目标目录存在，不能靠"失败就说明没改"。
 - `wallet_ese_seed.exe` 的 `argv` 是 ANSI（`main` + `A` 系列 API）。在中文系统上
   （ANSI = CP936）中文用户名没问题；真正超出 ANSI 字符集的路径会传坏，那一步会失败
   并 `exit 3`，不会造成损坏。
