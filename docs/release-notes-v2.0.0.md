@@ -40,7 +40,8 @@ without restarting the classroom client, and fixes several real defects on that 
 
 - `HR_ABI_VERSION = 3` / `BYPASS_STATE_VERSION = 1` 未变，但 **Loader 与 Core 必须整套
   一起换**；升级请替换整个 `bin\` 并重启课堂客户端。
-- 回退：`bypass_hook_single.dll` 覆盖 `bypass_hook32.dll` 后重启客户端。
+- 提权模式由代码决定（有 in\lpe\ 走 LPE，否则 UAC），没有 ypass_elevate.ini 这个配置文件。
+- 回退：ypass_hook_single.dll 覆盖 ypass_hook32.dll 后重启客户端。
 
 ---
 
@@ -82,7 +83,9 @@ without restarting the classroom client, and fixes several real defects on that 
 - `HR_ABI_VERSION = 3` / `BYPASS_STATE_VERSION = 1` are unchanged, but the **Loader and
   Core must be replaced together**: replace the whole `bin\` and restart the classroom
   client.
-- Rollback: copy `bypass_hook_single.dll` over `bypass_hook32.dll`, then restart the
+- The elevation mode is decided by the code (in\lpe\ present -> LPE, else UAC); there
+  is no ypass_elevate.ini.  Rollback: copy ypass_hook_single.dll over
+  ypass_hook32.dll, then restart the
   classroom client.
 
 ---
@@ -97,7 +100,6 @@ bin\bypass_hook_single.dll  rollback: old single-DLL build
 bin\inject32.exe            injector
 bin\lpe\                    auto-elevation payload (trigger.ps1 + wallet helpers)
 bin\bypass_config.ini       runtime config
-bin\bypass_elevate.ini      elevation mode (auto = lpe, falls back to UAC)
 bin\bypass_shut.ini         remote shutdown guard
 docs\how-to-use.md          usage
 docs\design.md              internals
@@ -107,4 +109,4 @@ CHANGELOG.md                (中文 / Chinese only)
 ```
 
 SHA256 `classroom-window-helper-v2.0.0-bin.zip`:
-`F6ED9919ACAF4742E609944453E4971FF0CBE34B1339BB833B0B78618271FC25`
+`70A874246427FA6F5B8FABA1EF0FC770917B0078F4A3483163F57E4BC618DB00`
