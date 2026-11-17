@@ -38,6 +38,7 @@ static BYTE*      g_scBits;         /* frozen frame, 32bpp top-down */
 static BITMAPINFO g_scBmi;
 static int        g_scW, g_scH;     /* cached frame size */
 static int        g_scSeeded;
+static int        g_scCfgLogged;    /* SC_ReadConfig change-log, skip first read */
 static DWORD      g_scCfgTick, g_scLastLog, g_scServed, g_scSeededTick;
 
 /* ---------------- logging (goes through the Loader's single log) ----------- */
@@ -52,6 +53,8 @@ static void SC_ReadConfig(void)
     FILE*  f;
     char   line[128];
     LONG   enabled = 0, mode = 0;
+    LONG   prevEnabled = g_scEnabled, prevMode = g_scMode;
+    int    hadFile;
 
     if (GetTickCount() - g_scCfgTick < 500) return;
     g_scCfgTick = GetTickCount();
@@ -60,40 +63,50 @@ static void SC_ReadConfig(void)
     _snprintf(path, sizeof(path) - 1, "%s" SC_INI_NAME, g_baseDir);
     path[sizeof(path) - 1] = '\0';
 
+    hadFile = 0;
     f = fopen(path, "r");
-    if (!f) {
-        /* no file = feature off (the main program creates it when enabled) */
-        InterlockedExchange(&g_scEnabled, 0);
-        return;
-    }
+    if (f) {
+        hadFile = 1;
+        while (fgets(line, sizeof(line), f)) {
+            char* eq;
+            char* k;
+            char* v;
 
-    while (fgets(line, sizeof(line), f)) {
-        char* eq;
-        char* k;
-        char* v;
+            k = line;
+            while (*k == ' ' || *k == '\t') k++;
+            if (!*k || *k == '#' || *k == ';') continue;
+            eq = strchr(k, '=');
+            if (!eq) continue;
+            *eq = '\0';
+            v = eq + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            {
+                size_t n = strlen(v);
+                while (n && (v[n - 1] == '\r' || v[n - 1] == '\n' ||
+                             v[n - 1] == ' '  || v[n - 1] == '\t'))
+                    v[--n] = '\0';
+            }
 
-        k = line;
-        while (*k == ' ' || *k == '\t') k++;
-        if (!*k || *k == '#' || *k == ';') continue;
-        eq = strchr(k, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        v = eq + 1;
-        while (*v == ' ' || *v == '\t') v++;
-        {
-            size_t n = strlen(v);
-            while (n && (v[n - 1] == '\r' || v[n - 1] == '\n' ||
-                         v[n - 1] == ' '  || v[n - 1] == '\t'))
-                v[--n] = '\0';
+            if (!_stricmp(k, "enabled"))      enabled = (atoi(v) != 0) ? 1 : 0;
+            else if (!_stricmp(k, "mode"))    mode = (_stricmp(v, "blank") == 0) ? 1 : 0;
         }
-
-        if (!_stricmp(k, "enabled"))      enabled = (atoi(v) != 0) ? 1 : 0;
-        else if (!_stricmp(k, "mode"))    mode = (_stricmp(v, "blank") == 0) ? 1 : 0;
+        fclose(f);
     }
-    fclose(f);
+    /* no file = feature off: enabled stays 0 (the main program creates the
+       ini when the button turns the guard on, and deletes it when turned off) */
 
     InterlockedExchange(&g_scMode, mode);
     InterlockedExchange(&g_scEnabled, enabled);
+
+    /* State changes used to be silent: the log showed "off" at attach and then
+       a frozen frame minutes later with nothing in between, and nobody could
+       tell when or why the guard armed.  The first read is skipped because
+       SC_Init logs the attach line right after this call. */
+    if (g_scCfgLogged++ > 0 &&
+        (enabled != prevEnabled || mode != prevMode))
+        SC_Log("[Screen] guard %s (mode=%s, from %s)", enabled ? "ON" : "off",
+               mode ? "blank" : "freeze",
+               hadFile ? SC_INI_NAME : "missing " SC_INI_NAME);
 }
 
 /* ---------------- screen DC bookkeeping ----------------------------------- */
@@ -216,6 +229,69 @@ static BOOL SC_DrawFrozen(HDC dst, int x, int y, int w, int h, int sx, int sy)
     return ok;
 }
 
+/* ---------------- freeze forensics ----------------------------------------- */
+
+/* "the teacher sees a black block" has two very different causes: the frozen
+   frame itself is black (the capture caught an empty moment - e.g. the tool's
+   own window is excluded from captures, so arming the guard on an otherwise
+   empty desktop freezes wallpaper + taskbar), or the frame has content and
+   the loss is downstream (encoder/transfer).  The seed happens exactly once,
+   so this is the one place where the evidence is free: log a sparse luminance
+   sample and dump the frame to a BMP under %TEMP% so a human can look at what
+   actually got frozen. */
+
+static void SC_FreezeForensics(void)
+{
+    const BYTE* row;
+    unsigned long long sum = 0;
+    unsigned mn = 255, mx = 0, luma;
+    long x, y;
+    int n = 0;
+    char temp[MAX_PATH], path[MAX_PATH];
+    FILE* f;
+    BITMAPFILEHEADER fh;
+
+    if (!g_scBits || g_scW < 16 || g_scH < 16) return;
+
+    for (y = 0; y < g_scH; y += 16) {
+        row = g_scBits + (size_t)y * (size_t)g_scW * 4;
+        for (x = 0; x < g_scW; x += 16) {
+            const BYTE* b = row + (size_t)x * 4;      /* BGRA */
+            luma = (unsigned)((b[0] * 114 + b[1] * 587 + b[2] * 299) / 1000);
+            sum += luma;
+            if (luma < mn) mn = luma;
+            if (luma > mx) mx = luma;
+            n++;
+        }
+    }
+    if (n > 0)
+        SC_Log("[Screen] freeze forensics: mean luma %lu/255, min %lu max %lu "
+               "(%s)", (unsigned long)(sum / n), (unsigned long)mn,
+               (unsigned long)mx,
+               (mx - mn <= 2) ? "solid colour frame" : "has content");
+
+    if (!GetTempPathA(sizeof(temp), temp)) return;
+    _snprintf(path, sizeof(path) - 1, "%sbypass_freeze_%lu.bmp", temp,
+              (unsigned long)GetCurrentProcessId());
+    path[sizeof(path) - 1] = '\0';
+
+    memset(&fh, 0, sizeof(fh));
+    fh.bfType    = 0x4D42;                    /* "BM" */
+    fh.bfOffBits = (DWORD)(sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER));
+    fh.bfSize    = fh.bfOffBits + (DWORD)g_scW * (DWORD)g_scH * 4;
+
+    f = fopen(path, "wb");
+    if (!f) return;
+    /* the cached DIB is top-down (biHeight < 0); Paint and explorer read that
+       fine, and writing it verbatim keeps the dump byte-identical to the
+       cache - no re-encode between "what we serve" and "what we inspect" */
+    if (fwrite(&fh, sizeof(fh), 1, f) == 1 &&
+        fwrite(&g_scBmi.bmiHeader, sizeof(BITMAPINFOHEADER), 1, f) == 1 &&
+        fwrite(g_scBits, (size_t)g_scW * (size_t)g_scH * 4, 1, f) == 1)
+        SC_Log("[Screen] freeze dump -> %s", path);
+    fclose(f);
+}
+
 /* ---------------- hooks --------------------------------------------------- */
 
 typedef BOOL (WINAPI *SC_PFN_BitBlt)(HDC, int, int, int, int, HDC, int, int, DWORD);
@@ -286,6 +362,9 @@ static BOOL WINAPI SC_Hook_BitBlt(HDC dst, int x, int y, int w, int h,
                 SC_Log("[Screen] froze the first frame (%dx%d) - later captures are served "
                        "from the cache (process=%s)", g_scW, g_scH,
                        g_ownImage[0] ? g_ownImage : "?");
+                /* safe outside the cache CS: g_scSeeded is now 1, and the only
+                   free of g_scBits lives inside a re-seed that cannot run */
+                SC_FreezeForensics();
             }
         }
         return ok;
