@@ -36,6 +36,17 @@
 `make.bat lpe` 会先用 `build\check_payload.ps1` 比对 `src\*.c` 的内容哈希与
 `payload\SOURCES.sha256`：源码改过而没重编时直接失败，不会静默把旧二进制拷进 `bin\lpe\`。
 
+## 运行时文件（不提交，不打包）
+
+| 路径 | 用途 | 生命周期 |
+|---|---|---|
+| `%LOCALAPPDATA%\ClassroomBypass-LPE\<runid>\` | 本次运行的 `wallet.db`、payload 副本、`result.txt` | 保留供排查，手工删除 |
+| `%LOCALAPPDATA%\ClassroomBypass-LPE\documents.orig` | Documents 原值快照 | 重定向前写入，恢复成功后删除 |
+| `%LOCALAPPDATA%\ClassroomBypass-LPE\abort.<elevate-pid>` | “跳过”信号（P1b，**尚未实现**，见 `docs\P1-abort.md`） | `elevate.c` 每次启动前清理 |
+
+放在用户目录而不是安装目录，是因为安装目录可能只读（Program Files），而这些文件
+必须能写；同时它们也不应该跟着发布包发给别人。
+
 ## 调用链
 
 ```
@@ -81,21 +92,37 @@ bin\bypass.exe（普通用户，非管理员）
     只有“硬杀”才需要跨运行记录；`exit 4` 会让只读安装的用户完全用不了。
 - 回调 DLL 的服务名是 `CVE49176_<pid>_<tick>`，每次运行唯一，所以不存在
   “上次残留 → 本次 `ERROR_SERVICE_EXISTS`”。但**残留窗口是真实存在的**：
-  `CreateServiceW` 与 `DeleteService` 之间被杀，服务会留下。它不会自启
-  （`SERVICE_DEMAND_START`），但任何有 `SERVICE_START` 权限的进程都能让它以
-  **SYSTEM** 加载 `%LOCALAPPDATA%\ClassroomBypass-LPE\<runid>\payload\wallet_callback_shell.dll`
-  ——一个普通用户可写目录里的 DLL，这就是持久提权面（不是“下次运行失败”）。
-  `trigger.ps1` 启动时只读扫描 `CVE49176_*`，命中才写 `WARNING`（不自动删：删服务
-  需要本脚本不一定持有的权限）。发现残留后手工清理（管理员）：
+  `CreateServiceW`（`wallet_callback_shell.c:121`）与 `DeleteService`（:137）之间被杀，
+  服务会留下。
+
+  风险范围要说准：`SERVICE_DEMAND_START` 不会自启；`CreateServiceW` 没有传
+  `SECURITY_ATTRIBUTES`，服务用系统默认 DACL，Interactive User 只有
+  `CCDCLCSWLOCRRC`（查询/枚举），**没有 RP**，所以普通权限下 `sc start` /
+  `sc stop` / `sc delete` 都是 Access Denied。能触发的门槛是 **High 及以上**：
+  用户之后任何一次 UAC 提权（包括本工具再跑一次，或别的程序）都能让它以 SYSTEM
+  加载 `%LOCALAPPDATA%\ClassroomBypass-LPE\<runid>\payload\wallet_callback_shell.dll`。
+  那个 DLL 在用户可写目录里，所以这仍然是持久提权面——只是入口不是“现在随便一个
+  普通进程”，而是“下一次高完整性上下文”。
+
+  `trigger.ps1` 启动时只读扫描 `CVE49176_*`，命中才写 `WARNING`（不自动删：
+  删服务需要本脚本不一定持有的权限）。发现残留后手工清理——**整段必须在管理员
+  上下文执行**。普通权限下前三条都会失败，而失败后继续 `rmdir` 会变成
+  “DLL 已删、服务还在”，比不修更糟（服务指向不存在的文件，`sc start` 会走 DLL
+  搜索顺序）：
 
   ```
+  rem 先确认真的是管理员；不是就别往下走
+  net session >nul 2>&1 || (echo NOT ELEVATED & goto :eof)
+
   sc query  CVE49176_<pid>_<tick>
   sc stop   CVE49176_<pid>_<tick>
   sc delete CVE49176_<pid>_<tick>
+  rem 只有 sc delete 成功了才删目录
   rmdir /s /q "%LOCALAPPDATA%\ClassroomBypass-LPE\<runid>"
   ```
 
   顺序不能反：先删目录再 `sc delete`，服务会有一段指向不存在文件的窗口。
+  （写在这里是为了挡住“先删目录更直观”的改法。）
 - `documents_path.exe get` 的输出会丢非 ASCII 字符（CRT `"C"` locale），所以
   `trigger.ps1` 只用它写日志，不再用它做任何判断：读当前路径走 .NET 的
   `[Environment]::GetFolderPath`，判断成败看 `documents_path.exe` 的退出码。

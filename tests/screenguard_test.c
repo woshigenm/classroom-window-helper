@@ -198,6 +198,40 @@ static int CheckAffinity(void)
     return (control && excluded) ? 0 : 3;
 }
 
+/* 这条自测的判据是"窗口换了颜色, 抓屏也跟着换", 前提是窗口真的显示在实时
+   桌面上。只要它被别的窗口盖住, 两次抓屏抓到的就是同一幅画面, 守卫关着也会
+   报 frozen=1 (CheckAffinity 早就为这个把窗口提到最上层)。所以主流程也提到
+   最上层, 并在抓屏前验证窗口中心确实命中自己; 不命中就打印环境并判 INVALID,
+   而不是把"没看到窗口"说成"画面被定格"。 */
+static int ProbeVisible(HWND w)
+{
+    RECT  r;
+    POINT c;
+    HWND  hit;
+    HWND  fg = GetForegroundWindow();
+    HDESK desk;
+    char  cls[128] = "?";
+    char  title[160] = "?";
+    int   ours;
+
+    GetWindowRect(w, &r);
+    c.x = (r.left + r.right) / 2;
+    c.y = (r.top + r.bottom) / 2;
+    hit = WindowFromPoint(c);
+    ours = (hit == w || (hit && IsChild(w, hit))) ? 1 : 0;
+    if (fg) {
+        GetClassNameA(fg, cls, sizeof(cls) - 1);
+        GetWindowTextA(fg, title, sizeof(title) - 1);
+    }
+    desk = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    printf("diag: rect=%ld,%ld,%ld,%ld center_hit=%p ours=%d fg=%p "
+           "class=%s title=%.40s input_desktop=%s\n",
+           r.left, r.top, r.right, r.bottom, (void *)hit, ours, (void *)fg,
+           cls, title, desk ? "ok" : "unavailable");
+    if (desk) CloseDesktop(desk);
+    return ours;
+}
+
 int main(int argc, char** argv)
 {
     const char* dll = NULL;
@@ -251,6 +285,17 @@ int main(int argc, char** argv)
         if (!RunInjector(injector, dll))
             printf("WARNING: injector failed, continuing as baseline\n");
         Pump(1800);          /* Worker 起来 + 读一次 ini */
+    }
+
+    /* 提到最上层 + 先验证可见性, 理由见 ProbeVisible 上方。 */
+    SetWindowPos(g_win, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    UpdateWindow(g_win);
+    Pump(200);
+    if (!ProbeVisible(g_win)) {
+        printf("VERDICT INVALID (probe window is not on the live desktop)\n");
+        DestroyWindow(g_win);
+        return 4;
     }
 
     /* 颜色 A -> 第一次抓屏 (守卫会把它存成定格帧) */

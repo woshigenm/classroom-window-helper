@@ -6,6 +6,8 @@
 #       两次抓屏应该不同 (抓的是实时桌面) => 基线;
 #    2) 写 enabled=1 -> 再跑一次: 两次抓屏应该相同 (第二次是定格帧);
 #    3) 恢复原来的 ini 内容。
+#    4) 窗口没显示在实时桌面上时 harness 判 INVALID 并打印 diag; 失败时本脚本
+#       会把两个 case 的完整输出留下, 不要用"重跑"把证据冲掉。
 #
 #  用法: powershell -NoProfile -ExecutionPolicy Bypass -File tests\screenguard_test.ps1
 #  ⚠ 本文件必须存成 "UTF-8 with BOM" (PowerShell 5.1 否则按 ANSI 读)。
@@ -39,12 +41,19 @@ function Run-Case([string]$tag) {
         Pop-Location
     }
     $m = [regex]::Match($out, 'SUMMARY .*frozen=(\d)')
-    if (-not $m.Success) {
-        Write-Host $out
-        throw "${tag}: no SUMMARY line"
+    $v = [regex]::Match($out, 'VERDICT\s+(\S+)')
+    if ($m.Success) {
+        Write-Host ("  {0}: frozen={1}" -f $tag, $m.Groups[1].Value)
+        return [pscustomobject]@{ Frozen = [int]$m.Groups[1].Value; Out = $out }
     }
-    Write-Host ("  {0}: frozen={1}" -f $tag, $m.Groups[1].Value)
-    return [int]$m.Groups[1].Value
+    if ($v.Success) {
+        # harness 自己判了 INVALID (窗口没显示在实时桌面上 / 桌面不可读)。
+        # 这不是 FROZEN, 也不能当成 PASS。
+        Write-Host ("  {0}: {1}" -f $tag, $v.Value.Trim())
+        return [pscustomobject]@{ Frozen = -1; Out = $out }
+    }
+    Write-Host $out
+    throw "${tag}: no SUMMARY line"
 }
 
 try {
@@ -63,9 +72,15 @@ try {
     }
 }
 
-if ($off -eq 0 -and $on -eq 1) {
+if ($off.Frozen -eq 0 -and $on.Frozen -eq 1) {
     Write-Host 'VERDICT PASS (live capture without the guard, frozen frame with it)'
     exit 0
 }
-Write-Host "VERDICT FAIL (off=$off on=$on)"
+Write-Host "VERDICT FAIL (off=$($off.Frozen) on=$($on.Frozen))"
+# 失败时把两个 case 的完整输出留下 (含 harness 的 diag 行): 最近一次
+# off=1 的记录里没有这些信息, 只能重跑, 而重跑会把证据冲掉。
+Write-Host '--- off output ---'
+Write-Host $off.Out
+Write-Host '--- on output ---'
+Write-Host $on.Out
 exit 1
