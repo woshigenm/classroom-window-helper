@@ -6372,19 +6372,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 /* 让本窗口不出现在任何抓屏里 —— 老师端监控/录屏/截图都拍不到工具界面。
-   WDA_EXCLUDEFROMCAPTURE(0x11, Win10 2004+): 直接从抓屏画面里排除;
-   更老的系统退化成 WDA_MONITOR(1): 抓屏里是一块黑, 至少不泄露界面内容。
-   注意这是"窗口级"设置, 对 BitBlt/PrintWindow/DXGI 抓屏都生效。 */
+
+   实测（Win11 25H2，2026-11-17）：只设 WDA_EXCLUDEFROMCAPTURE 时，GDI 抓屏
+   （课堂的 BitBlt(SRCCOPY|CAPTUREBLT)）里窗口区域是**一块黑**——内容不泄露
+   （目的达成），但留下的是黑洞而不是背后内容。真机观察：黑块随窗口移动。
+   更老的系统退化成 WDA_MONITOR(1)，视觉效果相同（注释原本假设 0x11 会
+   「直接排除」，被实测推翻）。
+
+   所以排除要配合 WS_EX_LAYERED(alpha=255)：本地视觉逐像素不变，但分层窗口
+   走 DWM 绘制期合成，CAPTUREBLT 下被排除的分层窗口有机会被**跳过**（露出
+   背后内容，即历史版本观察到的「透明」），而不是画黑。若无效，黑洞就是
+   该 OS 构建对排除窗口的固定渲染，唯一干净的形态是窗口不在屏幕上（托盘）。 */
 static void ExcludeOwnWindowFromCapture(HWND hwnd)
 {
     DWORD aff = 0;
     BOOL  ok;
 
     if (!hwnd) return;
+
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
+                      GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+
     ok = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
     if (!ok) ok = SetWindowDisplayAffinity(hwnd, WDA_MONITOR);
     if (!GetWindowDisplayAffinity(hwnd, &aff)) aff = 0;
-    FileLog("[Screen] own window capture affinity=0x%lx (%s)",
+    FileLog("[Screen] own window capture affinity=0x%lx (%s, layered=1)",
             (unsigned long)aff,
             aff == WDA_EXCLUDEFROMCAPTURE ? "excluded from captures"
                                           : (aff == WDA_MONITOR ? "black in captures"
