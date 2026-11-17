@@ -21,13 +21,13 @@
 |---|---|
 | abort 文件写入 / 轮询 / `return` 跑 `finally` | 单元（`tests\lpe_documents.ps1`，桩） |
 | 3000ms 等待与超时 `TerminateProcess` | 代码审查 + 单元形状，未在真实链路上计时 |
-| Job assign / `KILL_ON_JOB_CLOSE` / disarm | 本机一次性探针（armed close 杀、disarmed close 不杀、父在 job 内 assign 成功） |
-| **点跳过 → 真 `elevate.c` 写文件 → 真 `trigger.ps1` 轮询 → 真 `finally` 恢复** | **未端到端验证**：需要一个允许真实 UAC 交互的环境（VM + 快照），本机按约定不跑 |
+| Job assign / `KILL_ON_JOB_CLOSE` / disarm | 本机一次性探针（armed close 杀、disarmed close 不杀、父在 job 内 assign 成功）+ 真机日志 `lpe: script is in the job (kill-on-close)`（2026-11-17） |
+| 落盘脚本 + `-Command` IEX + `policy=Restricted` 下运行 + `finally` 恢复 Documents + 握手行 | **真机已验证**（2026-11-17，另一台机）：`policy=Restricted` 脚本照常执行，从落盘到 `elevated instance pid=4644 is up` 共 2.95s，`documents restored ... source=original`，`how=user-linked` |
+| **点跳过 → 真 `elevate.c` 写文件 → 真 `trigger.ps1` 轮询 → 真 `finally` 恢复** | **未端到端验证**：正常成功路径跑通≠跳过路径跑通，abort 轮询只有单元桩覆盖，见 §8 |
 
-最后一行是 P1b 的核心价值所在，也是唯一没被验证的一行。前四行只说明「零件对」，不说明
-「装配对」；真实链路才暴露的耦合有三处：跨权限写的文件高权限进程能否立刻读到、
-`RunHidden` 前删残留与脚本首次 `Test-Path` 的先后、3000ms 在真实
-`Await-WinRtOperation` 场景下够不够。
+最后一行是 P1b 的核心价值所在，也是唯一没被验证的一行。前面几行只说明「零件对」加「不带
+跳过的装配对」；真实链路才暴露的耦合里已消除两处（跨权限读文件、残留清理时序——真机一次
+成功），剩下一处只有跳过才走到：3000ms 在真实 `Await-WinRtOperation` 场景下够不够。
 
 因此：在 `§8` 跑过之前，**遇到「点了跳过但 Documents 没回来」，先看这条链路**，不要先怀疑
 快照或候选列表。README 的运行时文件表也带同样的提示。
