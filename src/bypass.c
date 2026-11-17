@@ -181,6 +181,7 @@
 #define IDM_TRAY_NETDIAG    2010    /* 网络/桌面诊断 (写日志) */
 #define IDM_TRAY_SHUT       2011    /* 屏蔽控制端重启/关机 (开关) */
 #define IDM_TRAY_RELOADCORE 2012    /* 热重载注入的 Core */
+#define IDM_TRAY_SCREEN     2013    /* 屏蔽屏幕监控 (开关, 与主界面按钮同一开关) */
 
 /* ========== UI theme constants (dark theme) ========== */
 #define TITLEBAR_H      40      /* custom title bar height */
@@ -5106,6 +5107,17 @@ static void ScreenGuardSave(void)
 static void OnScreenGuardToggle(HWND hwnd)
 {
     g_screenGuard = g_screenGuard ? FALSE : TRUE;
+
+    /* 武装前先把界面收进托盘, 顺序不能反: DLL 每 0.5 秒读一次 ini, 写了 ini
+       再隐藏就可能赶不上第一次抓屏 —— 而排除窗口在 (更新后的) Windows GDI
+       抓屏里渲染成黑色 (防泄露加固), 界面可见时武装会把黑洞**永久烤进定格
+       帧**。窗口不在屏幕上就没有任何足迹, 定格帧是干净的。
+       (托盘态/热键路径本来窗口就不可见, IsWindowVisible 挡掉重复隐藏。) */
+    if (g_screenGuard && IsWindowVisible(hwnd)) {
+        AppendLog(hwnd, "[Screen] 界面先收进托盘: 定格帧里不能有工具窗口的黑洞\r\n");
+        HideToTray(hwnd);
+    }
+
     ScreenGuardSave();
 
     /* 守卫逻辑在注入的 DLL 里: 打开时确保它已经进了 Student.exe 等进程 */
@@ -5498,6 +5510,10 @@ static void TrayShowMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING, IDM_TRAY_NETDIAG,    L"网络/桌面诊断(&N)");
     AppendMenuW(menu, MF_STRING | (g_shutGuard ? MF_CHECKED : 0),
                 IDM_TRAY_SHUT,                        L"屏蔽控制端重启/关机(&P)");
+    /* 与主界面按钮同一个开关 (OnScreenGuardToggle): 武装时界面会自动收托盘,
+       所以从托盘点它不会把工具窗口的黑洞烤进定格帧 —— 这正是托盘入口的价值 */
+    AppendMenuW(menu, MF_STRING | (g_screenGuard ? MF_CHECKED : 0),
+                IDM_TRAY_SCREEN,                      L"屏蔽屏幕监控（定格帧）(&M)\tCtrl+Alt+M");
     AppendMenuW(menu, MF_STRING, IDM_TRAY_RELOADCORE, L"重载 Core（热更新）(&L)");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_RELEASE,    L"恢复全屏广播（放行）(&R)");
@@ -5544,6 +5560,11 @@ static void TrayShowMenu(HWND hwnd) {
         break;
     case IDM_TRAY_SHUT:
         SetShutGuard(hwnd, g_shutGuard ? FALSE : TRUE);
+        break;
+    case IDM_TRAY_SCREEN:
+        /* 与主界面按钮同一个开关: 武装时界面自动收托盘, 定格帧里不会有
+           工具窗口的黑洞 (托盘入口天然满足这个条件) */
+        OnScreenGuardToggle(hwnd);
         break;
     case IDM_TRAY_RELOADCORE:
         OnReloadCore(hwnd);
