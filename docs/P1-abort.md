@@ -9,11 +9,28 @@
 | `lpe\trigger.ps1` | `do{}` 内新增 `# >>> abort-check` 块：发现 `abort.<AbortPid>` → 记 `documents: abort observed, exiting` → `return`（不是 `throw`，`return` 同样会跑 `finally`） |
 | `src\elevate.c` | `SkipFilePath()` / `WriteAbort()` / `CreateKillOnCloseJob()` / `CloseJob()` / `LogLeftoverServices()`；`RunHidden()` 加 `job` 参数（`CREATE_SUSPENDED` → assign → 无条件 `ResumeThread`）；跳过时写 abort → 等 ≤3000ms → 超时才 `TerminateProcess` |
 | `BuildEncodedCommand()` | 前置段增加 `$AbortPid=<launcher pid>`；顺手修掉 `qTarget[900]` 对 `target[2048]` 的静默截断（截掉的是 `--elevate=uac`） |
-| `tests\lpe_documents.ps1` | 新增 abort-check 三个用例（命中 / 无文件 / 无 pid + 残留 `abort.` 文件），共 60 项 |
+| `tests\lpe_documents.ps1` | 新增 abort-check 三个用例（命中 / 无文件 / 无 pid + 残留 `abort.` 文件）+ `restore-fallback`，共 67 项 |
 
 `return` 在脚本作用域、`try/finally` 内是否真的跑 `finally` 不是靠读文档断言的：上面第三个
 用例把真实形状（`try { do{} } finally {}` + `return`）抽出来跑，断言 `finally ran` 出现、
 `after-block` 与 `tail` 都不出现。
+
+### 验证状态：哪些是单元覆盖，哪些没跑过
+
+| 项 | 覆盖方式 |
+|---|---|
+| abort 文件写入 / 轮询 / `return` 跑 `finally` | 单元（`tests\lpe_documents.ps1`，桩） |
+| 3000ms 等待与超时 `TerminateProcess` | 代码审查 + 单元形状，未在真实链路上计时 |
+| Job assign / `KILL_ON_JOB_CLOSE` / disarm | 本机一次性探针（armed close 杀、disarmed close 不杀、父在 job 内 assign 成功） |
+| **点跳过 → 真 `elevate.c` 写文件 → 真 `trigger.ps1` 轮询 → 真 `finally` 恢复** | **未端到端验证**：需要一个允许真实 UAC 交互的环境（VM + 快照），本机按约定不跑 |
+
+最后一行是 P1b 的核心价值所在，也是唯一没被验证的一行。前四行只说明「零件对」，不说明
+「装配对」；真实链路才暴露的耦合有三处：跨权限写的文件高权限进程能否立刻读到、
+`RunHidden` 前删残留与脚本首次 `Test-Path` 的先后、3000ms 在真实
+`Await-WinRtOperation` 场景下够不够。
+
+因此：在 `§8` 跑过之前，**遇到「点了跳过但 Documents 没回来」，先看这条链路**，不要先怀疑
+快照或候选列表。README 的运行时文件表也带同样的提示。
 
 ## 1. 先摆事实（读代码得出，不是推测）
 

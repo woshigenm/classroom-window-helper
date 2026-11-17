@@ -73,6 +73,9 @@ bin\bypass.exe（普通用户，非管理员）
   （见 `docs\P1-abort.md`）。所以「跳过」只保证**尝试**恢复，不保证回到用户最初配置的路径。
 - 脚本在 Job Object（`KILL_ON_JOB_CLOSE`）里，启动器被强杀时它会跟着死；正常返回前会先
   撤掉这个限制，否则成功路径会把还在跑 `finally` 的脚本一起杀掉。
+- 「跳过」通道**目前只有单元覆盖，未做端到端实测**（需要一次真实 UAC 交互）。若用户反馈
+  「点了跳过但 Documents 没回来」，先按 `docs\P1-abort.md` §4 的三处失败点查这条链路，
+  不要先怀疑快照。
 - `SHSetKnownFolderPath` **失败时也会写入**：传一个不存在的目录，它先把
   `User Shell Folders\Personal` 和 `Shell Folders\Personal` 都改成那个路径，再返回错误，
   **不回滚**（实测：`set C:\__no_such_dir__` 退出码 1，但两处注册表值已经变坏，

@@ -54,7 +54,7 @@ CFLAGS32 := -std=gnu11 -O2 -Wall
 DLLFLAGS := -shared -Wl,--kill-at -static -static-libgcc
 DLLLIBS  := -lpsapi -lole32 -ladvapi32 -lgdi32
 
-.PHONY: all bypass hook32 lpe lpebroker lpepayload test wmodetest vdtest hangwintest screentest shuttest fakecores testcores corehost clean rebuild check
+.PHONY: all bypass hook32 lpe lpebroker lpepayload test wmodetest rclasstest vdtest hangwintest screentest shuttest fakecores testcores corehost clean rebuild check
 
 # 主程序 + DLL + 注入器 + 自动提权载荷（自测程序按需单独编）
 all: bypass hook32 lpe
@@ -99,6 +99,10 @@ test: $(BIN)/hooktest32.exe
 
 # 控制端「窗口模式广播」小窗测试载体 (见 tests/wmode_test.c)
 wmodetest: $(BIN)/wmode_test.exe
+
+# render-class 前缀匹配契约 (见 tests/rclass_test.c): 断言 MultiRender* 类名
+# 的第三方窗口确实会被接管, 收紧匹配时必须显式改这个测试
+rclasstest: $(BIN)/rclass_test.exe
 
 # virtual desktop pin regression (tests/vd_pin_test.c)
 vdtest: $(BIN)/vd_pin_test.exe
@@ -150,6 +154,9 @@ $(BIN)/hooktest32.exe: tests/hooktest32.c | $(BIN)
 
 $(BIN)/wmode_test.exe: tests/wmode_test.c | $(BIN)
 	"$(CC32)" $(CFLAGS32) "tests/wmode_test.c" -o "$@"
+
+$(BIN)/rclass_test.exe: tests/rclass_test.c | $(BIN)
+	"$(CC32)" $(CFLAGS32) "tests/rclass_test.c" -o "$@" -luser32
 
 $(BIN)/hangwin_test.exe: tests/hangwin_test.c | $(BIN)
 	"$(CC64)" $(CFLAGS32) "tests/hangwin_test.c" -o "$@"
@@ -207,6 +214,7 @@ clean:
 	-@del /q "$(BIN)\bypass.exe" "$(BIN)\bypass_hook32.dll" "$(BIN)\bypass_hook_core.dll" "$(BIN)\inject32.exe" 2>nul
 	-@del /q "$(BIN)\hooktest32.exe" 2>nul
 	-@del /q "$(BIN)\wmode_test.exe" 2>nul
+	-@del /q "$(BIN)\rclass_test.exe" 2>nul
 	-@del /q "$(BIN)\vd_pin_test.exe" 2>nul
 	-@del /q "$(BIN)\screenguard_test.exe" 2>nul
 	-@del /q "$(BIN)\shutguard_test.exe" 2>nul

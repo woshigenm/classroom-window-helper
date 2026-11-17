@@ -59,7 +59,8 @@ function Run-Suite([string]$name, [scriptblock]$body) {
 
 if (-not $NoBuild) {
     Invoke-Build @('all', 'fakecores', 'testcores', 'corehost', 'uitest',
-                   'wmodetest', 'screentest', 'shuttest', 'hangwintest')
+                   'wmodetest', 'rclasstest', 'screentest', 'shuttest',
+                   'hangwintest')
 }
 
 $script:results = @()
@@ -91,6 +92,21 @@ Run-Suite 'window mode (topmost stripped)' {
     Push-Location $bin
     try { & ".\wmode_test.exe" --ticks 2 --inject bypass_hook32.dll | Out-Host }
     finally { Pop-Location }
+}
+
+# The rule under test is a deliberate over-match: IsRenderWindowClass() decides
+# from the class-name prefix alone, so a third-party window named MultiRender*
+# gets its TOPMOST rewritten.  Pinning both directions means a future tightening
+# (exact class, image check) shows up as a red test instead of as a silent
+# behaviour change.  Baseline runs first so a failure says whether the DLL did
+# it or something else did.
+Run-Suite 'render class prefix (contract)' {
+    Push-Location $bin
+    try {
+        & ".\rclass_test.exe" --baseline | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'baseline: topmost changed without the DLL' }
+        & ".\rclass_test.exe" --inject bypass_hook32.dll | Out-Host
+    } finally { Pop-Location }
 }
 
 Run-Suite 'screen guard (frozen frame)' {

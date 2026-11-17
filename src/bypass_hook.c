@@ -397,6 +397,19 @@ static BOOL IsClassroomPid(DWORD pid)
      StudentHelperWnd.oseasy: 学生的浮动工具条 / 虚拟桌面面板, 平时 350x70),
      它们和广播窗口同进程。只按尺寸判断会把它们也套成小窗, 再被
      "keep user geometry" 钉死 —— 用户看到的就是"软件自己把虚拟桌面变成小窗"。 */
+/* Prefix match, not an exact name: the broadcast renderer ships class names
+   with a build/vendor suffix we do not control ("MultiRender..." variants,
+   "StreamRenderWindow...", "OeScreenRenderWindow..."), and the SDL-based ones
+   all use "SDL_app".  There is no image check either - the class name alone
+   decides, before IsRendererImage() is even consulted.
+
+   That over-match is deliberate, and the cost is real: any third-party window
+   whose class starts with one of these prefixes is treated as a broadcast
+   window - TOPMOST rewritten to NOTOPMOST, geometry frozen, style rewritten
+   (see WM_WINDOWPOSCHANGING below).  tests\rclass_test.c pins both directions
+   of this contract (MultiRender* taken over, plain class untouched), so
+   tightening the match or adding an image check fails a test instead of
+   changing behaviour quietly. */
 static BOOL IsRenderWindowClass(const char* cls)
 {
     if (!cls || !cls[0]) return FALSE;

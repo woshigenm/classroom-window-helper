@@ -454,9 +454,17 @@ static void CloseJob(HANDLE job)
     if (!job) return;
     memset(&li, 0, sizeof(li));
     if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
-                                 &li, sizeof(li)))
-        ELog("lpe: could not disarm kill-on-close err=%lu - closing the handle "
-             "may kill the script", (unsigned long)GetLastError());
+                                 &li, sizeof(li))) {
+        /* Deliberately leak the handle.  Closing it here would kill a script
+           that may still be inside its finally; leaking defers that to process
+           exit, and the launcher usually lives for seconds after this point
+           (the UAC leg), which is enough for the script to finish on its own.
+           A leak on an error path is the cheaper failure. */
+        ELog("lpe: could not disarm kill-on-close err=%lu - leaking the job "
+             "handle so the script is not killed here",
+             (unsigned long)GetLastError());
+        return;
+    }
     CloseHandle(job);
 }
 
@@ -994,7 +1002,7 @@ static int TryLpe(const char* cmdline)
     job = CreateKillOnCloseJob();
 
     if (!RunHidden(cmd, hookLog, &proc, job)) {
-        if (job) CloseHandle(job);      /* empty job: nothing to disarm */
+        CloseJob(job);                  /* empty job: nothing inside to kill */
         return 0;
     }
 
@@ -1110,6 +1118,10 @@ static int TryLpe(const char* cmdline)
         }
         CloseHandle(proc);
     }
+    /* No wait for the script here on purpose: CloseJob disarms kill-on-close
+       first, so a still-running trigger.ps1 keeps running its finally after we
+       close the handle.  Waiting would only stall the UI (and the success path
+       breaks out of the loop while the script is normally mid-finally). */
     CloseJob(job);
 
     /* The writer is also the only deleter (trigger.ps1 never removes it), and
