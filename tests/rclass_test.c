@@ -146,7 +146,7 @@ static void ReassertTopmost(HWND h)
 
 static HWND MakeWindow(const char* cls, const char* title, int x)
 {
-    HWND h = CreateWindowExA(WS_EX_TOPMOST, cls, title,
+    HWND h = CreateWindowExA(WS_EX_TOPMOST | WS_EX_NOACTIVATE, cls, title,
                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                              x, 120, 360, 240, NULL, NULL,
                              GetModuleHandleA(NULL), NULL);

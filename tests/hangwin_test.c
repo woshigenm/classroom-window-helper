@@ -50,7 +50,7 @@ int main(int argc, char** argv)
 
     sw = GetSystemMetrics(SM_CXSCREEN);
     sh = GetSystemMetrics(SM_CYSCREEN);
-    win = CreateWindowExA(0, CLS, "foreign fix victim (suspended)",
+    win = CreateWindowExA(WS_EX_NOACTIVATE, CLS, "foreign fix victim (suspended)",
                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                           sw / 40, sh / 40, sw * 95 / 100, sh * 95 / 100,
                           NULL, NULL, wc.hInstance, NULL);
@@ -63,7 +63,7 @@ int main(int argc, char** argv)
        SW_HIDE, 于是 WS_VISIBLE 建出来的窗口也可能是隐藏状态 —— 显式 Show 一次
        (探针实测 IsWindowVisible=0 时, 注入方的 enforcer 会在第一道
        "不可见就跳过"上直接 return, 跨进程兜底根本跑不到)。 */
-    ShowWindow(win, SW_SHOW);
+    ShowWindow(win, SW_SHOWNOACTIVATE);
     UpdateWindow(win);
 
     /* 让窗口真正显示/上屏, 再停止泵消息 */

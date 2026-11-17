@@ -47,6 +47,8 @@ static DWORD      g_scCfgTick, g_scLastLog, g_scServed, g_scSeededTick;
 
 /* ---------------- config: bin\bypass_screen.ini ---------------------------- */
 
+static void SC_DropFrameLocked(void);   /* defined below the frozen-frame block */
+
 static void SC_ReadConfig(void)
 {
     char   path[MAX_PATH];
@@ -103,10 +105,21 @@ static void SC_ReadConfig(void)
        tell when or why the guard armed.  The first read is skipped because
        SC_Init logs the attach line right after this call. */
     if (g_scCfgLogged++ > 0 &&
-        (enabled != prevEnabled || mode != prevMode))
+        (enabled != prevEnabled || mode != prevMode)) {
         SC_Log("[Screen] guard %s (mode=%s, from %s)", enabled ? "ON" : "off",
                mode ? "blank" : "freeze",
                hadFile ? SC_INI_NAME : "missing " SC_INI_NAME);
+        /* OFF (or a mode change) drops the cache: re-arming must re-seed from
+           the CURRENT screen.  Observed 2026-11-17: off -> on kept serving the
+           frame frozen before the off, which is not what "re-freeze" means to
+           the user toggling the switch.  Dropping under the CS is safe against
+           a concurrent serve on the capture thread. */
+        if (g_scCsReady && (!enabled || mode != prevMode)) {
+            EnterCriticalSection(&g_scCs);
+            SC_DropFrameLocked();
+            LeaveCriticalSection(&g_scCs);
+        }
+    }
 }
 
 /* ---------------- screen DC bookkeeping ----------------------------------- */
@@ -207,7 +220,12 @@ static void SC_SeedFromDC(HDC dst)
     if (buf) free(buf);
 }
 
-/* Serve the cached frame into the caller's bitmap. */
+/* Serve the cached frame into the caller's bitmap.  Same size as the cache:
+   1:1 with crop.  A DIFFERENT size (the VM's resolution changed mid-guard, or
+   the classroom switched capture geometry): stretch the cache to fill the
+   request - otherwise only the top-left corner carries the frozen image and
+   the rest of the caller's bitmap keeps whatever was there (reads as black
+   banding on the teacher's monitor). */
 static BOOL SC_DrawFrozen(HDC dst, int x, int y, int w, int h, int sx, int sy)
 {
     BOOL ok = FALSE;
@@ -219,10 +237,20 @@ static BOOL SC_DrawFrozen(HDC dst, int x, int y, int w, int h, int sx, int sy)
         if (sx + w > g_scW) w = g_scW - sx;
         if (sy + h > g_scH) h = g_scH - sy;
         if (w > 0 && h > 0) {
-            int n = SetDIBitsToDevice(dst, x, y, (DWORD)w, (DWORD)h,
-                                      sx, sy, 0, (UINT)g_scH,
-                                      g_scBits, &g_scBmi, DIB_RGB_COLORS);
-            ok = (n == h) ? TRUE : FALSE;
+            if (w == g_scW && h == g_scH && sx == 0 && sy == 0) {
+                int n = SetDIBitsToDevice(dst, x, y, (DWORD)w, (DWORD)h,
+                                          sx, sy, 0, (UINT)g_scH,
+                                          g_scBits, &g_scBmi, DIB_RGB_COLORS);
+                ok = (n == h) ? TRUE : FALSE;
+            } else {
+                /* partial request or a size that no longer matches: scale the
+                   cached frame to cover the whole requested rect */
+                int n = StretchDIBits(dst, x, y, w, h,
+                                      sx, sy, g_scW - sx, g_scH - sy,
+                                      g_scBits, &g_scBmi, DIB_RGB_COLORS,
+                                      SRCCOPY);
+                ok = (n == h) ? TRUE : FALSE;
+            }
         }
     }
     LeaveCriticalSection(&g_scCs);

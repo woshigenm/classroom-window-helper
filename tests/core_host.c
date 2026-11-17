@@ -48,7 +48,7 @@ static DWORD WINAPI HammerThread(LPVOID p)
     (void)p;
     while (InterlockedCompareExchange(&g_hammerRun, 0, 0)) {
         if (g_hostWin && IsWindow(g_hostWin))
-            ShowWindow(g_hostWin, SW_SHOW);
+            ShowWindow(g_hostWin, SW_SHOWNOACTIVATE);
         Sleep(50);
     }
     return 0;
@@ -202,11 +202,11 @@ int main(int argc, char** argv)
         wc.lpszClassName = "MultiRenderP2bTest";
         RegisterClassA(&wc);
 
-        w = CreateWindowExA(0, "MultiRenderP2bTest", "p2b subclass host",
+        w = CreateWindowExA(WS_EX_NOACTIVATE, "MultiRenderP2bTest", "p2b subclass host",
                             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                             sw / 10, sh / 10, sw * 8 / 10, sh * 8 / 10,
                             NULL, NULL, wc.hInstance, NULL);
-        if (w) ShowWindow(w, SW_SHOW);
+        if (w) ShowWindow(w, SW_SHOWNOACTIVATE);
         g_hostWin = w;
         printf("window=%p\n", (void*)w);
         fflush(stdout);

@@ -151,12 +151,12 @@ static int CheckAffinity(void)
     int   control, excluded;
 
     g_color = RGB(240, 235, 60);
-    w1 = CreateWindowExA(0, RENDER_CLASS, "control window",
+    w1 = CreateWindowExA(WS_EX_NOACTIVATE, RENDER_CLASS, "control window",
                          WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                          sw / 4, sh / 4, 480, 360, NULL, NULL,
                          GetModuleHandleA(NULL), NULL);
     if (!w1) { printf("control window failed\n"); return 1; }
-    ShowWindow(w1, SW_SHOW);
+    ShowWindow(w1, SW_SHOWNOACTIVATE);
     /* 抓屏区域必须真的被这个窗口覆盖住: 放到最上面, 否则前台终端会挡住,
        "visible" 和 "hidden" 两次抓到的是同一个画面 -> 误报 FAIL */
     SetWindowPos(w1, HWND_TOPMOST, 0, 0, 0, 0,
@@ -174,7 +174,7 @@ static int CheckAffinity(void)
     DestroyWindow(w1);
     Pump(300);
 
-    w2 = CreateWindowExA(0, RENDER_CLASS, "excluded window",
+    w2 = CreateWindowExA(WS_EX_NOACTIVATE, RENDER_CLASS, "excluded window",
                          WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                          sw / 4, sh / 4, 480, 360, NULL, NULL,
                          GetModuleHandleA(NULL), NULL);
@@ -182,7 +182,7 @@ static int CheckAffinity(void)
     if (!SetWindowDisplayAffinity(w2, WDA_EXCLUDEFROMCAPTURE))
         SetWindowDisplayAffinity(w2, WDA_MONITOR);
     GetWindowDisplayAffinity(w2, &aff);
-    ShowWindow(w2, SW_SHOW);
+    ShowWindow(w2, SW_SHOWNOACTIVATE);
     SetWindowPos(w2, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     UpdateWindow(w2);
@@ -268,12 +268,12 @@ int main(int argc, char** argv)
     g_color = RGB(10, 40, 90);
     sw = GetSystemMetrics(SM_CXSCREEN);
     sh = GetSystemMetrics(SM_CYSCREEN);
-    g_win = CreateWindowExA(0, RENDER_CLASS, "screenguard test",
+    g_win = CreateWindowExA(WS_EX_NOACTIVATE, RENDER_CLASS, "screenguard test",
                             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                             sw / 6, sh / 6, sw / 2, sh / 2,
                             NULL, NULL, wc.hInstance, NULL);
     if (!g_win) { printf("CreateWindow failed\n"); return 2; }
-    ShowWindow(g_win, SW_SHOW);
+    ShowWindow(g_win, SW_SHOWNOACTIVATE);
     UpdateWindow(g_win);
     Pump(400);
 

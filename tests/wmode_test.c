@@ -214,7 +214,7 @@ int main(int argc, char** argv)
     Say("classes registered: %s / %s", RENDER_CLASS, REF_CLASS);
 
     /* 参考窗: 一个普通(非置顶)顶层窗口, 代表"学生正在用的窗口" */
-    g_ref = CreateWindowExA(0, REF_CLASS, "reference (student app)",
+    g_ref = CreateWindowExA(WS_EX_NOACTIVATE, REF_CLASS, "reference (student app)",
                             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                             760, 420, 480, 300,
                             NULL, NULL, GetModuleHandleA(NULL), NULL);
@@ -225,7 +225,7 @@ int main(int argc, char** argv)
     ShowWindow(g_ref, SW_SHOWNOACTIVATE);
 
     /* 渲染窗: 出生即小尺寸 + WS_EX_TOPMOST (窗口模式广播的真实状态) */
-    g_win = CreateWindowExA(WS_EX_TOPMOST, RENDER_CLASS,
+    g_win = CreateWindowExA(WS_EX_TOPMOST | WS_EX_NOACTIVATE, RENDER_CLASS,
                             "window-mode broadcast (test)",
                             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                             WIN_X, WIN_Y, WIN_W, WIN_H,
@@ -239,7 +239,9 @@ int main(int argc, char** argv)
         (unsigned)GetWindowLongPtrA(g_win, GWL_EXSTYLE),
         (unsigned)GetWindowLongPtrA(g_win, GWL_STYLE));
 
-    ShowWindow(g_win, SW_SHOW);
+    ShowWindow(g_win, SW_SHOWNOACTIVATE);
+    /* explicit foreground grab stays: it simulates "the student clicked his
+       own window", and WS_EX_NOACTIVATE does not block SetForegroundWindow */
     SetForegroundWindow(g_win);
     Pump(300);
 

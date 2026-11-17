@@ -99,7 +99,7 @@ static DWORD WINAPI RendererProc(LPVOID p)
             fclose(f);
         }
 
-        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, g_sw, g_sh, 0);
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, g_sw, g_sh, SWP_NOACTIVATE);
         _snprintf(tag, sizeof(tag) - 1, "iter%03d-afterSWP", n);
         tag[sizeof(tag) - 1] = '\0';
         Snapshot(tag);
@@ -112,7 +112,7 @@ static DWORD WINAPI RendererProc(LPVOID p)
         tag[sizeof(tag) - 1] = '\0';
         Snapshot(tag);
 
-        ShowWindow(g_hwnd, SW_SHOWMAXIMIZED);
+        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
         _snprintf(tag, sizeof(tag) - 1, "iter%03d-afterShow", n);
         tag[sizeof(tag) - 1] = '\0';
         Snapshot(tag);
@@ -216,7 +216,7 @@ int main(void)
         RegisterClassA(&wc3);
     }
 
-    g_hwnd = CreateWindowExA(0, "MultiRenderWindowClass", "hooktest window",
+    g_hwnd = CreateWindowExA(WS_EX_NOACTIVATE, "MultiRenderWindowClass", "hooktest window",
                              WS_OVERLAPPEDWINDOW,
                              100, 100,
                              noLoop ? g_sw * 3 / 4 : 800,
@@ -227,7 +227,7 @@ int main(void)
         return 1;
     }
 
-    ShowWindow(g_hwnd, SW_SHOWNORMAL);
+    ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(g_hwnd);
     Snapshot("000-before");
 
@@ -237,28 +237,28 @@ int main(void)
         PumpSleep(3000, &msg);                        /* 等注入完成 */
         Snapshot("seq-0-injected");
 
-        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, g_sw, g_sh, SWP_FRAMECHANGED);
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, g_sw, g_sh, SWP_FRAMECHANGED | SWP_NOACTIVATE);
         PumpSleep(400, &msg); Snapshot("seq-1-appfull");
 
-        ShowWindow(g_hwnd, SW_SHOWMAXIMIZED);
+        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
         PumpSleep(600, &msg); Snapshot("seq-2-max");
 
         /* 应用想把窗口按回它缓存的小尺寸 —— 必须被挡 */
-        SetWindowPos(g_hwnd, HWND_TOPMOST, 159, 160, 960, 900, SWP_FRAMECHANGED);
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 159, 160, 960, 900, SWP_FRAMECHANGED | SWP_NOACTIVATE);
         PumpSleep(400, &msg); Snapshot("seq-3-pullback");
 
         /* 用户点"还原" —— 必须真的还原成用户矩形 */
-        ShowWindow(g_hwnd, SW_RESTORE);
+        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
         PumpSleep(600, &msg); Snapshot("seq-4-restore");
 
         /* 用户拖动: 用 WM_ENTERSIZEMOVE/EXITSIZEMOVE 包一次真实移动模拟 */
         SendMessageA(g_hwnd, WM_ENTERSIZEMOVE, 0, 0);
-        SetWindowPos(g_hwnd, NULL, 300, 300, 700, 600, SWP_NOZORDER);
+        SetWindowPos(g_hwnd, NULL, 300, 300, 700, 600, SWP_NOZORDER | SWP_NOACTIVATE);
         SendMessageA(g_hwnd, WM_EXITSIZEMOVE, 0, 0);
         PumpSleep(400, &msg); Snapshot("seq-5-usersized");
 
         /* 应用又想按回去 —— 必须被挡 */
-        SetWindowPos(g_hwnd, HWND_TOPMOST, 159, 160, 960, 900, SWP_FRAMECHANGED);
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 159, 160, 960, 900, SWP_FRAMECHANGED | SWP_NOACTIVATE);
         PumpSleep(400, &msg); Snapshot("seq-6-afterapp");
         for (i = 0; i < 10; i++) { PumpSleep(100, &msg); }
         Snapshot("seq-7-final");
@@ -268,7 +268,7 @@ int main(void)
     /* 再开一个「虚拟桌面」风格的窗口: 3/4 屏 + 带框 + 置顶。
        教室软件的虚拟桌面预览窗就是这个形状 (实测 1344x637 @1792x850),
        它绝对不能被我们降级成小窗。 */
-    g_hwnd2 = CreateWindowExA(WS_EX_TOPMOST, "HookTestVDesk", "vdesk preview",
+    g_hwnd2 = CreateWindowExA(WS_EX_TOPMOST | WS_EX_NOACTIVATE, "HookTestVDesk", "vdesk preview",
                               WS_OVERLAPPEDWINDOW,
                               50, 50, g_sw * 3 / 4, g_sh * 3 / 4,
                               NULL, NULL, wc.hInstance, NULL);
@@ -279,7 +279,7 @@ int main(void)
 
     /* 学生端自己的界面窗口: 这里故意让它满屏 (最坏情况),
        用来验证 "类名不在渲染器白名单里 -> 无论多大都不降级"。 */
-    g_hwnd3 = CreateWindowExA(0, "StudentHelperWnd.oseasy", "student helper",
+    g_hwnd3 = CreateWindowExA(WS_EX_NOACTIVATE, "StudentHelperWnd.oseasy", "student helper",
                               WS_OVERLAPPEDWINDOW,
                               0, 0, g_sw, g_sh,
                               NULL, NULL, wc.hInstance, NULL);
@@ -301,9 +301,9 @@ int main(void)
             /* 模拟真实渲染器: 每 500ms 既想还原 (SW_RESTORE), 又把它缓存的
                旧样式写回去 (没有 WS_MAXIMIZE) —— 两条路都可能把最大化清掉。 */
             LONG st2 = GetWindowLongW(g_hwnd, GWL_STYLE);
-            ShowWindow(g_hwnd, SW_RESTORE);
+            ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
             SetWindowLongW(g_hwnd, GWL_STYLE, (st2 & ~(LONG)WS_MAXIMIZE));
-            SetWindowPos(g_hwnd, HWND_TOPMOST, 1666, 766, 868, 456, SWP_FRAMECHANGED);
+            SetWindowPos(g_hwnd, HWND_TOPMOST, 1666, 766, 868, 456, SWP_FRAMECHANGED | SWP_NOACTIVATE);
             GetWindowRect(g_hwnd, &v);
             fv = fopen(g_resPath, "a");
             if (fv) {
