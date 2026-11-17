@@ -170,13 +170,37 @@ $original = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocument
 # even when the call fails, so a run that dies between "set" and "restore"
 # destroys the real value.  This file is the only record of it; the candidate
 # list below is a guess by comparison.
-$snapshot = Join-Path $Repo 'documents.orig'
+#
+# Under %LOCALAPPDATA%, not next to this script: bin\lpe can be read-only (a
+# copy under Program Files) while the snapshot must always be writable, and a
+# per-user file has no business travelling in a release zip.  The LPE root and
+# the run directories already live here.
+$lpeRoot = Join-Path $env:LOCALAPPDATA 'ClassroomBypass-LPE'
+$snapshot = Join-Path $lpeRoot 'documents.orig'
 $recorded = $null
 if (Test-Path -LiteralPath $snapshot -PathType Leaf) {
-    # UTF-8 without a BOM so a non-ASCII user name survives.  Empty or
-    # unreadable counts as absent rather than as a path to trust.
-    $recorded = ([IO.File]::ReadAllText($snapshot, [Text.Encoding]::UTF8)).Trim()
-    if (-not $recorded) { $recorded = $null }
+    # UTF-8 without a BOM so a non-ASCII user name survives, and validated
+    # before it is trusted: a corrupt file must not become a "restore
+    # Documents to <garbage>" instruction.  Failing these checks means there
+    # is no value to honour (fall through to the candidate list); a valid
+    # record whose directory is unreachable is a different state, handled
+    # below by refusing to run.
+    $raw = $null
+    try { $raw = [IO.File]::ReadAllText($snapshot, [Text.Encoding]::UTF8).Trim() }
+    catch { Set-Stage "WARNING documents snapshot is unreadable, ignoring: $snapshot" }
+    if ($null -ne $raw) {
+        if (-not $raw) {
+            Set-Stage "WARNING documents snapshot is empty, ignoring: $snapshot"
+        } elseif ($raw -match "[`r`n]") {
+            Set-Stage "WARNING documents snapshot has more than one line, ignoring: $snapshot"
+        } elseif ($raw.Length -gt 260) {
+            Set-Stage "WARNING documents snapshot is longer than MAX_PATH, ignoring: $snapshot"
+        } elseif ($raw -notmatch '^(?:[A-Za-z]:\\|\\\\)') {
+            Set-Stage "WARNING documents snapshot is not an absolute path, ignoring: $snapshot"
+        } else {
+            $recorded = $raw
+        }
+    }
 }
 
 # A previous run that died between "set" and "restore" leaves Documents pointing
@@ -189,7 +213,6 @@ if (Test-Path -LiteralPath $snapshot -PathType Leaf) {
 # anywhere else (D:\MyDocs, a share) cannot be guessed at - that is why an
 # empty candidate list refuses to run instead of overwriting the last usable
 # copy with a new $root.
-$lpeRoot = Join-Path $env:LOCALAPPDATA 'ClassroomBypass-LPE'
 if ($original -and $original.TrimEnd('\') -like "$lpeRoot*") {
     if ($recorded -and (Test-Path -LiteralPath $recorded -PathType Container)) {
         $original = $recorded
@@ -216,9 +239,16 @@ if ($original -and $original.TrimEnd('\') -like "$lpeRoot*") {
         Set-Stage "documents stale redirect under LPE root -> using $original"
     }
 } elseif (-not $original) {
+    # Same three states as the stale branch: no record at all, a record we can
+    # use, and a record that is authoritative but unreachable.  The last one
+    # refuses instead of guessing - an empty read means "unknown", so replacing
+    # a known-but-offline path with a candidate would lose the only copy.
     if ($recorded -and (Test-Path -LiteralPath $recorded -PathType Container)) {
         $original = $recorded
         Set-Stage "documents unreadable, using recorded original $original"
+    } elseif ($recorded) {
+        Set-Stage "documents unreadable and the recorded original is not a directory - refusing to run: $recorded"
+        exit 4
     } else {
         Set-Stage 'could not read the Documents path'
         exit 4
@@ -228,7 +258,18 @@ if ($original -and $original.TrimEnd('\') -like "$lpeRoot*") {
     # path that no longer exists (unplugged drive, deleted folder, or an older
     # build's lossy "original").  Restoring that would be worse than not
     # starting: set does not roll back, it would install the dead path.
-    Set-Stage "documents path is not a directory, refusing to run: $original"
+    #
+    # The '%' branch exists because it names the cause: User Shell Folders\
+    # Personal is REG_EXPAND_SZ, and a hand edit that writes REG_SZ makes
+    # SHGetKnownFolderPath hand back the literal "%USERPROFILE%\Documents",
+    # which never resolves.  Without a distinct message every run would stop
+    # here and the log would never say why.
+    if ($original -match '%') {
+        Set-Stage "documents path contains an unexpanded variable, refusing to run: $original"
+        Set-Stage 'documents hint: User Shell Folders\Personal must be REG_EXPAND_SZ; repair with: bin\lpe\documents_path.exe set <real path>'
+    } else {
+        Set-Stage "documents path is not a directory, refusing to run: $original"
+    }
     exit 4
 }
 Set-Stage "documents original=$original"
@@ -236,11 +277,17 @@ Set-Stage "documents original=$original"
 # Written before the redirect and cleared only after a verified restore: if
 # this process is killed in between, the next run reads the real value back
 # instead of guessing, and the guessing branch above never runs.
+#
+# A snapshot that cannot be written is a degraded run, not a failed one: the
+# finally block still restores within this process, and only a hard kill needs
+# the cross-run record.  Refusing to run would take the whole feature away from
+# a read-only install, so warn and continue.
 try {
+    New-Item -ItemType Directory -Path $lpeRoot -Force | Out-Null
     [IO.File]::WriteAllText($snapshot, $original,
         (New-Object Text.UTF8Encoding($false)))
 } catch {
-    Set-Stage "WARNING cannot write the snapshot $snapshot : $($_.Exception.Message)"
+    Set-Stage "WARNING documents snapshot could not be written, this run has no cross-run restore: $snapshot ($($_.Exception.Message))"
 }
 # <<< known-folder
 

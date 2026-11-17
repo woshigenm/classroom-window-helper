@@ -64,10 +64,11 @@ bin\bypass.exe（普通用户，非管理员）
   `Test-Path -PathType Container` 验目标，验不过就 `exit 4`，而不是照着写——
   写进去就是一个指不到任何目录的 Documents。
 - stale 自愈分两级：**快照**优先，**候选列表**只是兜底。
-  - 快照 `bin\lpe\documents.orig`：每次重定向前把当前值写进去（UTF-8 无 BOM，
-    中文用户名不会坏），恢复成功才删除。脚本被杀时它留在磁盘上，下一次运行直接
-    读回真值（`Test-Path -PathType Container` 验过才用），所以自定义重定向
-    （`D:\MyDocs`、网络盘）也能自愈。
+  - 快照 `%LOCALAPPDATA%\ClassroomBypass-LPE\documents.orig`：每次重定向前把当前值
+    写进去（UTF-8 无 BOM，中文用户名不会坏），恢复成功才删除。放用户目录而不是
+    `bin\lpe\`，因为安装目录可能只读（Program Files），而快照必须能写；它也不该
+    跟发布包走。读回时会验格式（非空、单行、≤260、绝对路径），验不过就当作“没有
+    记录”并告警；验过但目录当前不可达 → 见下一条。
   - 候选列表：只有没有快照时（旧版本遗留的坏状态）才用，顺序
     `$env:OneDrive` → `$env:OneDriveConsumer` → `%USERPROFILE%\Documents`。
     OneDrive 优先，是因为 KFM 用户通常还留着一个空壳 `%USERPROFILE%\Documents`，
@@ -75,10 +76,26 @@ bin\bypass.exe（普通用户，非管理员）
   - 两者都不可用 → `exit 4`，退回 UAC，并提示手工
     `bin\lpe\documents_path.exe set <真实路径>`。快照存在但当前不可达
     （移动硬盘拔了、共享离线）时同样拒绝，而不是拿候选覆盖它——那是最后一版真值。
-- 回调 DLL 的服务名是 `CVE49176_<pid>_<tick>`，每次运行唯一，`StartService` 之后
-  立即 `DeleteService`，所以没有“上次残留 → 本次 `ERROR_SERVICE_EXISTS`”这条路径。
-  `trigger.ps1` 启动时仍对 `CVE49176_*` 做一次只读扫描，发现残留才写 `WARNING`
-  （不自动删除：删服务需要本脚本不一定持有的权限）。
+    空值分支和 LPE 分支对这三种状态的处置一致。
+  - 写快照失败（磁盘满、权限）只写 `WARNING` 并继续：本次运行内 `finally` 仍然有效，
+    只有“硬杀”才需要跨运行记录；`exit 4` 会让只读安装的用户完全用不了。
+- 回调 DLL 的服务名是 `CVE49176_<pid>_<tick>`，每次运行唯一，所以不存在
+  “上次残留 → 本次 `ERROR_SERVICE_EXISTS`”。但**残留窗口是真实存在的**：
+  `CreateServiceW` 与 `DeleteService` 之间被杀，服务会留下。它不会自启
+  （`SERVICE_DEMAND_START`），但任何有 `SERVICE_START` 权限的进程都能让它以
+  **SYSTEM** 加载 `%LOCALAPPDATA%\ClassroomBypass-LPE\<runid>\payload\wallet_callback_shell.dll`
+  ——一个普通用户可写目录里的 DLL，这就是持久提权面（不是“下次运行失败”）。
+  `trigger.ps1` 启动时只读扫描 `CVE49176_*`，命中才写 `WARNING`（不自动删：删服务
+  需要本脚本不一定持有的权限）。发现残留后手工清理（管理员）：
+
+  ```
+  sc query  CVE49176_<pid>_<tick>
+  sc stop   CVE49176_<pid>_<tick>
+  sc delete CVE49176_<pid>_<tick>
+  rmdir /s /q "%LOCALAPPDATA%\ClassroomBypass-LPE\<runid>"
+  ```
+
+  顺序不能反：先删目录再 `sc delete`，服务会有一段指向不存在文件的窗口。
 - `documents_path.exe get` 的输出会丢非 ASCII 字符（CRT `"C"` locale），所以
   `trigger.ps1` 只用它写日志，不再用它做任何判断：读当前路径走 .NET 的
   `[Environment]::GetFolderPath`，判断成败看 `documents_path.exe` 的退出码。

@@ -83,9 +83,9 @@ try {
     $lpeSrc = Join-Path $Bin "lpe"
     if (Test-Path -LiteralPath $lpeSrc) {
         Copy-Item -LiteralPath $lpeSrc -Destination $stageBin -Recurse -Force
-        # bin\lpe\documents.orig is this machine's snapshot of where its
-        # Documents folder was (see trigger.ps1).  Shipping it would tell the
-        # recipient's first run to restore a path that only exists here.
+        # Older builds kept the Documents snapshot in bin\lpe (it now lives
+        # under %LOCALAPPDATA%).  A tree that still has one would ship this
+        # machine's Documents path to the recipient's first run.
         $stale = Join-Path $stageBin "lpe\documents.orig"
         if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
     } else {

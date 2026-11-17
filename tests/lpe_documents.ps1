@@ -7,8 +7,8 @@
 #
 # One substitution is unavoidable: [Environment]::GetFolderPath reads the real
 # per-user value, so that single line is replaced with $env:TEST_ORIGINAL.
-# Everything else - snapshot protocol, candidate order, the Test-Path gates,
-# exit codes and the two different restore messages - is the shipped code.
+# Everything else - snapshot location, validation, candidate order, the
+# Test-Path gates, exit codes and the restore messages - is the shipped code.
 #
 # Exit code 0 only if every case passed.
 
@@ -68,6 +68,10 @@ function Get-Snapshot([string]$path) {
     return [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)
 }
 
+# %LOCALAPPDATA%\ClassroomBypass-LPE\documents.orig, with %LOCALAPPDATA% pointed
+# at the sandbox.
+function Snap([string]$dir) { return (Join-Path $dir 'la\ClassroomBypass-LPE\documents.orig') }
+
 # A stand-in for documents_path.exe: records its arguments and returns the exit
 # code in rc.txt, so the failing-restore path can be exercised too.
 function New-DocumentsStub([string]$dir) {
@@ -89,7 +93,6 @@ function Esc([string]$s) { return $s.Replace("'", "''") }
 
 $knownTemplate = @'
 $ErrorActionPreference = 'Stop'
-$Repo = '@REPO@'
 $env:LOCALAPPDATA = '@LAPPDATA@'
 $env:USERPROFILE = '@UP@'
 $env:OneDrive = '@OD@'
@@ -118,9 +121,6 @@ function Run-Case([string]$name, [string]$template, [string]$block, $values,
                   [string[]]$expectStages, [int]$expectCode,
                   [scriptblock]$setup = $null) {
     $dir = New-Dir (Join-Path $work $name)
-    # bin\lpe always exists in production, so the snapshot write cannot fail
-    # for a missing directory there either.
-    New-Dir (Join-Path $dir 'repo') | Out-Null
     if ($setup) { & $setup $dir }
     $case = Join-Path $dir 'case.ps1'
     $text = $template.Replace('@STAGES@', (Esc (Join-Path $dir 'stages.txt')))
@@ -142,21 +142,16 @@ function Run-Case([string]$name, [string]$template, [string]$block, $values,
     foreach ($pattern in $expectStages) {
         Check ($stages -match $pattern) "$label log /$pattern/"
     }
-    return [pscustomobject]@{
-        Dir      = $dir
-        Stages   = $stages
-        Snapshot = (Join-Path $dir 'repo\documents.orig')
-    }
+    return [pscustomobject]@{ Dir = $dir; Stages = $stages; Snapshot = (Snap $dir) }
 }
 
-# A case directory is <work>\<name>, so a caller can pre-write files into it.
 function Case-Dir([string]$name) { return (Join-Path $work $name) }
 
 # ---- known-folder block -----------------------------------------------------
 
 $dir = Case-Dir 'healthy'
 $case = Run-Case 'healthy' $knownTemplate $known @{
-    REPO = "$dir\repo"; LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
     ORIGINAL = (New-Dir "$dir\docs")
 } @('documents original=') 0
 Check ((Get-Snapshot $case.Snapshot) -eq "$dir\docs") 'healthy    snapshot holds the original'
@@ -164,19 +159,19 @@ Check ((Get-Snapshot $case.Snapshot) -eq "$dir\docs") 'healthy    snapshot holds
 $dir = Case-Dir 'stale-recorded'
 $recorded = New-Dir "$dir\onedrive\Documents"
 $case = Run-Case 'stale-recorded' $knownTemplate $known @{
-    REPO = "$dir\repo"; LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
     ORIGINAL = "$dir\la\ClassroomBypass-LPE\run1"
 } @('recorded original') 0 {
-    param($d) Set-Snapshot "$d\repo\documents.orig" $recorded
+    param($d) Set-Snapshot (Snap $d) $recorded
 }
 Check ((Get-Snapshot $case.Snapshot) -eq $recorded) 'recorded   snapshot keeps the recorded path'
 
 $dir = Case-Dir 'stale-recorded-dead'
 $case = Run-Case 'stale-recorded-dead' $knownTemplate $known @{
-    REPO = "$dir\repo"; LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
     ORIGINAL = "$dir\la\ClassroomBypass-LPE\run1"
 } @('recorded original is not a directory') 4 {
-    param($d) Set-Snapshot "$d\repo\documents.orig" "$d\gone"
+    param($d) Set-Snapshot (Snap $d) "$d\gone"
 }
 Check ((Get-Snapshot $case.Snapshot) -eq "$dir\gone") 'dead       snapshot not overwritten by a guess'
 
@@ -184,7 +179,7 @@ $dir = Case-Dir 'stale-onedrive'
 $oneDriveDocs = New-Dir "$dir\od\Documents"
 $profileDocs  = New-Dir "$dir\up\Documents"
 $case = Run-Case 'stale-onedrive' $knownTemplate $known @{
-    REPO = "$dir\repo"; LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = "$dir\od"
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = "$dir\od"
     ORIGINAL = "$dir\la\ClassroomBypass-LPE\run1"
 } @('candidates:', 'under LPE root -> using ') 0
 Check ((Get-Snapshot $case.Snapshot) -eq $oneDriveDocs) 'onedrive   picked over %USERPROFILE%'
@@ -192,33 +187,63 @@ Check ($profileDocs -ne $oneDriveDocs) 'onedrive   the two candidates really dif
 
 $dir = Case-Dir 'stale-nothing'
 $case = Run-Case 'stale-nothing' $knownTemplate $known @{
-    REPO = "$dir\repo"; LAPPDATA = "$dir\la"
-    UP = (New-Dir "$dir\up"); OD = (New-Dir "$dir\od")
+    LAPPDATA = "$dir\la"; UP = (New-Dir "$dir\up"); OD = (New-Dir "$dir\od")
     ORIGINAL = "$dir\la\ClassroomBypass-LPE\run1"
 } @('no candidate to restore') 4
 Check ($null -eq (Get-Snapshot $case.Snapshot)) 'nothing    no snapshot written when refusing'
 
+# A corrupt snapshot is not a value: it is ignored, and only then may the run
+# fall back to guessing.
+$dir = Case-Dir 'snapshot-garbage'
+$oneDriveDocs = New-Dir "$dir\od\Documents"
+$case = Run-Case 'snapshot-garbage' $knownTemplate $known @{
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = "$dir\od"
+    ORIGINAL = "$dir\la\ClassroomBypass-LPE\run1"
+} @('more than one line', 'candidates:') 0 {
+    param($d) Set-Snapshot (Snap $d) "$($d)\one`r`n$($d)\two"
+}
+Check ((Get-Snapshot $case.Snapshot) -eq $oneDriveDocs) 'garbage    ignored, candidate used instead'
+
 $dir = Case-Dir 'unreadable-recorded'
 $docs = New-Dir "$dir\docs"
 $case = Run-Case 'unreadable-recorded' $knownTemplate $known @{
-    REPO = "$dir\repo"; LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
     ORIGINAL = ''
 } @('using recorded original') 0 {
-    param($d) Set-Snapshot "$d\repo\documents.orig" $docs
+    param($d) Set-Snapshot (Snap $d) $docs
 }
 Check ((Get-Snapshot $case.Snapshot) -eq $docs) 'unreadable snapshot is authoritative'
 
 $dir = Case-Dir 'unreadable-nothing'
 $null = Run-Case 'unreadable-nothing' $knownTemplate $known @{
-    REPO = "$dir\repo"; LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''; ORIGINAL = ''
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''; ORIGINAL = ''
 } @('could not read the Documents path') 4
+
+# Same refusal as the stale branch: a recorded but unreachable original is not
+# a reason to try a candidate.
+$dir = Case-Dir 'unreadable-recorded-dead'
+$null = Run-Case 'unreadable-recorded-dead' $knownTemplate $known @{
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''; ORIGINAL = ''
+} @('unreadable and the recorded original is not a directory') 4 {
+    param($d) Set-Snapshot (Snap $d) "$d\gone"
+}
 
 $dir = Case-Dir 'not-a-directory'
 $file = Join-Path (New-Dir $dir) 'notadir.txt'
 [IO.File]::WriteAllText($file, 'x')
 $null = Run-Case 'not-a-directory' $knownTemplate $known @{
-    REPO = "$dir\repo"; LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''; ORIGINAL = $file
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''; ORIGINAL = $file
 } @('path is not a directory') 4
+
+# User Shell Folders\Personal written as REG_SZ keeps its %VAR% unexpanded;
+# SHGetKnownFolderPath then hands back the literal, which never resolves.  The
+# run must refuse and say which registry value is wrong, not just "not a
+# directory".
+$dir = Case-Dir 'unexpanded'
+$null = Run-Case 'unexpanded' $knownTemplate $known @{
+    LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
+    ORIGINAL = '%USERPROFILE%\Documents'
+} @('contains an unexpanded variable', 'must be REG_EXPAND_SZ') 4
 
 # ---- restore block ----------------------------------------------------------
 
