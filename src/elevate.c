@@ -601,18 +601,47 @@ static int ScanHookLogChildPid(const char* path, DWORD* pid)
     return *pid != 0;
 }
 
-/* 1 = alive, 0 = gone, -1 = cannot tell (higher integrity: trust the caller) */
-static int ProcessState(DWORD pid)
+/* 1 = alive, 0 = gone, -1 = cannot tell (cannot open: higher integrity -
+   trust the caller).  On 1, img (when img/n are given) receives the image
+   base name, or stays empty if even the name could not be queried.  The
+   caller uses it to reject a reused pid: the handshake line describes the
+   pid that WAS the elevated instance, and within a 60 s window Windows can
+   hand that pid to an unrelated process. */
+static int ProcessState(DWORD pid, char* img, size_t n)
 {
     HANDLE h;
-    DWORD  w;
+    DWORD  w, got;
+    char   path[MAX_PATH];
+    char*  p;
 
+    if (img && n) img[0] = '\0';
     if (!pid) return 0;
     h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!h) return (GetLastError() == ERROR_ACCESS_DENIED) ? -1 : 0;
     w = WaitForSingleObject(h, 0);
+    if (w != WAIT_TIMEOUT) { CloseHandle(h); return 0; }
+    if (img && n) {
+        got = sizeof(path);
+        if (QueryFullProcessImageNameA(h, 0, path, &got)) {
+            p = strrchr(path, '\\');
+            _snprintf(img, n, "%s", p ? p + 1 : path);
+            img[n - 1] = '\0';
+        }
+    }
     CloseHandle(h);
-    return (w == WAIT_TIMEOUT) ? 1 : 0;
+    return 1;
+}
+
+/* The elevated instance is this exe - the chain spawns it from our own
+   GetModuleFileName path.  Base-name compare on purpose, not full path: the
+   check exists to reject pid reuse (a different image), and a path-spelling
+   difference must not turn into a false mismatch.  An unqueryable image
+   keeps the old behaviour (trust): the check can only reject on evidence. */
+static int ProcessImageIsOurs(const char* img, const char* selfName)
+{
+    if (!img || !img[0]) return 1;
+    if (!selfName || !selfName[0]) return 1;
+    return _stricmp(img, selfName) == 0;
 }
 
 /* ---------------- progress window ---------------- */
@@ -1014,6 +1043,7 @@ static int TryLpe(const char* cmdline)
     static char cmd[LPE_CMDLINE_MAX], target[2048];
     char    exe[MAX_PATH];
     char    abortPath[MAX_PATH], scriptTmp[MAX_PATH];
+    const char* selfName;
     HANDLE  proc = NULL, job = NULL;
     DWORD   t0, lastBeat, exitCode = 0, pid = 0, exitTick = 0, got, skipTick = 0;
     int     ok = 0, skipped = 0, i, n, stillRunning = 0;
@@ -1053,6 +1083,10 @@ static int TryLpe(const char* cmdline)
     if (got == 0 || got >= sizeof(exe)) {
         ELog("lpe: own path does not fit in %u bytes", (unsigned)sizeof(exe));
         return 0;
+    }
+    {
+        char* p = strrchr(exe, '\\');
+        selfName = p ? p + 1 : exe;
     }
 
     /* --elevate=uac at the end: if the spawned instance somehow is NOT admin
@@ -1159,19 +1193,40 @@ static int TryLpe(const char* cmdline)
             break;
         }
         if (sr == 1 && pid != GetCurrentProcessId()) {
-            int st = ProcessState(pid);
-            if (st != 0) { ok = 1; break; }   /* -1 = higher integrity: trust it */
+            char img[MAX_PATH];
+            int  st = ProcessState(pid, img, sizeof(img));
+            /* A live process whose image is not ours means the pid in the
+               handshake line was reused (the launcher truncated the log at
+               startup, so the line is from this run - but its process may
+               have died and Windows handed the pid on).  Keep polling: a
+               real instance appends its own handshake line and this scan
+               takes the last one.  -1 (cannot open) and an unqueryable image
+               keep the old trust: the check only rejects on evidence. */
+            if (st > 0 && !ProcessImageIsOurs(img, selfName)) {
+                ELog("lpe: handshake pid=%lu is %s, not %s - pid reused, "
+                     "ignoring the line", (unsigned long)pid, img, selfName);
+            } else if (st != 0) {
+                ok = 1;
+                break;
+            }
         }
         if (!ok) {
             DWORD cpid = 0;
-            if (ScanHookLogChildPid(hookLog, &cpid) && cpid != GetCurrentProcessId() &&
-                ProcessState(cpid) != 0) {
-                pid = cpid;
-                ok = 1;
-                ELog("lpe: handshake line not seen yet - log says child_pid=%lu "
-                     "is alive, accepting it (it may still run its own UAC step)",
-                     (unsigned long)cpid);
-                break;
+            if (ScanHookLogChildPid(hookLog, &cpid) &&
+                cpid != GetCurrentProcessId()) {
+                char img[MAX_PATH];
+                int  st = ProcessState(cpid, img, sizeof(img));
+                if (st > 0 && !ProcessImageIsOurs(img, selfName)) {
+                    ELog("lpe: child_pid=%lu is %s, not %s - pid reused, "
+                         "ignoring it", (unsigned long)cpid, img, selfName);
+                } else if (st != 0) {
+                    pid = cpid;
+                    ok = 1;
+                    ELog("lpe: handshake line not seen yet - log says "
+                         "child_pid=%lu is alive, accepting it (it may still "
+                         "run its own UAC step)", (unsigned long)cpid);
+                    break;
+                }
             }
         }
 
@@ -1186,15 +1241,20 @@ static int TryLpe(const char* cmdline)
                 if (GetExitCodeProcess(proc, &code)) exitCode = code;
             }
         }
-        /* After the script ends: exit=0 means the chain SUCCEEDED and the
-           spawned child may still be mid-UAC (the human has to click), so
-           keep watching for its status.  Any failure exit is final and there
-           is nothing to wait for. */
-        if (!stillRunning && exitTick) {
+        /* Two independent clocks, not one total cap:
+           - while the script is still running: 60 s from launch, then give up
+             on it (the post-loop code terminates it after 55 s anyway);
+           - once it exited: only its own grace counts.  exit=0 means the
+             chain SUCCEEDED and the spawned child may still be mid-UAC (the
+             human has to click) - a script that exited 0 at t0+40 s must keep
+             its full 25 s grace, which a shared t0+60 s cap silently cuts to
+             20 s. */
+        if (exitTick) {
             DWORD grace = (exitCode == 0) ? 25000 : 2500;
             if (GetTickCount() - exitTick > grace) break;
+        } else if (GetTickCount() - t0 > 60000) {
+            break;
         }
-        if (GetTickCount() - t0 > 60000) break;
 
         if (GetTickCount() - lastBeat > 10000) {
             lastBeat = GetTickCount();
@@ -1246,9 +1306,14 @@ static int TryLpe(const char* cmdline)
            t+109 ms).  The skip branch stops polling, so without this check the
            launcher reported failure and popped a second UAC whose instance
            immediately exited on the single-instance mutex.  The button skips
-           the exploit chain, not a result that already exists. */
+           the exploit chain, not a result that already exists.  The image
+           check keeps a reused pid from reading as "already succeeded". */
+        char img[MAX_PATH];
+        int  st;
+
         if (ScanHookLogStatus(hookLog, &pid) == 1 && pid != GetCurrentProcessId() &&
-            ProcessState(pid) != 0) {
+            (st = ProcessState(pid, img, sizeof(img))) != 0 &&
+            ProcessImageIsOurs(img, selfName)) {
             ELog("lpe: skip landed after the chain already succeeded "
                  "(elevated pid=%lu is up) - not popping a second UAC",
                  (unsigned long)pid);

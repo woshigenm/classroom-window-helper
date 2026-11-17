@@ -2253,6 +2253,109 @@ static BOOL BuildStatusReport(HWND hwnd, BOOL verbose)
     return FALSE;
 }
 
+/* ---- 「检查当前状态」的偏移式增量读 bin\bypass_hook.log --------------------
+   共享日志里躺着 GUI 框看不到的东西：payload 的 [elevate] 进度行、提权实例的
+   握手行、DLL 的 [Tray]/[Loader] 行 —— GUI 模式下 AppendLog 只写编辑框，这些
+   只进文件。这里把「上次检查之后新增的部分」搬进编辑框。
+   锚点是字节偏移，不是「日志框第一行是不是 banner」之类的展示细节
+   （docs\P1-abort.md §10.3，P3 定的）：记下上次读到哪，这次从那开始；偏移大于
+   当前长度（启动器每次启动都截断 = 轮转）就从头读。日志格式怎么改都不影响。 */
+static DWORD g_logTailOffset;        /* 0 = 从头（首次点击，或文件被截断/轮转） */
+
+#define LOG_TAIL_MAX (64 * 1024)
+
+static void AppendNewLogTail(HWND hwnd)
+{
+    static char buf[LOG_TAIL_MAX + 2];
+    char   dir[MAX_PATH], path[MAX_PATH], *p, *end;
+    HANDLE h;
+    DWORD  size, readFrom, readLen, got = 0;
+    int    capped, boundary;
+
+    if (!GetModuleFileNameA(NULL, dir, sizeof(dir))) return;
+    p = strrchr(dir, '\\');
+    if (!p) return;
+    *(p + 1) = '\0';
+    _snprintf(path, sizeof(path) - 1, "%sbypass_hook.log", dir);
+    path[sizeof(path) - 1] = '\0';
+
+    h = CreateFileA(path, GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        AppendLog(hwnd, "\r\n--- Shared Log ---\r\n"
+                        "  (%s unreadable err=%lu)\r\n",
+                  path, (unsigned long)GetLastError());
+        g_logTailOffset = 0;
+        return;
+    }
+    size = GetFileSize(h, NULL);
+    if (size == INVALID_FILE_SIZE) { CloseHandle(h); return; }
+    if (g_logTailOffset > size) g_logTailOffset = 0;    /* truncated / rotated */
+
+    AppendLog(hwnd, "\r\n--- Shared Log (%s) ---\r\n",
+              g_logTailOffset ? "new since the last check" : "full log so far");
+    if (size == g_logTailOffset) {
+        AppendLog(hwnd, "  (no new lines)\r\n");
+        CloseHandle(h);
+        return;
+    }
+
+    /* 64 KB cap: a burst (LPE + reloads can write fast) must not flood the
+       edit box; the skipped bytes are announced, not silently lost. */
+    capped = (size - g_logTailOffset > LOG_TAIL_MAX);
+    if (capped)
+        AppendLog(hwnd, "  (showing the last %u bytes; %lu older byte(s) "
+                        "skipped)\r\n",
+                  (unsigned)LOG_TAIL_MAX,
+                  (unsigned long)(size - g_logTailOffset - LOG_TAIL_MAX));
+
+    /* readFrom carries ONE extra byte so the alignment check below can tell a
+       clean line boundary from a cut made mid-line. */
+    if (capped)                    readFrom = size - (LOG_TAIL_MAX + 1);
+    else if (g_logTailOffset > 0)  readFrom = g_logTailOffset - 1;
+    else                           readFrom = 0;
+    readLen = size - readFrom;
+    if (readLen > LOG_TAIL_MAX + 1) readLen = LOG_TAIL_MAX + 1;
+
+    SetFilePointer(h, (LONG)readFrom, NULL, FILE_BEGIN);
+    ReadFile(h, buf, readLen, &got, NULL);
+    CloseHandle(h);
+    buf[got] = '\0';
+
+    /* Alignment: capped cuts are always mid-file, so drop the partial first
+       line.  Offset cuts keep one clean boundary byte: only drop when the
+       previous read stopped mid-line (the file grew between the size snapshot
+       and the read).  No complete line in the window -> show nothing, but the
+       offset still advances so we never re-show it. */
+    p = buf;
+    end = buf + got;
+    boundary = (!capped && g_logTailOffset > 0);
+    if (capped || (boundary && p[0] != '\n')) {
+        char* q = strchr(p, '\n');
+        p = q ? q + 1 : end;
+    } else if (boundary) {
+        p++;                    /* the carried boundary byte */
+    }
+
+    /* AppendLog formats into a 1 KB buffer, so the tail goes out in <=900
+       byte pieces, cut at line ends when possible. */
+    while (p < end && *p) {
+        char piece[900];
+        size_t take = 0;
+
+        while (take < sizeof(piece) - 1 && p + take < end && p[take]) {
+            piece[take] = p[take];
+            take++;
+            if (p[take - 1] == '\n') break;
+        }
+        piece[take] = '\0';
+        AppendLog(hwnd, "%s", piece);
+        p += take;
+    }
+    g_logTailOffset = size;
+}
+
 BOOL CheckStatus(HWND hwnd) {
     AppendLog(hwnd, "\r\n[Status] Checking system status...\r\n");
     UpdateStatus(hwnd, "Status: Checking...");
@@ -2316,6 +2419,9 @@ BOOL CheckStatus(HWND hwnd) {
         if (ReadConfigValue(configPath, "View", view, sizeof(view)))
             AppendLog(hwnd, "  View (read-only): %s\r\n", view);
     }
+
+    /* 共享日志的增量: 提权链路、payload、DLL 的行只进文件, 这里搬进编辑框 */
+    AppendNewLogTail(hwnd);
 
     UpdateStatus(hwnd, "Status: Check completed");
     return TRUE;
