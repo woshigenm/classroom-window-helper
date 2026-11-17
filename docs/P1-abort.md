@@ -1,6 +1,19 @@
 # P1b 设计：点「跳过」时的协作退出
 
-状态：**草案，未实现**。审完这份再动 `src\elevate.c`。
+状态：**已实现**（abort 协作 + Job Object）。手动「点跳过」实测需要真实链路，见 §8。
+
+## 0. 实现记录（本轮）
+
+| 位置 | 内容 |
+|---|---|
+| `lpe\trigger.ps1` | `do{}` 内新增 `# >>> abort-check` 块：发现 `abort.<AbortPid>` → 记 `documents: abort observed, exiting` → `return`（不是 `throw`，`return` 同样会跑 `finally`） |
+| `src\elevate.c` | `SkipFilePath()` / `WriteAbort()` / `CreateKillOnCloseJob()` / `CloseJob()` / `LogLeftoverServices()`；`RunHidden()` 加 `job` 参数（`CREATE_SUSPENDED` → assign → 无条件 `ResumeThread`）；跳过时写 abort → 等 ≤3000ms → 超时才 `TerminateProcess` |
+| `BuildEncodedCommand()` | 前置段增加 `$AbortPid=<launcher pid>`；顺手修掉 `qTarget[900]` 对 `target[2048]` 的静默截断（截掉的是 `--elevate=uac`） |
+| `tests\lpe_documents.ps1` | 新增 abort-check 三个用例（命中 / 无文件 / 无 pid + 残留 `abort.` 文件），共 60 项 |
+
+`return` 在脚本作用域、`try/finally` 内是否真的跑 `finally` 不是靠读文档断言的：上面第三个
+用例把真实形状（`try { do{} } finally {}` + `return`）抽出来跑，断言 `finally ran` 出现、
+`after-block` 与 `tail` 都不出现。
 
 ## 1. 先摆事实（读代码得出，不是推测）
 
@@ -24,7 +37,8 @@ bypass.exe（普通用户；elevate.c）
    （握手行已出现时说明它已经在跑）。
 
 结论：Job Object 的作用范围是 **powershell(+conhost)**，不是“整棵树”。这已经够用，
-因为它保证 `elevate.c` 退出后不会留下一个还持有 Documents 重定向的孤儿。
+因为它覆盖的正是那个进程——`elevate.c` 退出后不会留下持有 Documents 重定向的孤儿
+（assign 成功时；assign 失败的情形见 §6）。
 
 ## 2. 现在的缺口
 
@@ -60,20 +74,60 @@ trigger.ps1 的 `finally`：
 
 | 组件 | 点跳过之后 |
 |---|---|
-| `trigger.ps1` | 看到 abort → 退出 `do{}` → `finally` 恢复 Documents → 退出 |
+| `trigger.ps1` | 看到 abort → 退出 `do{}` → `finally` **尝试**恢复 Documents → 退出 |
 | `elevate.c` | 写 abort → 等 powershell 退出（≤3000ms）→ 超时硬杀 → 继续走 UAC / 返回 |
 | 提权实例（broker 拉起） | 不受影响，继续跑完 |
 
-所以「跳过」只保证 **Documents 恢复**，不保证 LPE 侧动作回滚：run 目录、`wallet.db`、
-可能残留的服务，都按 `lpe\README.md` 的手动序列处理。用户点跳过之后看到
+### 「尝试恢复」不是「恢复」
+
+不用「保证」这个词，因为链路上至少三处会失败：
+
+| 环节 | 失败可能 |
+|---|---|
+| 轮询 | powershell 正卡在 `Await-WinRtOperation`（`:311`），abort 根本没被看到 → 3 秒后硬杀 |
+| `finally` | `$original` 已不是目录 → 跳过（`restore skipped`）；`set` 返回非零 → `WARNING` |
+| 写成功 | 写回的是**候选值**，不是用户原来的路径（例如原来是 `D:\MyDocs`，现在回到 `%USERPROFILE%\Documents`） |
+
+第三条最危险：Documents 功能正常了，用户以为原路径回来了，其实没有。所以恢复日志要带
+**来源标记**，三种来源分开写：
+
+| source | 含义 | 能说「原路径回来了」吗 |
+|---|---|---|
+| `original` | 本次读到的就是真值，重定向前后写回同一个值 | 能 |
+| `snapshot` | 用的是上一次运行留下的 `documents.orig` | 能（快照就是那次写的真值） |
+| `fallback` | 快照不可用，用了 OneDrive / `%USERPROFILE%\Documents` 候选 | **不能**——只是“找了一个能用的” |
+
+实现上是一个变量：`$source` 在 known-folder 块里跟着 `$original` 一起定（健康路径 =
+`original`；用 `$recorded` 的两个分支 = `snapshot`；候选分支 = `fallback`），`finally`
+只用它拼日志，例如
+
+```
+documents restored original=D:\MyDocs source=snapshot
+documents restored original=C:\Users\x\Documents source=fallback
+```
+
+`source=fallback` 那一行就是「路径变了」的凭证：默认日志里看不到差异，只有这个标记能
+事后区分「真的还原了」和「换了个能用的」。三者都不成立时不写入、留 `WARNING`。
+
+同理，「跳过」不保证 LPE 侧动作回滚：run 目录、`wallet.db`、可能残留的服务，都按
+`lpe\README.md` 的手动序列处理。用户点跳过之后看到
 `%LOCALAPPDATA%\ClassroomBypass-LPE\<guid>` 里还有东西，不是 bug，是这条边界。
 
-日志只写三个关键节点（心跳不加状态：200ms 一条 `abort=false` 只会淹掉日志，而 abort
+也不保证恢复到**用户最初配置的**路径：自定义重定向（`D:\MyDocs`、网络盘）如果原值已经
+丢了（快照没写成，或者上一版把它覆盖了），P1 无法还原，只能人工
+`bin\lpe\documents_path.exe set <真实路径>`。候选列表能救回的是「Documents 能用」，
+不是「你的配置回来了」。
+
+日志只写关键节点（心跳不加状态：200ms 一条 `abort=false` 只会淹掉日志，而 abort
 之后的 3 秒超时根本不看心跳）：
 
-1. `elevate.c` 写 abort：`lpe: user skipped, abort written, waiting 3000ms for trigger.ps1`
-2. `trigger.ps1` 看到 abort：`documents: abort observed, exiting loop`
-3. `elevate.c` 超时硬杀：`lpe: trigger.ps1 did not exit in 3000ms, terminating`
+1. `elevate.c` 写 abort：`lpe: user skipped, abort written, waiting up to 3000ms for trigger.ps1`
+2. `trigger.ps1` 看到 abort：`documents: abort observed, exiting`
+3. `elevate.c` 等到退出：`lpe: trigger.ps1 exited after %lu ms`
+4. `elevate.c` 超时硬杀：`lpe: trigger.ps1 did not exit in 3000ms, terminating`
+
+3 和 4 是互斥的，必须有一条。带实际时长是为了事后能看出「是不是经常卡满 3 秒」——
+这决定要不要继续查 `trigger.ps1` 里的不可打断点。
 
 另外 `elevate.c` 写 abort 后顺手扫一次 `Get-Service -Name 'CVE49176_*'`（普通权限可以
 枚举），有命中就 `ELog("note: service CVE49176_%lu_%lu may remain; see README for cleanup", ...)`，
@@ -119,15 +173,49 @@ trigger.ps1 的 `finally`：
 - **assign 与第一行脚本之间的窗口**：`CreateProcessA` 返回后到 assign 完成之间，
   powershell 可能已经跑了几条指令。这期间它 spawn 的子进程默认也进 job（父在 job 里），
   但“已经 spawn 完”的那一个会逃逸。`trigger.ps1` 开头只读文件、不 spawn，窗口的实际
-  影响接近零；正确做法是 `CREATE_SUSPENDED` → assign → `ResumeThread`，把窗口降为零。
-  `RunHidden` 只有一个调用点（`elevate.c:789`），加一个 `suspend` 参数不会影响别处，
-  实现时直接这么做。
+  影响接近零——但「现在不 spawn」是**未来改动的隐含约束**，不该靠它。已定：
+  `CREATE_SUSPENDED` → assign → `ResumeThread`，把窗口降为零。
+  `RunHidden` 只有一个调用点（`elevate.c:789`），加一个参数不影响别处。
+
+- **suspend 的三条铁律**（写错比不 suspend 更糟，按这个顺序实现）：
+
+  | 步骤 | 必须 | 写错的后果 |
+  |---|---|---|
+  | `CreateProcessA(..., CREATE_SUSPENDED \| CREATE_NO_WINDOW, ...)` | 失败时**不** resume（没有线程存在） | `ResumeThread` 一个不存在的进程 |
+  | `AssignProcessToJobObject` | 成功和失败**都** `ELog`（失败带 `err=%lu`） | 失败无声，日志里看起来“有 job 保护” |
+  | `ResumeThread(pi.hThread)` | **无条件执行，且在 assign 之后** | assign 失败时忘了 resume → 进程永久挂起，用户视角是“UAC 过了但什么都没发生” |
+
+  「assign 失败也要 resume」是最容易写出来的 bug：直觉上“保护没建立就不该让它跑”，
+  但那会让进程僵死在挂起态。正确的降级是 **没有 job 保护地正常跑**，由快照兜底。
+
+- `ResumeThread` 在 `RunHidden` 内部、返回之前执行，所以调用点（`:789`）永远看不到一个
+  挂起态的进程；`RunHidden` 之后任何“进程已启动”的假设（取输出、等退出）都成立。
+
 - **assign 失败的后果要说清**：`TerminateProcess(powershell)` 只杀宿主。
   `documents_path.exe set $root` 如果是被 assign 失败后硬杀留下的，它可能刚写完注册表
   就停在那里，而 `finally` 已经不会跑了。下次运行只能靠 `documents.orig` / 候选列表
   恢复——这就是“快照必须先落地”的直接理由。日志里要有一条
   `lpe: job assign failed err=%lu - hard kill will not cover child processes`。
 - 句柄必须在硬杀之后、函数返回之前才关闭——`KILL_ON_JOB_CLOSE` 是“句柄关 = 杀”。
+
+- **成功路径必须先撤掉 `KILL_ON_JOB_CLOSE`，再关句柄**（否则这是本次设计里最容易自伤的一处）。
+  循环在“看到握手行”时就 `break`（`elevate.c:820`），而那一刻 trigger.ps1 **通常还在跑**：
+  它可能刚写完 `command.txt`、还没走到 `finally`。如果这时按“函数返回前关闭 job 句柄”处理，
+  `KILL_ON_JOB_CLOSE` 会把正在跑 `finally` 的 powershell 杀掉——Documents 停在 `$root`，
+  而且**每一次成功都会发生**，比原来的“点跳过才残留”严重得多。
+
+  规则只有一条：**任何正常返回都先撤掉 kill-on-close，再关句柄**；显式杀由
+  `TerminateProcess` 负责。不做“按路径决定撤不撤”——那种表格迟早会漏一行，而漏掉成功
+  路径的代价是“每次成功都把 Documents 留在 `$root`”。
+
+  换句话说：job 的语义是「**父进程意外消失时**连带杀掉脚本」，不是「父进程函数返回时杀掉
+  脚本」。这两件事在成功路径上不是一回事。
+
+  这条规则在本机用一次性探针验证过（不是推理）：`CreateProcess(CREATE_SUSPENDED)` →
+  `AssignProcessToJobObject` → `ResumeThread` → 撤掉 limit → `CloseHandle`，子进程存活；
+  不撤、直接 `CloseHandle`，子进程被杀；`AssignProcessToJobObject` 在**父进程本身也在 job
+  里**的情况下依然返回成功（Windows 8+ 的嵌套 job），所以 `ERROR_ACCESS_DENIED` 那条分支
+  只作为兜底存在，不是常规路径。
 - `AssignProcessToJobObject` 失败（目标已在别的 job 里，`ERROR_ACCESS_DENIED` = 5，
   或嵌套 job 的 LimitFlags 不允许）：只写 `ELog`，不阻断流程。当前 `RunHidden` 用
   `CreateProcessA`（`elevate.c:265`），父进程不在 job 里，正常路径不会失败；
@@ -137,38 +225,82 @@ trigger.ps1 的 `finally`：
   它不持有 Documents 重定向，所以**不作为残留判定依据**，也不进验收标准。
 - 不需要 `CREATE_BREAKAWAY_FROM_JOB`：那是“父进程已在 job 里”才需要的技巧。
 
-## 7. 四种时序
+## 7. 五种时序
 
 | 场景 | 结果 |
 |---|---|
-| 正常完成 | 脚本自己 `exit`，job 句柄关闭，powershell 已退出，无副作用 |
-| 点跳过 | abort → finally 恢复 Documents → 删 abort → 3 秒内退出 |
+| 正常完成 | 脚本自己 `exit` → `finally` 恢复 Documents → elevate.c 撤掉 kill-on-close 再关句柄，不留孤儿也不误杀 |
+| 点跳过 | abort → finally 尝试恢复 Documents → 删 abort → 3 秒内退出 |
 | 点跳过且脚本卡住 | 3 秒后 `TerminateProcess`；Documents 停在 `$root`，快照仍在，下次运行修复 |
 | 点跳过 + assign 失败 | 硬杀只杀 powershell；`documents_path.exe` 可能还在跑。Documents 可能停在 `$root`，靠下次运行的快照恢复；日志里有 assign 失败那一条 |
 | `elevate.c` 被强杀 | job 句柄随进程关闭 → powershell 被杀；Documents 停在 `$root`，下次运行用快照修复 |
 
 ## 8. 验收标准
 
-1. 点跳过：日志出现 `documents restored`，注册表两处 `Personal` 回到原值，abort 文件消失；
-2. 跳过 + 脚本卡住（测试桩里 `Start-Sleep 10`）：3 秒后 powershell 消失，快照文件仍在；
+1. 点跳过：日志出现 `documents restored ... source=<original|snapshot|fallback>`，**source 与实际来源一致**（用快照恢复时不能写 `source=original`），注册表两处 `Personal` 回到该值，abort 文件消失；
+2. 跳过 + 脚本卡住（测试桩里 `Start-Sleep 10`）：3 秒后 powershell 消失，快照文件仍在，日志有 `timed out at 3000ms`；
 3. 强杀 `elevate.c`（任务管理器）：powershell 跟着消失（`tasklist` 无残留）；
 4. 已成功（握手行已出现）后点跳过：提权实例不受影响；
-5. 三条日志齐全且顺序正确（写 abort → abort observed → 硬杀或正常退出）；
-6. `conhost.exe` 不作为残留判定依据：验收只查中文名 powershell 是否存在；
-7. `make all` 0 警告，全套测试通过（含 P1a 的 45 项）。
+5. 关键节点日志齐全且顺序正确（写 abort → abort observed → `exited after N ms` 或 `terminating`，两者恰有一条）；
+6. `conhost.exe` 不作为残留判定依据：验收只查 powershell 是否存在；
+7. **成功路径不误杀**：握手行出现后（不点跳过）等 10 秒，日志里没有“脚本被杀”的痕迹，Documents 已由 `finally` 恢复（不是停在 `$root`）。这条专门验证 §6 的“撤掉 kill-on-close”；
+8. `make all` 0 警告，全套测试通过（含 P1a 的 45 项）。
 
 ## 9. 已定（本轮答复）
 
 | 问题 | 结论 |
 |---|---|
-| `3000ms` 是否缩放 | 固定值，不跟 `TimeoutSec` 缩放；前提是循环体单步 < 200ms 或可切片（当前满足） |
+| `3000ms` 是否缩放 | 固定值，不跟 `TimeoutSec` 缩放；前提是循环体单步 < 200ms 或可切片（当前满足）。**实际等待时长要写进日志**：`exited after %lu ms` / `did not exit in 3000ms`，否则永远看不出是不是经常打满 |
 | 跳过时是否 `sc stop/delete` | 不做。`elevate.c` 是普通权限，删服务要么静默失败要么二次提权；只扫一次并 `ELog` 留痕 |
 | README 是否列运行时文件 | 列，单独一节“运行时文件（不提交，不打包）”，已加 |
-| 心跳是否带 abort 状态 | 不带，改用三条关键节点日志 |
+| 心跳是否带 abort 状态 | 不带，改用关键节点日志（写 abort / abort observed / exited 或 terminating） |
 
-## 10. 仍需确认
+关于 `Get-Service -Name 'CVE49176_*'`：**扫到即真残留**，不留“可能正在删除中”的模糊话。
+`DeleteService` 成功后服务只是被标记删除，而枚举由新开的 SC Manager 句柄发起，看不到
+已标记删除的项。所以能看到就说明进程死在 `CreateServiceW` 与 `DeleteService` 之间。
 
-1. 残留服务的手工序列要不要做成 `build\cleanup_lpe.ps1`（管理员运行，先校验 `net session`）？
-   现在是 README 里的文档，靠人照抄，容易漏掉“先 delete 再删目录”。
-2. `documents_path.exe` 若在硬杀窗口里被留下，要不要在下次启动时检测并等待它退出？
-   当前的答案是“不检测，靠快照恢复”，但日志里缺少“上次可能有个 set 正在跑”的痕迹。
+### 一个小概率但真实的撞名窗口（不修，记账）
+
+`CVE49176_<pid>_<GetTickCount()>` 严格说不是「不可能撞」：`GetTickCount` 49.7 天回绕，
+pid 也会复用。同一次「回绕后 tick 恰好相等 + pid 恰好复用 + 那个残留服务还在」才会撞。
+
+按你的建议本来该加三行（`ERROR_SERVICE_EXISTS` → `OpenService` + `DeleteService` →
+再 `CreateServiceW` 一次），但**不能加**：`lpe\src\*.c` 与上游逐字节相同是硬约束
+（只允许来源注释头和 `#ifndef`），改它等于把冻结的源码解冻，而
+`build\check_payload.ps1` 只比对「源码 vs 记录的哈希」，抓不到这种偏离。
+
+查了源码，撞名的后果是**已定义且良性**的：`CreateServiceW` 的失败是被检查的
+（`wallet_callback_shell.c:126-130`），不会把 NULL 句柄传给 `StartServiceW` /
+`DeleteService`；它把 `ERROR_SERVICE_EXISTS`（1073）返回给 WalletService，
+`trigger.ps1` 记下 `shell failed`，`elevate.c` 退回 UAC。也就是「这一次 LPE 没成，
+退回原流程」，不是未定义行为。代价只是那一次不能自动提权——不值得为此解冻上游源码。
+
+## 10. 结论（本轮）
+
+1. **`build\cleanup_lpe.ps1`：做，但默认只列不删。**
+   这套工具里最危险的自动化就是清理脚本——它的输入是「系统当前状态」，而那个状态可能
+   包含**正在运行的正常实例**。无条件 `sc delete CVE49176_*` + `rmdir` 会让用户在一次
+   正常运行途中删掉服务与 DLL，LPE 失败且日志里看不出原因。
+
+   | 行为 | 参数 |
+   |---|---|
+   | 列出 `CVE49176_*` 服务、`%LOCALAPPDATA%\ClassroomBypass-LPE\` 下的 runid 目录、`documents.orig`、`abort.*` | 无参数（默认） |
+   | 清理指定项 | `-Service <name>` / `-RunId <id>` |
+   | 全清 | `-All -Force`，且要求 `net session` 通过 + 二次确认 |
+
+   列表阶段就要做存活判断：服务名里的 pid 用 `Get-Process -Id` 查，活着就标
+   `[RUNNING, do not delete]`。这条比任何参数都重要——它挡住的就是「清理脚本杀掉正在
+   运行的那一次」。
+
+2. **遗留 `documents_path.exe` 检测：不做。** 对象选错了：它的生命周期是「set 完就退」，
+   被逮到的概率极低，而且它不持有状态——真正持有重定向的是跑 `trigger.ps1` 的
+   powershell。退一步说，要检测也该检测「命令行含 `trigger.ps1` 且父进程已死的
+   powershell」，但它是用 `-EncodedCommand` 起的（`elevate.c:265`），命令行里只有
+   Base64，没有明文可匹配。A+ 的 stale 分支 + 快照已经在「下次运行」这个时点兜住了，
+   再加一条启动时扫描就是第二条路径，两者判断不一致时更难查。留给 P3 和
+   `ScanHookLog*` 一起做（那时才有进程枚举的基础设施）。
+
+3. **P3 的起点判定：用偏移，不用 banner。** 「日志框第一行是不是 banner」这个问题不用
+   再回答——它是 UI 实现细节，改版就会变，拿它当增量读的锚点等于把重构绑在展示层上。
+   改成：点「检查当前状态」时记下文件长度 `L`（或行数 `N`），增量读从 `L` 开始；
+   若 `L` 大于当前长度（文件被清空/轮转），直接从头读。这样日志格式怎么改都不影响。

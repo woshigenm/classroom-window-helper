@@ -37,6 +37,7 @@ if ($known -notmatch '\$env:TEST_ORIGINAL') {
     throw 'GetFolderPath line not found - update the substitution in this test'
 }
 $restore = Get-Block '# >>> restore' '# <<< restore'
+$abort   = Get-Block '# >>> abort-check' '# <<< abort-check'
 
 $work = Join-Path $env:TEMP ('lpe_docs_' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work -Force | Out-Null
@@ -108,12 +109,38 @@ exit 0
 $restoreTemplate = @'
 $ErrorActionPreference = 'Stop'
 $original = '@ORIGINAL@'
+$source = '@SOURCE@'
 $snapshot = '@SNAPSHOT@'
 $documents = '@DOCUMENTS@'
 function Set-Stage([string]$text) {
     [IO.File]::AppendAllText('@STAGES@', "$text`r`n", (New-Object Text.UTF8Encoding($false)))
 }
 @BLOCK@
+exit 0
+'@
+
+# The shipped block is a `return` inside try/finally, at script scope.  This
+# template reproduces that shape exactly - same nesting, same "after the block"
+# and "after the try" lines - because the whole point is that return still runs
+# the finally that restores Documents.  If PowerShell ever changes that, this
+# case fails instead of silently leaving Documents redirected.
+$abortTemplate = @'
+$ErrorActionPreference = 'Stop'
+$env:LOCALAPPDATA = '@LAPPDATA@'
+$AbortPid = '@PID@'
+function Set-Stage([string]$text) {
+    [IO.File]::AppendAllText('@STAGES@', "$text`r`n", (New-Object Text.UTF8Encoding($false)))
+}
+try {
+    do {
+@BLOCK@
+        Set-Stage 'after-block'
+        break
+    } while ($true)
+} finally {
+    Set-Stage 'finally ran'
+}
+Set-Stage 'tail'
 exit 0
 '@
 
@@ -153,7 +180,7 @@ $dir = Case-Dir 'healthy'
 $case = Run-Case 'healthy' $knownTemplate $known @{
     LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
     ORIGINAL = (New-Dir "$dir\docs")
-} @('documents original=') 0
+} @('documents original=', 'source=original') 0
 Check ((Get-Snapshot $case.Snapshot) -eq "$dir\docs") 'healthy    snapshot holds the original'
 
 $dir = Case-Dir 'stale-recorded'
@@ -161,7 +188,7 @@ $recorded = New-Dir "$dir\onedrive\Documents"
 $case = Run-Case 'stale-recorded' $knownTemplate $known @{
     LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
     ORIGINAL = "$dir\la\ClassroomBypass-LPE\run1"
-} @('recorded original') 0 {
+} @('recorded original', 'source=snapshot') 0 {
     param($d) Set-Snapshot (Snap $d) $recorded
 }
 Check ((Get-Snapshot $case.Snapshot) -eq $recorded) 'recorded   snapshot keeps the recorded path'
@@ -181,7 +208,7 @@ $profileDocs  = New-Dir "$dir\up\Documents"
 $case = Run-Case 'stale-onedrive' $knownTemplate $known @{
     LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = "$dir\od"
     ORIGINAL = "$dir\la\ClassroomBypass-LPE\run1"
-} @('candidates:', 'under LPE root -> using ') 0
+} @('candidates:', 'under LPE root -> using ', 'source=fallback') 0
 Check ((Get-Snapshot $case.Snapshot) -eq $oneDriveDocs) 'onedrive   picked over %USERPROFILE%'
 Check ($profileDocs -ne $oneDriveDocs) 'onedrive   the two candidates really differ'
 
@@ -209,7 +236,7 @@ $docs = New-Dir "$dir\docs"
 $case = Run-Case 'unreadable-recorded' $knownTemplate $known @{
     LAPPDATA = "$dir\la"; UP = "$dir\up"; OD = ''
     ORIGINAL = ''
-} @('using recorded original') 0 {
+} @('using recorded original', 'source=snapshot') 0 {
     param($d) Set-Snapshot (Snap $d) $docs
 }
 Check ((Get-Snapshot $case.Snapshot) -eq $docs) 'unreadable snapshot is authoritative'
@@ -253,18 +280,31 @@ $snap = Join-Path $dir 'documents.orig'
 $docs = New-Dir "$dir\docs"
 Set-Snapshot $snap $docs
 $null = Run-Case 'restore-ok' $restoreTemplate $restore @{
-    ORIGINAL = $docs; SNAPSHOT = $snap; DOCUMENTS = $stub
-} @('documents restored') 0
+    ORIGINAL = $docs; SOURCE = 'original'; SNAPSHOT = $snap; DOCUMENTS = $stub
+} @('documents restored', 'source=original') 0
 $calls = [IO.File]::ReadAllText((Join-Path $dir 'calls.txt'), [Text.Encoding]::Default)
 Check ($calls.Trim() -eq "set $docs") 'restore    called set with the original path'
 Check (-not (Test-Path -LiteralPath $snap)) 'restore    snapshot removed after success'
+
+# Same call, different provenance: a fallback candidate restores a *working*
+# Documents, not the path the user configured.  The only thing that tells the
+# two apart afterwards is the source marker, so it gets a case of its own.
+$dir = Case-Dir 'restore-fallback'
+$stub = New-DocumentsStub $dir
+$snap = Join-Path $dir 'documents.orig'
+$docs = New-Dir "$dir\up\Documents"
+Set-Snapshot $snap $docs
+$case = Run-Case 'restore-fallback' $restoreTemplate $restore @{
+    ORIGINAL = $docs; SOURCE = 'fallback'; SNAPSHOT = $snap; DOCUMENTS = $stub
+} @('documents restored', 'source=fallback') 0
+Check ($case.Stages -notmatch 'source=(original|snapshot)') 'fallback   never logged as a real restore'
 
 $dir = Case-Dir 'restore-skipped'
 $stub = New-DocumentsStub $dir
 $snap = Join-Path $dir 'documents.orig'
 Set-Snapshot $snap "$dir\gone"
 $null = Run-Case 'restore-skipped' $restoreTemplate $restore @{
-    ORIGINAL = "$dir\gone"; SNAPSHOT = $snap; DOCUMENTS = $stub
+    ORIGINAL = "$dir\gone"; SOURCE = 'original'; SNAPSHOT = $snap; DOCUMENTS = $stub
 } @('restore skipped') 0
 Check (-not (Test-Path -LiteralPath (Join-Path $dir 'calls.txt'))) 'skipped    set was not called at all'
 Check (Test-Path -LiteralPath $snap) 'skipped    snapshot kept for the next run'
@@ -276,10 +316,44 @@ $docs = New-Dir "$dir\docs"
 Set-Snapshot $snap $docs
 [IO.File]::WriteAllText((Join-Path $dir 'rc.txt'), '1')
 $null = Run-Case 'restore-failed' $restoreTemplate $restore @{
-    ORIGINAL = $docs; SNAPSHOT = $snap; DOCUMENTS = $stub
+    ORIGINAL = $docs; SOURCE = 'original'; SNAPSHOT = $snap; DOCUMENTS = $stub
 } @('restore failed \(exit 1\)') 0
 Check (Test-Path -LiteralPath (Join-Path $dir 'calls.txt')) 'failed     set was attempted'
 Check (Test-Path -LiteralPath $snap) 'failed     snapshot kept for the next run'
+
+# ---- abort check block ------------------------------------------------------
+#
+# "Skip" turns into a file that the launcher writes; the wait loop only has to
+# notice it and let the script unwind.  Two things can go wrong silently: the
+# loop keeps waiting (user sees nothing happen) or the return skips the finally
+# (Documents stays on the LPE root).  Both are asserted here.
+
+$dir = Case-Dir 'abort-hit'
+$abortFile = Join-Path $dir 'la\ClassroomBypass-LPE\abort.4242'
+New-Dir (Split-Path -Parent $abortFile) | Out-Null
+Set-Content -LiteralPath $abortFile -Value 'abort 1' -NoNewline
+$case = Run-Case 'abort-hit' $abortTemplate $abort @{
+    LAPPDATA = "$dir\la"; PID = '4242'
+} @('abort observed', 'finally ran') 0
+Check ($case.Stages -notmatch 'after-block') 'abort      stops waiting at once'
+Check ($case.Stages -notmatch 'tail') 'abort      exits the script, does not fall through'
+
+$dir = Case-Dir 'abort-cold'
+$case = Run-Case 'abort-cold' $abortTemplate $abort @{
+    LAPPDATA = "$dir\la"; PID = '4242'
+} @('after-block', 'finally ran', 'tail') 0
+Check ($case.Stages -notmatch 'abort observed') 'cold       no file, no abort'
+
+# Without an injected pid there is no path to test, and the guard has to keep
+# that from turning into "...\abort." (which a stale file could match).
+$dir = Case-Dir 'abort-nopid'
+$strayFile = Join-Path $dir 'la\ClassroomBypass-LPE\abort.'
+New-Dir (Split-Path -Parent $strayFile) | Out-Null
+Set-Content -LiteralPath $strayFile -Value 'abort 1' -NoNewline
+$case = Run-Case 'abort-nopid' $abortTemplate $abort @{
+    LAPPDATA = "$dir\la"; PID = ''
+} @('tail') 0
+Check ($case.Stages -notmatch 'abort observed') 'nopid      no pid, no abort even with a stray file'
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 

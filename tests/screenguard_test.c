@@ -22,7 +22,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RENDER_CLASS "MultiRenderScreenGuardTest"
+/* 类名不能以 "MultiRender" 开头: bypass_hook 的 IsRenderWindowClass() 就是按
+   这个前缀认课堂渲染窗口的, 命中后它会把本窗口当"广播窗口"接管 —— 包括把
+   SetWindowPos(HWND_TOPMOST) 改写成 HWND_NOTOPMOST (bypass_hook.c:1748)。
+   那样本测试窗口会被别的前台窗口盖住, 守卫关着也会抓到同一幅画面, 报出假的
+   frozen=1。这是本文件改名前的真实故障(全套里 1/10 次 off=1, 且 ProbeVisible
+   打出的 diag 显示 center_hit 落在了别的窗口上)。 */
+#define RENDER_CLASS "ScreenguardProbeWnd"
 
 static HWND   g_win;
 static COLORREF g_color;

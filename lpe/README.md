@@ -42,7 +42,7 @@
 |---|---|---|
 | `%LOCALAPPDATA%\ClassroomBypass-LPE\<runid>\` | 本次运行的 `wallet.db`、payload 副本、`result.txt` | 保留供排查，手工删除 |
 | `%LOCALAPPDATA%\ClassroomBypass-LPE\documents.orig` | Documents 原值快照 | 重定向前写入，恢复成功后删除 |
-| `%LOCALAPPDATA%\ClassroomBypass-LPE\abort.<elevate-pid>` | “跳过”信号（P1b，**尚未实现**，见 `docs\P1-abort.md`） | `elevate.c` 每次启动前清理 |
+| `%LOCALAPPDATA%\ClassroomBypass-LPE\abort.<elevate-pid>` | “跳过”信号：`elevate.c` 写一行，`trigger.ps1` 的等待循环看到它就收尾（设计见 `docs\P1-abort.md`） | 写方自己删：启动前清残留，退出前删掉 |
 
 放在用户目录而不是安装目录，是因为安装目录可能只读（Program Files），而这些文件
 必须能写；同时它们也不应该跟着发布包发给别人。
@@ -68,6 +68,11 @@ bin\bypass.exe（普通用户，非管理员）
 - 只启动 `command.txt` 里那一行命令，而那是启动器编进 `-EncodedCommand` 的 `bin\bypass.exe` 路径。
 - 优先取会话令牌的**未过滤链接令牌**（真正的管理员组身份），拿不到才退回 SYSTEM（PoC 原行为）。
 - `trigger.ps1` 的 `finally` 会恢复 Documents 已知文件夹。
+- 「跳过」是协作退出，不是直接杀进程：`elevate.c` 写 `abort.<pid>`，脚本在 200 ms 轮询里
+  看到它就 `return`，由 `finally` 把 Documents 写回；3 秒没有反应才 `TerminateProcess`
+  （见 `docs\P1-abort.md`）。所以「跳过」只保证**尝试**恢复，不保证回到用户最初配置的路径。
+- 脚本在 Job Object（`KILL_ON_JOB_CLOSE`）里，启动器被强杀时它会跟着死；正常返回前会先
+  撤掉这个限制，否则成功路径会把还在跑 `finally` 的脚本一起杀掉。
 - `SHSetKnownFolderPath` **失败时也会写入**：传一个不存在的目录，它先把
   `User Shell Folders\Personal` 和 `Shell Folders\Personal` 都改成那个路径，再返回错误，
   **不回滚**（实测：`set C:\__no_such_dir__` 退出码 1，但两处注册表值已经变坏，

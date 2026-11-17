@@ -165,6 +165,16 @@ $record = $null
 # same FOLDERID_Documents as a UTF-16 string, so nothing is ever narrowed.
 $original = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
 
+# Where $original came from, and therefore what "restored" will mean in the
+# log.  Three sources, three outcomes:
+#   original - this run read the real value and will write it back
+#   snapshot - documents.orig (written by a run that died before restoring)
+#   fallback - a candidate (OneDrive / %USERPROFILE%\Documents), i.e. "a working
+#              Documents", NOT "the path this user configured"
+# Without this marker a fallback restore reads exactly like a real one, and the
+# user is told their path is back when it was only replaced.
+$source = 'original'
+
 # Snapshot of what the redirect is about to overwrite.  SHSetKnownFolderPath
 # overwrites User Shell Folders\Personal -- the only copy -- and it does that
 # even when the call fails, so a run that dies between "set" and "restore"
@@ -216,6 +226,7 @@ if (Test-Path -LiteralPath $snapshot -PathType Leaf) {
 if ($original -and $original.TrimEnd('\') -like "$lpeRoot*") {
     if ($recorded -and (Test-Path -LiteralPath $recorded -PathType Container)) {
         $original = $recorded
+        $source = 'snapshot'
         Set-Stage "documents stale redirect -> recorded original $original"
     } elseif ($recorded) {
         # Recorded, but not reachable right now (unplugged drive, share
@@ -236,6 +247,7 @@ if ($original -and $original.TrimEnd('\') -like "$lpeRoot*") {
             Set-Stage 'stale redirect under the LPE root and no candidate to restore - refusing to run'
             exit 4
         }
+        $source = 'fallback'
         Set-Stage "documents stale redirect under LPE root -> using $original"
     }
 } elseif (-not $original) {
@@ -245,6 +257,7 @@ if ($original -and $original.TrimEnd('\') -like "$lpeRoot*") {
     # a known-but-offline path with a candidate would lose the only copy.
     if ($recorded -and (Test-Path -LiteralPath $recorded -PathType Container)) {
         $original = $recorded
+        $source = 'snapshot'
         Set-Stage "documents unreadable, using recorded original $original"
     } elseif ($recorded) {
         Set-Stage "documents unreadable and the recorded original is not a directory - refusing to run: $recorded"
@@ -272,7 +285,7 @@ if ($original -and $original.TrimEnd('\') -like "$lpeRoot*") {
     }
     exit 4
 }
-Set-Stage "documents original=$original"
+Set-Stage "documents original=$original source=$source"
 
 # Written before the redirect and cleared only after a verified restore: if
 # this process is killed in between, the next run reads the real value back
@@ -315,6 +328,21 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
     do {
         Start-Sleep -Milliseconds 200
+        # >>> abort-check
+        # "Skip" is a file, not a window message: this loop runs inside a hidden
+        # powershell that never sees the UI.  The launcher writes the file and is
+        # also the only one that deletes it, so there is no "both sides delete"
+        # race.  The path is built here rather than reusing $lpeRoot above, so
+        # this block can be extracted and tested on its own; its only input is
+        # $AbortPid, which the launcher injects into the preamble.
+        $abortFile = Join-Path (Join-Path $env:LOCALAPPDATA 'ClassroomBypass-LPE') ('abort.' + $AbortPid)
+        if ($AbortPid -and (Test-Path -LiteralPath $abortFile)) {
+            Set-Stage 'documents: abort observed, exiting'
+            # return, not throw: the user choosing to stop is not an error, and
+            # return still runs the finally block that restores Documents.
+            return
+        }
+        # <<< abort-check
         if (Test-Path -LiteralPath $result) {
             # Every writer to result.txt (callback DLL and shell_broker) appends
             # plain ASCII - the default reader is exactly what the pipeline expects.
@@ -338,7 +366,10 @@ try {
         if ($LASTEXITCODE -ne 0) {
             Set-Stage "WARNING documents restore failed (exit $LASTEXITCODE): $original"
         } else {
-            Set-Stage 'documents restored'
+            # source= tells the reader whether the original path really came
+            # back (original / snapshot) or Documents was merely pointed at a
+            # working candidate (fallback).  Without it the two are identical.
+            Set-Stage "documents restored original=$original source=$source"
             try {
                 Remove-Item -LiteralPath $snapshot -Force
             } catch {
