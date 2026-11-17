@@ -35,26 +35,51 @@
 #define LPE_TRIGGER      "lpe\\trigger.ps1"
 
 static int   g_mode = -1;
-static char  g_modeDir[MAX_PATH];      /* exe dir, resolved once by Mode() */
-static char  g_modeTrigger[MAX_PATH];  /* <dir>\lpe\trigger.ps1, ditto */
 
 /* ---------------- small helpers ---------------- */
 
-static void ExeDir(char* out, size_t n)
+/* exe directory into out.  0 = failed or truncated (out is then empty). */
+static int ExeDir(char* out, size_t n)
 {
+    DWORD got;
+    char* p;
+
+    if (!out || n == 0) return 0;
     out[0] = '\0';
-    if (!GetModuleFileNameA(NULL, out, (DWORD)n)) { out[0] = '\0'; return; }
-    {
-        char* p = strrchr(out, '\\');
-        if (p) *p = '\0';
-        else   out[0] = '\0';
-    }
+
+    got = GetModuleFileNameA(NULL, out, (DWORD)n);
+    if (got == 0 || (size_t)got >= n) { out[0] = '\0'; return 0; }
+    p = strrchr(out, '\\');
+    if (!p) { out[0] = '\0'; return 0; }
+    *p = '\0';
+    return 1;
 }
 
-static void Join(char* out, size_t n, const char* dir, const char* name)
+/* "<dir>\<name>" into out.  0 = bad arguments or truncated; out is emptied in
+   that case, so a caller can never end up opening a half-written path. */
+static int Join(char* out, size_t n, const char* dir, const char* name)
 {
-    _snprintf(out, n - 1, "%s\\%s", dir, name);
-    out[n - 1] = '\0';
+    int r;
+
+    if (!out || n == 0) return 0;
+    out[0] = '\0';
+    if (!dir || !name) return 0;
+
+    r = _snprintf(out, n, "%s\\%s", dir, name);
+    if (r < 0 || (size_t)r >= n) { out[0] = '\0'; return 0; }
+    return 1;
+}
+
+/* "<exe dir>\<name>" into out - a file that ships next to the exe, e.g.
+   "lpe\\trigger.ps1".  0 = failed or truncated (out is empty). */
+static int ExeSibling(char* out, size_t n, const char* name)
+{
+    char dir[MAX_PATH];
+
+    if (!out || n == 0) return 0;
+    out[0] = '\0';
+    if (!ExeDir(dir, sizeof(dir))) return 0;
+    return Join(out, n, dir, name);
 }
 
 static int FileExists(const char* p)
@@ -64,12 +89,10 @@ static int FileExists(const char* p)
 
 static void TruncateLog(void)
 {
-    char dir[MAX_PATH], path[MAX_PATH];
+    char   path[MAX_PATH];
     HANDLE h;
 
-    ExeDir(dir, sizeof(dir));
-    if (!dir[0]) return;
-    Join(path, sizeof(path), dir, ELEVATE_LOG);
+    if (!ExeSibling(path, sizeof(path), ELEVATE_LOG)) return;
     h = CreateFileA(path, GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -83,16 +106,14 @@ static void TruncateLog(void)
 static void ELog(const char* fmt, ...)
 {
     static char line[4096];
-    char        dir[MAX_PATH], path[MAX_PATH];
+    char        path[MAX_PATH];
     SYSTEMTIME  st;
     va_list     ap;
     int         n;
     HANDLE      h;
     DWORD       written = 0;
 
-    ExeDir(dir, sizeof(dir));
-    if (!dir[0]) return;
-    Join(path, sizeof(path), dir, ELEVATE_LOG);
+    if (!ExeSibling(path, sizeof(path), ELEVATE_LOG)) return;
 
     GetLocalTime(&st);
     n = _snprintf(line, sizeof(line) - 3,
@@ -159,17 +180,15 @@ static int ParseMode(const char* s, int* out)
     return 0;
 }
 
-/* Mode decided by the code (see the file header): LPE when the payload exists,
-   UAC otherwise. */
 static int Mode(void)
 {
-    if (g_mode >= 0) return g_mode;
+    char trigger[MAX_PATH];
 
-    /* Mode decided by the code (see the file header): LPE when the payload
-       exists, UAC otherwise. */
-    ExeDir(g_modeDir, sizeof(g_modeDir));
-    Join(g_modeTrigger, sizeof(g_modeTrigger), g_modeDir, LPE_TRIGGER);
-    g_mode = (g_modeDir[0] && FileExists(g_modeTrigger)) ? ELEVATE_LPE : ELEVATE_UAC;
+    if (g_mode >= 0) return g_mode;          /* only WinMain calls this */
+
+    /* Mode decided by the code: LPE when the payload exists, UAC otherwise. */
+    g_mode = (ExeSibling(trigger, sizeof(trigger), LPE_TRIGGER) &&
+              FileExists(trigger)) ? ELEVATE_LPE : ELEVATE_UAC;
     return g_mode;
 }
 
@@ -662,22 +681,25 @@ static int TryLpe(const char* cmdline)
     DWORD   t0, lastBeat, exitCode = 0, pid = 0, exitTick = 0;
     int     ok = 0, skipped = 0, i, stillRunning = 0;
 
-    ExeDir(dir, sizeof(dir));
-    if (!dir[0]) return 0;
+    if (!ExeDir(dir, sizeof(dir))) return 0;
 
     /* Fail fast (and say what is missing) instead of letting PowerShell die
        for an unrelated reason 40 seconds later. */
     for (i = 0; i < (int)(sizeof(pieces) / sizeof(pieces[0])); i++) {
         char p[MAX_PATH];
-        Join(p, sizeof(p), dir, pieces[i]);
+        if (!Join(p, sizeof(p), dir, pieces[i])) {
+            ELog("lpe: path too long: %s", pieces[i]);
+            return 0;
+        }
         if (!FileExists(p)) {
             ELog("lpe: missing %s - skipped", p);
             return 0;
         }
     }
 
-    Join(script, sizeof(script), dir, LPE_TRIGGER);
-    Join(hookLog, sizeof(hookLog), dir, ELEVATE_LOG);
+    if (!Join(script, sizeof(script), dir, LPE_TRIGGER) ||
+        !Join(hookLog, sizeof(hookLog), dir, ELEVATE_LOG))
+        return 0;
 
     GetModuleFileNameA(NULL, exe, sizeof(exe));
     /* --elevate=uac at the end: if the spawned instance somehow is NOT admin
@@ -697,7 +719,7 @@ static int TryLpe(const char* cmdline)
         char  repo[MAX_PATH];
         char* enc;
 
-        Join(repo, sizeof(repo), dir, "lpe");
+        if (!Join(repo, sizeof(repo), dir, "lpe")) return 0;
         enc = BuildEncodedCommand(script, repo, target);
         if (!enc) {
             ELog("lpe: cannot read/encode %s", script);
@@ -852,14 +874,12 @@ int Elevate_Boot(HWND owner, const char* cmdline, int silent)
        what PowerShell itself would produce.  Never starts anything; the blob
        goes to %TEMP% so bin\ stays clean. */
     if (cmdline && strstr(cmdline, "--elevate-selftest")) {
-        char dir[MAX_PATH], script[MAX_PATH];
-        char repo[MAX_PATH], temp[MAX_PATH], out[MAX_PATH];
+        char script[MAX_PATH], repo[MAX_PATH], temp[MAX_PATH], out[MAX_PATH];
         char* enc;
         FILE* f;
 
-        ExeDir(dir, sizeof(dir));
-        Join(script, sizeof(script), dir, LPE_TRIGGER);
-        Join(repo, sizeof(repo), dir, "lpe");
+        if (!ExeSibling(script, sizeof(script), LPE_TRIGGER)) return 0;
+        if (!ExeSibling(repo, sizeof(repo), "lpe")) return 0;
         {
             char target[2048], exe[MAX_PATH];
             GetModuleFileNameA(NULL, exe, sizeof(exe));
