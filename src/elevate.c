@@ -402,8 +402,12 @@ static void LogLeftoverServices(void)
         for (i = 0; i < returned; i++) {
             if (_strnicmp(buf[i].lpServiceName, "CVE49176_", 9) != 0) continue;
             if (found < 5)
-                ELog("note: service %s may remain - see lpe\\README.md for the "
-                     "elevated cleanup sequence", buf[i].lpServiceName);
+                /* Self-contained on purpose: the log is shipped, the README is
+                   not, and "see lpe\\README.md" sent users to a file their copy
+                   does not contain. */
+                ELog("note: service %s may remain - from an elevated prompt: "
+                     "sc delete %s (remove its run directory only after that)",
+                     buf[i].lpServiceName, buf[i].lpServiceName);
             found++;
         }
         free(buf);
