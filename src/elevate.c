@@ -34,6 +34,13 @@
 #define ELEVATE_SELFTEST "bypass_elevate_selftest.b64"   /* debug, goes to %TEMP% */
 #define LPE_TRIGGER      "lpe\\trigger.ps1"
 
+/* CreateProcessA takes 32766 characters plus the NUL.  Sizing the buffer to
+   exactly that keeps "the buffer is full" and "the API refuses" at the same
+   threshold; a bigger buffer only moved the failure deeper (we would hand
+   CreateProcess a silently truncated Base64 blob and PowerShell would report
+   a decode error instead of the real reason). */
+#define LPE_CMDLINE_MAX  32767
+
 static int   g_mode = -1;
 
 /* ---------------- small helpers ---------------- */
@@ -531,16 +538,28 @@ static int TryUac(const char* cmdline, int silent)
     char exe[MAX_PATH];
     static char params[2048];
     SHELLEXECUTEINFOA sei;
+    DWORD got;
+    int   n;
 
-    GetModuleFileNameA(NULL, exe, sizeof(exe));
+    got = GetModuleFileNameA(NULL, exe, sizeof(exe));
+    if (got == 0 || got >= sizeof(exe)) {
+        ELog("uac: own path does not fit in %u bytes", (unsigned)sizeof(exe));
+        return 0;
+    }
     /* --elevate=uac marks the spawned instance as a chain member: it skips the
        early single-instance exit (the launcher holds the mutex) and the log
        truncation.  An admin instance never reads the flag beyond that. */
     if (cmdline && *cmdline)
-        _snprintf(params, sizeof(params) - 1, "%s --elevate=uac", cmdline);
+        n = _snprintf(params, sizeof(params), "%s --elevate=uac", cmdline);
     else
-        _snprintf(params, sizeof(params) - 1, "--elevate=uac");
-    params[sizeof(params) - 1] = '\0';
+        n = _snprintf(params, sizeof(params), "--elevate=uac");
+    if (n < 0 || n >= (int)sizeof(params)) {
+        /* Truncating here drops the marker, and then the elevated instance
+           makes itself a second launcher and dies on the mutex. */
+        ELog("uac: parameters too long (%d bytes, max %u)", n,
+             (unsigned)sizeof(params) - 1);
+        return 0;
+    }
 
     memset(&sei, 0, sizeof(sei));
     sei.cbSize       = sizeof(sei);
@@ -681,11 +700,13 @@ static int TryLpe(const char* cmdline)
         "lpe\\shell_broker.exe"
     };
     char    dir[MAX_PATH], script[MAX_PATH], hookLog[MAX_PATH], ps[MAX_PATH];
-    static char cmd[40000], target[2048];
+    /* Static only to stay off the stack: TryLpe runs on the WinMain thread and
+       nothing else in this process touches these buffers. */
+    static char cmd[LPE_CMDLINE_MAX], target[2048];
     char    exe[MAX_PATH];
     HANDLE  proc = NULL;
-    DWORD   t0, lastBeat, exitCode = 0, pid = 0, exitTick = 0;
-    int     ok = 0, skipped = 0, i, stillRunning = 0;
+    DWORD   t0, lastBeat, exitCode = 0, pid = 0, exitTick = 0, got;
+    int     ok = 0, skipped = 0, i, n, stillRunning = 0;
 
     if (!ExeDir(dir, sizeof(dir))) return 0;
 
@@ -707,14 +728,32 @@ static int TryLpe(const char* cmdline)
         !Join(hookLog, sizeof(hookLog), dir, ELEVATE_LOG))
         return 0;
 
-    GetModuleFileNameA(NULL, exe, sizeof(exe));
+    /* cmdline is spliced into a command line verbatim.  A stray quote re-splits
+       it, and then --elevate=uac is no longer the last argument - it is the
+       only thing that stops a non-admin child from looping back into TryLpe. */
+    if (cmdline && strchr(cmdline, '"')) {
+        ELog("lpe: refusing to forward a cmdline containing a quote: %s", cmdline);
+        return 0;
+    }
+
+    got = GetModuleFileNameA(NULL, exe, sizeof(exe));
+    if (got == 0 || got >= sizeof(exe)) {
+        ELog("lpe: own path does not fit in %u bytes", (unsigned)sizeof(exe));
+        return 0;
+    }
+
     /* --elevate=uac at the end: if the spawned instance somehow is NOT admin
        (token tricks failed), it goes straight to the UAC prompt instead of
        re-running this LPE (which would loop).  An admin instance never parses
        it - WinMain only calls Elevate_Boot when IsUserAnAdmin() is false. */
-    _snprintf(target, sizeof(target) - 1, "\"%s\" %s --elevate=uac",
-              exe, (cmdline && *cmdline) ? cmdline : "");
-    target[sizeof(target) - 1] = '\0';
+    n = _snprintf(target, sizeof(target), "\"%s\" %s --elevate=uac",
+                  exe, (cmdline && *cmdline) ? cmdline : "");
+    if (n < 0 || n >= (int)sizeof(target)) {
+        ELog("lpe: child command line too long (%d bytes, max %u) - not "
+             "starting it with a truncated --elevate=uac",
+             n, (unsigned)sizeof(target) - 1);
+        return 0;
+    }
 
     if (!FindPowerShell(ps, sizeof(ps))) {
         ELog("lpe: powershell.exe not found");
@@ -731,12 +770,19 @@ static int TryLpe(const char* cmdline)
             ELog("lpe: cannot read/encode %s", script);
             return 0;
         }
-        /* ~15 KB for the current script; CreateProcess allows 32767 */
-        _snprintf(cmd, sizeof(cmd) - 1,
-                  "\"%s\" -NoLogo -NoProfile -NonInteractive -EncodedCommand %s",
-                  ps, enc);
-        cmd[sizeof(cmd) - 1] = '\0';
+        /* The script becomes UTF-16, then Base64 (4/3 of that), so the command
+           line grows ~2.7x.  With a 9.2 KB script that is ~25 KB, leaving room
+           for the script to reach ~12 KB before CreateProcessA refuses; past
+           that the exe must grow (or the payload must move out of -EncodedCommand). */
+        n = _snprintf(cmd, sizeof(cmd),
+                      "\"%s\" -NoLogo -NoProfile -NonInteractive -EncodedCommand %s",
+                      ps, enc);
         free(enc);
+        if (n < 0 || n >= (int)sizeof(cmd)) {
+            ELog("lpe: encoded command does not fit in %u bytes (%d needed) - "
+                 "is the payload script too big?", (unsigned)sizeof(cmd), n);
+            return 0;
+        }
     }
 
     ELog("lpe: payload %s (encoded command)", script);
@@ -779,8 +825,11 @@ static int TryLpe(const char* cmdline)
         if (proc) {
             if (WaitForSingleObject(proc, 0) == WAIT_TIMEOUT) stillRunning = 1;
             else if (!exitTick) {
+                DWORD code;
                 exitTick = GetTickCount();
-                GetExitCodeProcess(proc, &exitCode);
+                /* On failure keep the previous value: a failed query leaving 0
+                   would read as "success" and buy a 25 s grace for nothing. */
+                if (GetExitCodeProcess(proc, &code)) exitCode = code;
             }
         }
         /* After the script ends: exit=0 means the chain SUCCEEDED and the
